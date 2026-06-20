@@ -82,6 +82,7 @@ impl AppStore {
         let config = normalize_config(config);
         validate_bind_settings(&config)?;
         validate_provider_urls(&config)?;
+        validate_enabled_model_ids(&config)?;
         self.delete_removed_provider_keys(&previous, &config)?;
         self.write_config_file(&config)?;
         *self.inner.config.write().await = config.clone();
@@ -534,6 +535,33 @@ pub fn validate_provider_urls(config: &AppConfig) -> Result<(), String> {
     Ok(())
 }
 
+pub fn validate_enabled_model_ids(config: &AppConfig) -> Result<(), String> {
+    let mut enabled = HashMap::<String, String>::new();
+    for model in config.models.iter().filter(|model| model.enabled) {
+        let id = model.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let label = model_conflict_label(model);
+        if let Some(existing) = enabled.insert(id.to_string(), label.clone()) {
+            return Err(format!(
+                "Model ID '{id}' is already enabled by {existing}. Disable it before enabling {label}."
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn model_conflict_label(model: &crate::types::ModelEntry) -> String {
+    let name = model.display_name.trim();
+    let name = if name.is_empty() {
+        model.id.trim()
+    } else {
+        name
+    };
+    format!("'{name}' on provider '{}'", model.provider_id)
+}
+
 fn reset_config_preserving_settings(raw: &str) -> AppConfig {
     let mut config = default_config();
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
@@ -602,7 +630,7 @@ fn sanitize_provider_id(value: &str) -> String {
 mod tests {
     use super::{
         normalize_config, reset_config_preserving_settings, validate_bind_settings,
-        validate_provider_urls, CURRENT_CONFIG_VERSION,
+        validate_enabled_model_ids, validate_provider_urls, CURRENT_CONFIG_VERSION,
     };
     use crate::types::{
         default_config, CodexInjectionMode, Provider, ProviderKind, ProviderProtocol,
@@ -706,6 +734,33 @@ mod tests {
         assert!(validate_provider_urls(&config).is_ok());
         config.providers.last_mut().unwrap().base_url = "notaurl".into();
         assert!(validate_provider_urls(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_enabled_model_ids() {
+        let mut config = default_config();
+        let mut duplicate = config.models[0].clone();
+        duplicate.id = " gpt-5.5 ".into();
+        duplicate.display_name = "Second GPT-5.5".into();
+        config.models.push(duplicate);
+        let config = normalize_config(config);
+
+        let error = validate_enabled_model_ids(&config).unwrap_err();
+
+        assert!(error.contains("Model ID 'gpt-5.5' is already enabled"));
+        assert!(error.contains("Second GPT-5.5"));
+    }
+
+    #[test]
+    fn allows_duplicate_model_ids_when_only_one_is_enabled() {
+        let mut config = default_config();
+        let mut duplicate = config.models[0].clone();
+        duplicate.display_name = "Second GPT-5.5".into();
+        duplicate.enabled = false;
+        config.models.push(duplicate);
+        let config = normalize_config(config);
+
+        assert!(validate_enabled_model_ids(&config).is_ok());
     }
 
     #[test]

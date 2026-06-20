@@ -8,7 +8,7 @@ use crate::{
 };
 use axum::{
     body::Body,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -31,6 +31,8 @@ use std::{
 };
 use tokio::{net::TcpListener, time::sleep};
 use uuid::Uuid;
+
+const RESPONSES_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ServerState {
@@ -106,7 +108,10 @@ pub async fn run(store: AppStore) -> Result<(), String> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
-        .route("/v1/responses", post(responses))
+        .route(
+            "/v1/responses",
+            post(responses).layer(DefaultBodyLimit::max(RESPONSES_BODY_LIMIT_BYTES)),
+        )
         .with_state(state);
 
     axum::serve(listener, app)
@@ -2478,32 +2483,30 @@ fn chat_message_from_input_item(item: &Value, pending_reasoning: Option<&str>) -
                 "tool" => "tool",
                 _ => "user",
             };
-            let content = text_from_content(item.get("content").unwrap_or(item));
+            let raw_content = item.get("content").unwrap_or(item);
+            let content_value = chat_content_from_content(raw_content);
             if role == "assistant" {
                 let tool_calls = item.get("tool_calls").cloned();
-                if content.is_empty() && reasoning_content.is_none() && tool_calls.is_none() {
+                if content_value.is_none() && reasoning_content.is_none() && tool_calls.is_none() {
                     return None;
                 }
-                let mut message = if content.is_empty() {
-                    json!({ "role": "assistant", "content": Value::Null })
-                } else {
-                    json!({ "role": "assistant", "content": content })
-                };
+                let mut message =
+                    json!({ "role": "assistant", "content": content_value.unwrap_or(Value::Null) });
                 if let Some(tool_calls) = tool_calls {
                     message["tool_calls"] = tool_calls;
                 }
                 attach_reasoning_content(&mut message, reasoning_content);
                 Some(message)
-            } else if content.is_empty() {
+            } else if content_value.is_none() {
                 None
             } else if role == "tool" {
                 Some(json!({
                     "role": "tool",
                     "tool_call_id": item.get("tool_call_id").or_else(|| item.get("call_id")).and_then(Value::as_str).unwrap_or("tool_call"),
-                    "content": content
+                    "content": text_from_content(raw_content)
                 }))
             } else {
-                Some(json!({ "role": role, "content": content }))
+                Some(json!({ "role": role, "content": content_value.unwrap() }))
             }
         }
     }
@@ -2675,18 +2678,24 @@ fn anthropic_message_from_input_item(item: &Value) -> AnthropicInputMessage {
         }
         _ => {
             let role = normalize_message_role(item.get("role").and_then(Value::as_str));
-            let content = text_from_content(item.get("content").unwrap_or(item));
-            if content.is_empty() {
+            let raw_content = item.get("content").unwrap_or(item);
+            let content = anthropic_content_from_content(raw_content);
+            if content.is_none() {
                 AnthropicInputMessage::Empty
             } else if role == "system" {
-                AnthropicInputMessage::System(content)
+                let text = text_from_content(raw_content);
+                if text.is_empty() {
+                    AnthropicInputMessage::Empty
+                } else {
+                    AnthropicInputMessage::System(text)
+                }
             } else {
                 let role = if role == "assistant" {
                     "assistant"
                 } else {
                     "user"
                 };
-                AnthropicInputMessage::Message(json!({ "role": role, "content": content }))
+                AnthropicInputMessage::Message(json!({ "role": role, "content": content.unwrap() }))
             }
         }
     }
@@ -2744,6 +2753,254 @@ fn normalize_message_role(role: Option<&str>) -> &'static str {
         "system" | "developer" | "latest_reminder" => "system",
         _ => "user",
     }
+}
+
+fn chat_content_from_content(value: &Value) -> Option<Value> {
+    multimodal_content_from_content(value, MultimodalTarget::OpenAiChat)
+}
+
+fn anthropic_content_from_content(value: &Value) -> Option<Value> {
+    multimodal_content_from_content(value, MultimodalTarget::Anthropic)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MultimodalTarget {
+    OpenAiChat,
+    Anthropic,
+}
+
+fn multimodal_content_from_content(value: &Value, target: MultimodalTarget) -> Option<Value> {
+    match value {
+        Value::String(text) => non_empty_string(text).map(Value::String),
+        Value::Array(items) => {
+            let mut parts = Vec::new();
+            let mut has_non_text = false;
+            for item in items {
+                if let Some(text) = text_from_content_item(item) {
+                    push_multimodal_text_part(&mut parts, target, text);
+                    continue;
+                }
+                if is_image_content_item(item) {
+                    has_non_text = true;
+                    if let Some(part) = multimodal_image_part(item, target) {
+                        parts.push(part);
+                    } else {
+                        push_multimodal_text_part(
+                            &mut parts,
+                            target,
+                            unsupported_image_message(item, target),
+                        );
+                    }
+                    continue;
+                }
+                if is_file_content_item(item) {
+                    has_non_text = true;
+                    push_multimodal_text_part(&mut parts, target, unsupported_file_message(item));
+                }
+            }
+            multimodal_parts_to_content(parts, has_non_text, target)
+        }
+        Value::Object(_) => {
+            if let Some(text) = text_from_content_item(value) {
+                return Some(Value::String(text));
+            }
+            if is_image_content_item(value) {
+                return multimodal_image_part(value, target)
+                    .map(|part| Value::Array(vec![part]))
+                    .or_else(|| {
+                        Some(Value::Array(vec![multimodal_text_part(
+                            target,
+                            unsupported_image_message(value, target),
+                        )]))
+                    });
+            }
+            if is_file_content_item(value) {
+                return Some(Value::String(unsupported_file_message(value)));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn multimodal_parts_to_content(
+    parts: Vec<Value>,
+    has_non_text: bool,
+    target: MultimodalTarget,
+) -> Option<Value> {
+    if parts.is_empty() {
+        return None;
+    }
+    if has_non_text {
+        return Some(Value::Array(parts));
+    }
+    Some(Value::String(
+        parts
+            .iter()
+            .filter_map(|part| match target {
+                MultimodalTarget::OpenAiChat => part.get("text").and_then(Value::as_str),
+                MultimodalTarget::Anthropic => part.get("text").and_then(Value::as_str),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ))
+}
+
+fn push_multimodal_text_part(parts: &mut Vec<Value>, target: MultimodalTarget, text: String) {
+    if !text.is_empty() {
+        parts.push(multimodal_text_part(target, text));
+    }
+}
+
+fn multimodal_text_part(target: MultimodalTarget, text: String) -> Value {
+    match target {
+        MultimodalTarget::OpenAiChat => json!({ "type": "text", "text": text }),
+        MultimodalTarget::Anthropic => json!({ "type": "text", "text": text }),
+    }
+}
+
+fn multimodal_image_part(item: &Value, target: MultimodalTarget) -> Option<Value> {
+    match target {
+        MultimodalTarget::OpenAiChat => image_url_from_content_item(item).map(|url| {
+            json!({
+                "type": "image_url",
+                "image_url": { "url": url }
+            })
+        }),
+        MultimodalTarget::Anthropic => {
+            anthropic_image_source_from_content_item(item).map(|source| {
+                json!({
+                    "type": "image",
+                    "source": source
+                })
+            })
+        }
+    }
+}
+
+fn text_from_content_item(item: &Value) -> Option<String> {
+    match item {
+        Value::String(text) => non_empty_string(text),
+        Value::Object(_) => item
+            .get("text")
+            .or_else(|| item.get("input_text"))
+            .or_else(|| item.get("output_text"))
+            .and_then(Value::as_str)
+            .and_then(non_empty_string),
+        _ => None,
+    }
+}
+
+fn non_empty_string(text: &str) -> Option<String> {
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn is_image_content_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("input_image" | "image" | "image_url")
+    ) || item.get("image_url").is_some()
+}
+
+fn is_file_content_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("input_file" | "file")
+    ) || item.get("file_id").is_some()
+        || item.get("filename").is_some()
+}
+
+fn image_url_from_content_item(item: &Value) -> Option<String> {
+    item.get("image_url")
+        .and_then(Value::as_str)
+        .or_else(|| item.pointer("/image_url/url").and_then(Value::as_str))
+        .or_else(|| item.get("url").and_then(Value::as_str))
+        .or_else(|| item.get("data_url").and_then(Value::as_str))
+        .map(str::to_string)
+        .or_else(|| base64_source_to_data_url(item.get("source")?))
+}
+
+fn base64_source_to_data_url(source: &Value) -> Option<String> {
+    let source_type = source.get("type").and_then(Value::as_str)?;
+    if source_type != "base64" {
+        return None;
+    }
+    let media_type = source
+        .get("media_type")
+        .and_then(Value::as_str)
+        .filter(|media_type| media_type.to_ascii_lowercase().starts_with("image/"))?;
+    let data = source.get("data").and_then(Value::as_str)?;
+    Some(format!("data:{media_type};base64,{data}"))
+}
+
+fn anthropic_image_source_from_content_item(item: &Value) -> Option<Value> {
+    if let Some(source) = item.get("source") {
+        if source.get("type").and_then(Value::as_str) == Some("base64") {
+            let media_type = source.get("media_type").and_then(Value::as_str)?;
+            if !media_type.to_ascii_lowercase().starts_with("image/") {
+                return None;
+            }
+            let data = source.get("data").and_then(Value::as_str)?;
+            return Some(json!({
+                "type": "base64",
+                "media_type": media_type,
+                "data": data
+            }));
+        }
+    }
+    let image_url = image_url_from_content_item(item)?;
+    let (media_type, data) = parse_image_data_url(&image_url)?;
+    Some(json!({
+        "type": "base64",
+        "media_type": media_type,
+        "data": data
+    }))
+}
+
+fn parse_image_data_url(url: &str) -> Option<(String, String)> {
+    let (metadata, data) = url.strip_prefix("data:")?.split_once(',')?;
+    let metadata_lower = metadata.to_ascii_lowercase();
+    if !metadata_lower.contains(";base64") {
+        return None;
+    }
+    let media_type = metadata
+        .split(';')
+        .next()
+        .filter(|media_type| media_type.to_ascii_lowercase().starts_with("image/"))?;
+    Some((media_type.to_string(), data.to_string()))
+}
+
+fn unsupported_image_message(item: &Value, target: MultimodalTarget) -> String {
+    let detail = item
+        .get("file_id")
+        .or_else(|| item.get("image_file_id"))
+        .and_then(Value::as_str)
+        .map(|id| format!(" file_id={id}"))
+        .unwrap_or_default();
+    match target {
+        MultimodalTarget::OpenAiChat => {
+            format!("[unsupported image input{detail}: Chat Completions routes need an image_url or data URL]")
+        }
+        MultimodalTarget::Anthropic => {
+            format!(
+                "[unsupported image input{detail}: Anthropic routes need a base64 data URL image]"
+            )
+        }
+    }
+}
+
+fn unsupported_file_message(item: &Value) -> String {
+    let detail = item
+        .get("filename")
+        .or_else(|| item.get("file_id"))
+        .and_then(Value::as_str)
+        .map(|value| format!(" {value}"))
+        .unwrap_or_default();
+    format!("[unsupported file input{detail}: file inputs require an OpenAI Responses route]")
 }
 
 fn text_from_content(value: &Value) -> String {
@@ -3052,7 +3309,7 @@ mod tests {
         official_responses_endpoint, post_bytes_with_retries, proxy_raw, proxy_request_headers,
         response_stream_done_events, response_stream_start_events, responses_proxy_body,
         responses_proxy_url, should_skip_proxy_request_header, RawProxyContext, RawSseObserver,
-        ResponsesAuthMode,
+        ResponsesAuthMode, RESPONSES_BODY_LIMIT_BYTES,
     };
     use crate::{
         router::match_route,
@@ -3061,7 +3318,7 @@ mod tests {
             default_config, Provider, ProviderKind, ProviderProtocol, RequestRecord, TokenUsage,
         },
     };
-    use axum::http::{header, HeaderMap, HeaderValue};
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
     use bytes::Bytes;
     use chrono::Utc;
     use futures_util::StreamExt;
@@ -3071,6 +3328,33 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    #[tokio::test]
+    async fn responses_route_accepts_bodies_above_axum_default_limit() {
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(|body: Bytes| async move {
+                assert!(body.len() > 2_097_152);
+                assert!(body.len() < RESPONSES_BODY_LIMIT_BYTES);
+                StatusCode::OK
+            })
+            .layer(axum::extract::DefaultBodyLimit::max(
+                RESPONSES_BODY_LIMIT_BYTES,
+            )),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let body = vec![b'a'; 2_097_153];
+        let response = Client::new().post(url).body(body).send().await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        server.abort();
+    }
 
     #[test]
     fn moves_developer_messages_to_anthropic_system() {
@@ -3243,6 +3527,32 @@ mod tests {
         assert_eq!(body["messages"][2]["content"], "Reply OK");
         assert_eq!(body["max_tokens"], 77);
         assert_eq!(body["temperature"], 0.2);
+    }
+
+    #[test]
+    fn chat_completions_converts_responses_images_to_image_url_parts() {
+        let request = json!({
+            "model": "gpt-test",
+            "input": [{
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Describe this" },
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AAAA"
+                    }
+                ]
+            }],
+            "stream": false
+        });
+
+        let body = build_chat_completions_body(&request, "upstream-chat", false);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Describe this");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
     }
 
     #[test]
@@ -3498,6 +3808,58 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_body_converts_data_url_images_to_image_blocks() {
+        let request = json!({
+            "model": "claude-route",
+            "input": [{
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Describe this" },
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/jpeg;base64,BBBB"
+                    }
+                ]
+            }],
+            "stream": false
+        });
+
+        let body = build_anthropic_body(&request, "claude-upstream", false, true);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Describe this");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(content[1]["source"]["data"], "BBBB");
+    }
+
+    #[test]
+    fn anthropic_body_keeps_clear_text_for_unconvertible_images() {
+        let request = json!({
+            "model": "claude-route",
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": "https://example.com/image.png"
+                }]
+            }],
+            "stream": false
+        });
+
+        let body = build_anthropic_body(&request, "claude-upstream", false, true);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+
+        assert_eq!(content[0]["type"], "text");
+        assert!(content[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Anthropic routes need a base64 data URL image"));
+    }
+
+    #[test]
     fn anthropic_tool_use_returns_responses_function_items() {
         let upstream = json!({
             "content": [{
@@ -3664,6 +4026,41 @@ mod tests {
         assert_eq!(value["model"], "gpt-upstream");
         assert_eq!(value["input"], "OK");
         assert_eq!(value["stream"], false);
+    }
+
+    #[test]
+    fn responses_proxy_preserves_image_and_file_inputs_when_rewriting_model() {
+        let mut config = default_config();
+        config
+            .models
+            .iter_mut()
+            .find(|model| model.id == "gpt-5.5")
+            .unwrap()
+            .upstream_model = Some("gpt-upstream".into());
+        let matched = match_route(&config, "gpt-5.5").unwrap();
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [{
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Use both attachments" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,AAAA" },
+                    { "type": "input_file", "file_id": "file_123" }
+                ]
+            }],
+            "stream": false
+        });
+        let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
+
+        let proxied = responses_proxy_body(body, raw, "gpt-5.5", &matched).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&proxied).unwrap();
+        let content = value["input"][0]["content"].as_array().unwrap();
+
+        assert_eq!(value["model"], "gpt-upstream");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,AAAA");
+        assert_eq!(content[2]["type"], "input_file");
+        assert_eq!(content[2]["file_id"], "file_123");
     }
 
     #[test]

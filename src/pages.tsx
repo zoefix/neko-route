@@ -10,6 +10,7 @@ import {
   IconBrandBilibili as BrandBilibili,
   IconBrandGithub as BrandGithub,
   IconBrandTiktok as BrandTiktok,
+  IconBrandX as BrandX,
   IconBrandYoutube as BrandYoutube,
   IconCloudDownload as DownloadCloud,
   IconCoins as Coins,
@@ -358,6 +359,12 @@ export function About({ notify, notifyRaw }: PageProps) {
       value: "zoefix",
       icon: <BookOpen size={22} />,
       copy: "zoefix",
+    },
+    {
+      label: t("about.twitter"),
+      value: "zoefech",
+      icon: <BrandX size={22} />,
+      url: "https://x.com/zoefech",
     },
     {
       label: "YouTube",
@@ -758,12 +765,28 @@ function EMPTY_MODEL(provider: Provider | undefined): ModelEntry {
   };
 }
 
+function modelIdKey(id: string) {
+  return id.trim();
+}
+
+function sameModelId(a: string, b: string) {
+  const left = modelIdKey(a);
+  return left.length > 0 && left === modelIdKey(b);
+}
+
+function modelSwitchLabel(model: ModelEntry, config: AppConfig) {
+  const provider = config.providers.find((p) => p.id === model.provider_id);
+  const label = model.display_name.trim() || model.id.trim();
+  return provider ? `${label} (${provider.name})` : label;
+}
+
 function ModelModal({
   open,
   onClose,
   config,
   editIndex,
   commit,
+  notifyRaw,
   busy,
 }: {
   open: boolean;
@@ -771,6 +794,7 @@ function ModelModal({
   config: AppConfig;
   editIndex: number | null;
   commit: PageProps["commit"];
+  notifyRaw: PageProps["notifyRaw"];
   busy: boolean;
 }) {
   const { t } = useI18n();
@@ -821,7 +845,13 @@ function ModelModal({
 
   const selectedProvider = config.providers.find((p) => p.id === draft.provider_id);
   const protocolDefaults = providerReasoningDefaults(selectedProvider);
-  const usesReservedCodexModelId = CODEX_RESERVED_MODEL_IDS.has(draft.id.trim());
+  const draftModelId = modelIdKey(draft.id);
+  const usesReservedCodexModelId = CODEX_RESERVED_MODEL_IDS.has(draftModelId);
+  const duplicateModels = config.models.filter((model, index) => {
+    if (isEdit && editIndex === index) return false;
+    return sameModelId(model.id, draftModelId);
+  });
+  const hasDuplicateModelId = duplicateModels.length > 0;
 
   function setProvider(providerId: string) {
     const provider = config.providers.find((p) => p.id === providerId);
@@ -841,15 +871,39 @@ function ModelModal({
     };
     const clean: ModelEntry = {
       ...draft,
-      id: draft.id.trim(),
-      display_name: draft.display_name.trim() || draft.id.trim(),
+      id: draftModelId,
+      display_name: draft.display_name.trim() || draftModelId,
       upstream_model: draft.upstream_model?.trim() || null,
       ...runtimeDefaults,
     };
+    let addedAsDisabledDuplicate = false;
+    if (!isEdit && hasDuplicateModelId) {
+      clean.enabled = false;
+      addedAsDisabledDuplicate = true;
+    }
     const ok = await commit((d) => {
-      if (isEdit && editIndex !== null) d.models[editIndex] = clean;
-      else d.models.push(clean);
-    }, isEdit ? "toast.modelUpdated" : "toast.modelAdded");
+      if (isEdit && editIndex !== null) {
+        d.models[editIndex] = clean;
+        if (clean.enabled) {
+          d.models.forEach((model, index) => {
+            if (index !== editIndex && sameModelId(model.id, clean.id)) {
+              model.enabled = false;
+            }
+          });
+        }
+      } else {
+        d.models.push(clean);
+      }
+    }, addedAsDisabledDuplicate ? "toast.modelAddedDuplicateDisabled" : isEdit ? "toast.modelUpdated" : "toast.modelAdded");
+    if (ok && isEdit && clean.enabled) {
+      const switchedFrom = duplicateModels
+        .filter((model) => model.enabled)
+        .map((model) => modelSwitchLabel(model, config))
+        .join(", ");
+      if (switchedFrom) {
+        notifyRaw(t("toast.modelDuplicateSwitched", { name: switchedFrom }));
+      }
+    }
     if (ok) onClose();
   }
 
@@ -884,6 +938,7 @@ function ModelModal({
         </Field>
       </div>
       {usesReservedCodexModelId ? <div className="reserved-model-warning">{t("model.reservedCodexId")}</div> : null}
+      {hasDuplicateModelId ? <div className="inline-warning">{isEdit ? t("model.duplicateEditHint") : t("model.duplicateAddHint")}</div> : null}
       <Field label={t("model.provider")}>
         <Dropdown value={draft.provider_id} options={providerOptions} onChange={setProvider} />
       </Field>
@@ -1011,6 +1066,18 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
   const [dragOffset, setDragOffset] = React.useState<{ x: number; y: number }>({ x: 35, y: 33 });
   const dragFromRef = React.useRef<number | null>(null);
   const dragOverRef = React.useRef<number | null>(null);
+  const duplicateModelStats = React.useMemo(() => {
+    const stats = new Map<string, { total: number; enabled: number }>();
+    for (const model of config.models) {
+      const id = modelIdKey(model.id);
+      if (!id) continue;
+      const current = stats.get(id) ?? { total: 0, enabled: 0 };
+      current.total += 1;
+      if (model.enabled) current.enabled += 1;
+      stats.set(id, current);
+    }
+    return stats;
+  }, [config.models]);
 
   function openAdd() {
     setEditIndex(null);
@@ -1035,9 +1102,31 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
   }
 
   async function quickToggle(i: number, v: boolean) {
-    await commit((d) => {
-      d.models[i].enabled = v;
+    const current = config.models[i];
+    if (!current) return;
+    const switchedFrom = v
+      ? config.models
+          .filter((model, index) => index !== i && model.enabled && sameModelId(model.id, current.id))
+          .map((model) => modelSwitchLabel(model, config))
+          .join(", ")
+      : "";
+    const ok = await commit((d) => {
+      const target = d.models[i];
+      if (!target) return;
+      if (v) {
+        d.models.forEach((model, index) => {
+          if (index !== i && sameModelId(model.id, target.id)) {
+            model.enabled = false;
+          }
+        });
+        target.enabled = true;
+      } else {
+        target.enabled = false;
+      }
     });
+    if (ok && v && switchedFrom) {
+      notifyRaw(t("toast.modelDuplicateSwitched", { name: switchedFrom }));
+    }
   }
 
   async function reorderModels(from: number, to: number) {
@@ -1159,6 +1248,9 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
             const prov = config.providers.find((p) => p.id === model.provider_id);
             const ident = prov ? providerIcon(prov) : { icon: <CustomProviderIcon size={20} />, cls: "custom" };
             const tokens = modelTokens(model.id);
+            const modelStats = duplicateModelStats.get(modelIdKey(model.id));
+            const hasDuplicateId = (modelStats?.total ?? 0) > 1;
+            const hasEnabledConflict = model.enabled && (modelStats?.enabled ?? 0) > 1;
             const shiftingDown =
               dragIndex !== null &&
               dragOverIndex !== null &&
@@ -1214,6 +1306,11 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
                     <strong>{model.display_name || t("models.empty")}</strong>
                     <span className="entity-sub mono">{model.id}</span>
                     <span className="entity-note">{prov?.name ?? "—"}</span>
+                    {hasDuplicateId ? (
+                      <span className={`entity-note ${hasEnabledConflict ? "warn" : ""}`}>
+                        {hasEnabledConflict ? t("model.duplicateEnabledConflict") : t("model.duplicateIdHint")}
+                      </span>
+                    ) : null}
                   </div>
                 </div>
 
@@ -1249,7 +1346,7 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
         </div>
       )}
 
-      <ModelModal open={modalOpen} onClose={() => setModalOpen(false)} config={config} editIndex={editIndex} commit={commit} busy={busy} />
+      <ModelModal open={modalOpen} onClose={() => setModalOpen(false)} config={config} editIndex={editIndex} commit={commit} notifyRaw={notifyRaw} busy={busy} />
       <TestModal open={testModal.open} onClose={() => setTestModal({ open: false, model: "" })} model={testModal.model} state={testState} />
       <ConfirmDialog
         open={deleteIndex !== null}

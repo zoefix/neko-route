@@ -140,7 +140,7 @@ fn model_to_codex_json(model: &ModelEntry, slug: &str) -> Value {
         "max_context_window": model.context_window,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
-        "input_modalities": ["text"],
+        "input_modalities": ["text", "image"],
         "supports_search_tool": false,
         "use_responses_lite": false,
         "auto_compact_token_limit": null
@@ -180,6 +180,23 @@ mod tests {
         assert_eq!(gpt["supported_in_api"], true);
         assert!(gpt.get("base_instructions").is_some());
         assert!(gpt.get("model_messages").is_some());
+    }
+
+    #[test]
+    fn catalog_exports_all_models_with_image_input_enabled() {
+        let config = default_config();
+        let catalog = catalog_json(&config);
+        let models = catalog["models"].as_array().unwrap();
+
+        assert!(!models.is_empty());
+        for model in models {
+            assert_eq!(
+                model["input_modalities"],
+                serde_json::json!(["text", "image"])
+            );
+            assert_eq!(model["supports_image_detail_original"], true);
+            assert_eq!(model["web_search_tool_type"], "text_and_image");
+        }
     }
 
     #[test]
