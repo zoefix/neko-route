@@ -28,6 +28,7 @@ pub struct ClaudeAuth {
 struct TokenRecord {
     access_token: String,
     source: &'static str,
+    metadata: Option<Value>,
 }
 
 enum DesktopTokenLookup {
@@ -66,6 +67,16 @@ pub fn desktop_auth() -> Result<ClaudeAuth, String> {
     })
 }
 
+pub fn cli_oauth_token_value() -> Result<(Value, String), String> {
+    let token = discover_cli_token(true)?;
+    Ok((token_record_value(&token), token.access_token))
+}
+
+pub fn desktop_oauth_token_value() -> Result<(Value, String), String> {
+    let token = discover_desktop_token()?;
+    Ok((token_record_value(&token), token.access_token))
+}
+
 pub fn cli_credential_json() -> Result<String, String> {
     credential_json(discover_cli_token(true)?)
 }
@@ -82,11 +93,18 @@ pub fn cli_status() -> (bool, bool, Option<String>) {
 }
 
 fn credential_json(token: TokenRecord) -> Result<String, String> {
-    serde_json::to_string_pretty(&json!({
+    serde_json::to_string_pretty(&token_record_value(&token)).map_err(|error| error.to_string())
+}
+
+fn token_record_value(token: &TokenRecord) -> Value {
+    let mut value = json!({
         "access_token": token.access_token,
         "source": token.source,
-    }))
-    .map_err(|error| error.to_string())
+    });
+    if let (Value::Object(object), Some(metadata)) = (&mut value, &token.metadata) {
+        object.insert("metadata".into(), metadata.clone());
+    }
+    value
 }
 
 pub fn desktop_status() -> (bool, bool, Option<String>) {
@@ -107,20 +125,16 @@ pub fn desktop_status() -> (bool, bool, Option<String>) {
 }
 
 fn discover_cli_token(allow_keychain: bool) -> Result<TokenRecord, String> {
-    if let Some(token) = env_token("CLAUDE_CODE_OAUTH_TOKEN") {
-        return Ok(TokenRecord {
-            access_token: token,
-            source: "CLAUDE_CODE_OAUTH_TOKEN",
-        });
+    if let Some(token) = env_token("CLAUDE_CODE_OAUTH_TOKEN")
+        .and_then(|token| token_record_from_secret(&token, "CLAUDE_CODE_OAUTH_TOKEN"))
+    {
+        return Ok(token);
     }
 
-    if let Some(token) =
-        env_token("ANTHROPIC_AUTH_TOKEN").and_then(|token| token_from_secret(&token))
+    if let Some(token) = env_token("ANTHROPIC_AUTH_TOKEN")
+        .and_then(|token| token_record_from_secret(&token, "ANTHROPIC_AUTH_TOKEN"))
     {
-        return Ok(TokenRecord {
-            access_token: token,
-            source: "ANTHROPIC_AUTH_TOKEN",
-        });
+        return Ok(token);
     }
 
     if let Some(token) = token_from_cli_credentials()? {
@@ -165,6 +179,7 @@ fn token_from_cli_credentials() -> Result<Option<TokenRecord>, String> {
     Ok(find_access_token(&value).map(|access_token| TokenRecord {
         access_token,
         source: "Claude Code credentials",
+        metadata: Some(value),
     }))
 }
 
@@ -182,11 +197,8 @@ fn token_from_cli_keychain() -> Result<Option<TokenRecord>, String> {
             };
             match entry.get_password() {
                 Ok(secret) => {
-                    if let Some(access_token) = token_from_secret(&secret) {
-                        return Ok(Some(TokenRecord {
-                            access_token,
-                            source: "Claude Code Keychain",
-                        }));
+                    if let Some(token) = token_record_from_secret(&secret, "Claude Code Keychain") {
+                        return Ok(Some(token));
                     }
                 }
                 Err(keyring::Error::NoEntry) => {}
@@ -252,20 +264,14 @@ fn token_from_desktop_cache_with_decrypter<F>(
 where
     F: FnMut(&str) -> Result<Option<String>, String>,
 {
-    if let Some(access_token) = token_from_secret(cache) {
-        return Ok(DesktopTokenLookup::Usable(TokenRecord {
-            access_token,
-            source: "Claude Desktop config",
-        }));
+    if let Some(token) = token_record_from_secret(cache, "Claude Desktop config") {
+        return Ok(DesktopTokenLookup::Usable(token));
     }
 
     if allow_safe_storage {
         if let Some(plain) = decrypt(cache)? {
-            if let Some(access_token) = token_from_secret(&plain) {
-                return Ok(DesktopTokenLookup::Usable(TokenRecord {
-                    access_token,
-                    source: "Claude Desktop token cache",
-                }));
+            if let Some(token) = token_record_from_secret(&plain, "Claude Desktop token cache") {
+                return Ok(DesktopTokenLookup::Usable(token));
             }
         }
     }
@@ -277,18 +283,26 @@ where
     }
 }
 
-fn token_from_secret(secret: &str) -> Option<String> {
+fn token_record_from_secret(secret: &str, source: &'static str) -> Option<TokenRecord> {
     let trimmed = secret.trim();
     if trimmed.is_empty() {
         return None;
     }
     if trimmed.starts_with('{') {
         if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-            return find_access_token(&value);
+            return find_access_token(&value).map(|access_token| TokenRecord {
+                access_token,
+                source,
+                metadata: Some(value),
+            });
         }
     }
     if looks_like_claude_oauth_access_token(trimmed) {
-        return Some(trimmed.to_string());
+        return Some(TokenRecord {
+            access_token: trimmed.to_string(),
+            source,
+            metadata: None,
+        });
     }
     None
 }
@@ -436,7 +450,8 @@ fn read_json(path: &PathBuf) -> Result<Option<Value>, String> {
 mod tests {
     use super::{
         find_access_token, looks_like_chromium_encrypted_value,
-        token_from_desktop_cache_with_decrypter, token_from_secret, DesktopTokenLookup,
+        token_from_desktop_cache_with_decrypter, token_record_from_secret, token_record_value,
+        DesktopTokenLookup,
     };
     use serde_json::json;
 
@@ -456,12 +471,32 @@ mod tests {
 
     #[test]
     fn ignores_api_keys_for_official_auth() {
-        assert!(token_from_secret("sk-ant-api03-test").is_none());
+        assert!(token_record_from_secret("sk-ant-api03-test", "secret").is_none());
     }
 
     #[test]
     fn ignores_desktop_jwt_tokens_for_official_api_auth() {
-        assert!(token_from_secret("eyJabcdefghijklmnopqrstuvwxyz").is_none());
+        assert!(token_record_from_secret("eyJabcdefghijklmnopqrstuvwxyz", "secret").is_none());
+    }
+
+    #[test]
+    fn preserves_token_metadata_for_quota_plan_parsing() {
+        let token = token_record_from_secret(
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-token","account":{"subscriptionTier":"claude_max_20x"}}}"#,
+            "Claude Desktop token cache",
+        )
+        .unwrap();
+        let value = token_record_value(&token);
+
+        assert_eq!(
+            value
+                .get("metadata")
+                .and_then(|metadata| metadata.get("claudeAiOauth"))
+                .and_then(|oauth| oauth.get("account"))
+                .and_then(|account| account.get("subscriptionTier"))
+                .and_then(serde_json::Value::as_str),
+            Some("claude_max_20x")
+        );
     }
 
     #[test]
@@ -503,6 +538,7 @@ mod tests {
             DesktopTokenLookup::Usable(token) => {
                 assert_eq!(token.access_token, "sk-ant-oat01-decrypted-token");
                 assert_eq!(token.source, "Claude Desktop token cache");
+                assert!(token.metadata.is_some());
             }
             _ => panic!("expected decrypted Claude Desktop token"),
         }

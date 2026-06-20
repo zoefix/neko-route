@@ -18,24 +18,35 @@ mod usage;
 use crate::{
     router::{match_route, match_route_for_provider, RouteMatch},
     store::AppStore,
-    types::{AppConfig, AppSnapshot, ProviderKind, ProviderProtocol, RequestLogPage, TokenUsage},
+    types::{
+        AppConfig, AppSnapshot, Provider, ProviderKind, ProviderProtocol, RequestLogPage,
+        TokenUsage,
+    },
     usage::parse_usage,
 };
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
+    collections::HashMap,
     fs,
+    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
+#[cfg(target_os = "windows")]
+use std::{env, ffi::OsStr, path::PathBuf};
 use tauri::{
     menu::MenuBuilder,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
+use tokio::sync::Mutex;
 
 #[tauri::command]
 async fn get_snapshot(store: tauri::State<'_, AppStore>) -> Result<AppSnapshot, String> {
@@ -106,6 +117,167 @@ async fn set_official_provider_token(
         return Err("This provider does not use official account token JSON".into());
     }
     official_auth::set_provider_token(&provider.id, &token_json)?;
+    if matches!(
+        provider.kind,
+        ProviderKind::OfficialOpenAiAccount | ProviderKind::OfficialAnthropicAccount
+    ) {
+        let _ = refresh_official_usage_for_provider(&store, provider).await;
+    }
+    Ok(store.snapshot().await)
+}
+
+#[derive(Clone, Default)]
+struct OpenAiOAuthSessions {
+    sessions: Arc<Mutex<HashMap<String, official_auth::OpenAiOAuthSession>>>,
+}
+
+#[derive(Clone, Default)]
+struct ClaudeOAuthSessions {
+    sessions: Arc<Mutex<HashMap<String, official_auth::ClaudeOAuthSession>>>,
+}
+
+#[derive(Serialize)]
+struct OAuthStart {
+    session_id: String,
+    auth_url: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+struct CodexAppStatus {
+    running: bool,
+}
+
+#[derive(Serialize)]
+struct CodexAppRestartResult {
+    action: &'static str,
+}
+
+#[tauri::command]
+async fn start_openai_oauth(
+    sessions: tauri::State<'_, OpenAiOAuthSessions>,
+) -> Result<OAuthStart, String> {
+    let session = official_auth::start_openai_oauth_session();
+    let result = OAuthStart {
+        session_id: session.session_id.clone(),
+        auth_url: session.auth_url.clone(),
+        expires_at: session.expires_at,
+    };
+    sessions
+        .sessions
+        .lock()
+        .await
+        .insert(session.session_id.clone(), session);
+    Ok(result)
+}
+
+#[tauri::command]
+async fn finish_openai_oauth(
+    store: tauri::State<'_, AppStore>,
+    sessions: tauri::State<'_, OpenAiOAuthSessions>,
+    provider_id: String,
+    session_id: String,
+    callback_or_code: String,
+) -> Result<AppSnapshot, String> {
+    let config = store.config().await;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| "Provider not found".to_string())?;
+    if provider.kind != ProviderKind::OfficialOpenAiAccount {
+        return Err("This provider does not use OpenAI OAuth".into());
+    }
+    let session = sessions
+        .sessions
+        .lock()
+        .await
+        .remove(&session_id)
+        .ok_or_else(|| "OpenAI OAuth session not found or expired".to_string())?;
+    if session.expires_at <= Utc::now() {
+        return Err("OpenAI OAuth session expired. Generate a new authorization link.".into());
+    }
+    let code = official_auth::extract_openai_oauth_code(&callback_or_code, &session.state)?;
+    let client = reqwest::Client::new();
+    let token =
+        official_auth::exchange_openai_oauth_code(&client, &code, &session.code_verifier).await?;
+    official_auth::set_provider_token_value(&provider.id, token)?;
+    let _ = refresh_official_usage_for_provider(&store, provider).await;
+    Ok(store.snapshot().await)
+}
+
+#[tauri::command]
+async fn start_claude_oauth(
+    sessions: tauri::State<'_, ClaudeOAuthSessions>,
+) -> Result<OAuthStart, String> {
+    let session = official_auth::start_claude_oauth_session();
+    let result = OAuthStart {
+        session_id: session.session_id.clone(),
+        auth_url: session.auth_url.clone(),
+        expires_at: session.expires_at,
+    };
+    sessions
+        .sessions
+        .lock()
+        .await
+        .insert(session.session_id.clone(), session);
+    Ok(result)
+}
+
+#[tauri::command]
+async fn finish_claude_oauth(
+    store: tauri::State<'_, AppStore>,
+    sessions: tauri::State<'_, ClaudeOAuthSessions>,
+    provider_id: String,
+    session_id: String,
+    callback_or_code: String,
+) -> Result<AppSnapshot, String> {
+    let config = store.config().await;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| "Provider not found".to_string())?;
+    if provider.kind != ProviderKind::OfficialAnthropicAccount {
+        return Err("This provider does not use Claude OAuth".into());
+    }
+    let session = sessions
+        .sessions
+        .lock()
+        .await
+        .remove(&session_id)
+        .ok_or_else(|| "Claude OAuth session not found or expired".to_string())?;
+    if session.expires_at <= Utc::now() {
+        return Err("Claude OAuth session expired. Generate a new authorization link.".into());
+    }
+    let code = official_auth::extract_claude_oauth_code(&callback_or_code, &session.state)?;
+    let client = reqwest::Client::new();
+    let token =
+        official_auth::exchange_claude_oauth_code(&client, &code, &session.code_verifier).await?;
+    official_auth::set_provider_token_value(&provider.id, token)?;
+    let _ = refresh_official_usage_for_provider(&store, provider).await;
+    Ok(store.snapshot().await)
+}
+
+#[tauri::command]
+async fn finish_claude_cookie_oauth(
+    store: tauri::State<'_, AppStore>,
+    provider_id: String,
+    session_key: String,
+) -> Result<AppSnapshot, String> {
+    let config = store.config().await;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| "Provider not found".to_string())?;
+    if provider.kind != ProviderKind::OfficialAnthropicAccount {
+        return Err("This provider does not use Claude OAuth".into());
+    }
+    let client = reqwest::Client::new();
+    let token = official_auth::exchange_claude_cookie_session_key(&client, &session_key).await?;
+    official_auth::set_provider_token_value(&provider.id, token)?;
+    let _ = refresh_official_usage_for_provider(&store, provider).await;
     Ok(store.snapshot().await)
 }
 
@@ -140,7 +312,38 @@ async fn refresh_official_provider_token(
         .ok_or_else(|| "Provider not found".to_string())?;
     let client = reqwest::Client::new();
     official_auth::refresh_provider_token(&client, provider).await?;
+    if matches!(
+        provider.kind,
+        ProviderKind::OfficialOpenAiAccount | ProviderKind::OfficialAnthropicAccount
+    ) {
+        let _ = refresh_official_usage_for_provider(&store, provider).await;
+    }
     Ok(store.snapshot().await)
+}
+
+#[tauri::command]
+async fn codex_app_status() -> Result<CodexAppStatus, String> {
+    tokio::task::spawn_blocking(|| CodexAppStatus {
+        running: codex_desktop_running(),
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn restart_codex_app() -> Result<CodexAppRestartResult, String> {
+    tokio::task::spawn_blocking(|| {
+        let running = codex_desktop_running();
+        if running {
+            stop_codex_desktop()?;
+        }
+        start_codex_desktop()?;
+        Ok(CodexAppRestartResult {
+            action: codex_restart_action(running),
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -842,6 +1045,418 @@ fn provider_status_error(status: reqwest::StatusCode, body: &str) -> String {
     format!("Provider returned {}: {}", status.as_u16(), message)
 }
 
+fn codex_restart_action(was_running: bool) -> &'static str {
+    if was_running {
+        "restarted"
+    } else {
+        "started"
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn codex_macos_process_pattern() -> &'static str {
+    "Codex.app/Contents/MacOS/Codex$"
+}
+
+#[cfg(target_os = "macos")]
+fn codex_desktop_running() -> bool {
+    Command::new("pgrep")
+        .args(["-f", codex_macos_process_pattern()])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(target_os = "macos")]
+fn stop_codex_desktop() -> Result<(), String> {
+    let _ = Command::new("osascript")
+        .args(["-e", "tell application \"Codex\" to quit"])
+        .status();
+    if wait_until_codex_stopped(Duration::from_secs(6)) {
+        return Ok(());
+    }
+    let _ = Command::new("pkill")
+        .args(["-TERM", "-f", codex_macos_process_pattern()])
+        .status();
+    if wait_until_codex_stopped(Duration::from_secs(3)) {
+        return Ok(());
+    }
+    let _ = Command::new("pkill")
+        .args(["-KILL", "-f", codex_macos_process_pattern()])
+        .status();
+    if wait_until_codex_stopped(Duration::from_secs(3)) {
+        Ok(())
+    } else {
+        Err("Could not stop Codex desktop app".into())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_codex_desktop() -> Result<(), String> {
+    if Command::new("open")
+        .args(["-a", "Codex"])
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return Ok(());
+    }
+    Command::new("open")
+        .arg("/Applications/Codex.app")
+        .status()
+        .map_err(|error| format!("Could not start Codex desktop app: {error}"))
+        .and_then(|status| {
+            status
+                .success()
+                .then_some(())
+                .ok_or_else(|| "Could not start Codex desktop app".to_string())
+        })
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(target_os = "windows")]
+fn windows_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.creation_flags(WINDOWS_CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn windows_codex_process_names() -> [&'static str; 2] {
+    ["Codex.exe", "OpenAI Codex.exe"]
+}
+
+#[cfg(target_os = "windows")]
+fn windows_codex_executable_names() -> [&'static str; 2] {
+    ["Codex.exe", "OpenAI Codex.exe"]
+}
+
+#[cfg(target_os = "windows")]
+fn codex_desktop_running() -> bool {
+    windows_codex_process_names().iter().any(|process_name| {
+        let filter = format!("IMAGENAME eq {process_name}");
+        windows_command("tasklist")
+            .args(["/FI", &filter, "/NH"])
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .is_some_and(|output| {
+                output
+                    .to_ascii_lowercase()
+                    .contains(&process_name.to_ascii_lowercase())
+            })
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn stop_codex_desktop() -> Result<(), String> {
+    for process_name in windows_codex_process_names() {
+        let _ = windows_command("taskkill")
+            .args(["/IM", process_name, "/T", "/F"])
+            .status();
+    }
+    if wait_until_codex_stopped(Duration::from_secs(8)) {
+        Ok(())
+    } else {
+        Err("Could not stop Codex desktop app".into())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_reg_default_path(output: &str) -> Option<PathBuf> {
+    output.lines().find_map(|line| {
+        let (_, value) = line.split_once("REG_SZ")?;
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_codex_app_path_from_registry() -> Vec<PathBuf> {
+    [
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\Codex.exe",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\OpenAI Codex.exe",
+        r"HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\Codex.exe",
+        r"HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\OpenAI Codex.exe",
+    ]
+    .iter()
+    .filter_map(|key| {
+        let output = windows_command("reg")
+            .args(["query", key, "/ve"])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+            .and_then(|text| parse_windows_reg_default_path(&text))
+    })
+    .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_codex_paths_from_path() -> Vec<PathBuf> {
+    windows_codex_executable_names()
+        .iter()
+        .filter_map(|executable| {
+            windows_command("where.exe")
+                .arg(executable)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+        })
+        .flat_map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn push_windows_codex_folder_paths(paths: &mut Vec<PathBuf>, folder: PathBuf) {
+    for executable in windows_codex_executable_names() {
+        paths.push(folder.join(executable));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_codex_common_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        for folder in [
+            local_app_data.join("Programs").join("Codex"),
+            local_app_data.join("Programs").join("OpenAI Codex"),
+            local_app_data.join("Codex"),
+            local_app_data.join("OpenAI Codex"),
+            local_app_data.join("OpenAI").join("Codex"),
+            local_app_data.join("Microsoft").join("WindowsApps"),
+        ] {
+            push_windows_codex_folder_paths(&mut paths, folder);
+        }
+    }
+    for var in ["PROGRAMFILES", "PROGRAMFILES(X86)"] {
+        if let Some(base) = env::var_os(var).map(PathBuf::from) {
+            for folder in [
+                base.join("Codex"),
+                base.join("OpenAI Codex"),
+                base.join("OpenAI").join("Codex"),
+            ] {
+                push_windows_codex_folder_paths(&mut paths, folder);
+            }
+        }
+    }
+    paths
+}
+
+#[cfg(target_os = "windows")]
+fn collect_windows_shortcuts(root: &PathBuf, depth: usize, paths: &mut Vec<PathBuf>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_windows_shortcuts(&path, depth - 1, paths);
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let lower = file_name.to_ascii_lowercase();
+        if lower.ends_with(".lnk") && lower.contains("codex") {
+            paths.push(path);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_start_menu_programs_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(app_data) = env::var_os("APPDATA").map(PathBuf::from) {
+        dirs.push(
+            app_data
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs"),
+        );
+    }
+    if let Some(program_data) = env::var_os("PROGRAMDATA").map(PathBuf::from) {
+        dirs.push(
+            program_data
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs"),
+        );
+    }
+    dirs
+}
+
+#[cfg(target_os = "windows")]
+fn windows_codex_shortcut_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for programs in windows_start_menu_programs_dirs() {
+        for name in ["Codex.lnk", "OpenAI Codex.lnk", "Codex Desktop.lnk"] {
+            paths.push(programs.join(name));
+            paths.push(programs.join("OpenAI").join(name));
+        }
+        collect_windows_shortcuts(&programs, 4, &mut paths);
+    }
+    paths
+}
+
+#[cfg(target_os = "windows")]
+fn dedupe_windows_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped = Vec::new();
+    for path in paths {
+        let key = path.to_string_lossy().to_ascii_lowercase();
+        if seen.insert(key) {
+            deduped.push(path);
+        }
+    }
+    deduped
+}
+
+#[cfg(target_os = "windows")]
+fn shell_execute_windows(target: &OsStr) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{UI::Shell::ShellExecuteW, UI::WindowsAndMessaging::SW_SHOWNORMAL};
+
+    let verb = OsStr::new("open")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let file = target
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if result > 32 {
+        Ok(())
+    } else {
+        Err(format!("ShellExecute failed with code {result}"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn start_codex_desktop() -> Result<(), String> {
+    let candidates = dedupe_windows_paths(
+        windows_codex_app_path_from_registry()
+            .into_iter()
+            .chain(windows_codex_paths_from_path())
+            .chain(windows_codex_common_paths())
+            .chain(windows_codex_shortcut_paths())
+            .collect(),
+    );
+
+    let mut errors = Vec::new();
+    for path in candidates.iter().filter(|path| path.exists()) {
+        match shell_execute_windows(path.as_os_str()) {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+
+    for target in ["Codex.exe", "Codex"] {
+        match shell_execute_windows(OsStr::new(target)) {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(format!("{target}: {error}")),
+        }
+    }
+
+    if errors.is_empty() {
+        Err("Could not start Codex desktop app".into())
+    } else {
+        Err(format!(
+            "Could not start Codex desktop app. Tried: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn codex_desktop_running() -> bool {
+    Command::new("pgrep")
+        .args(["-x", "Codex"])
+        .status()
+        .is_ok_and(|status| status.success())
+        || Command::new("pgrep")
+            .args(["-x", "codex"])
+            .status()
+            .is_ok_and(|status| status.success())
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn stop_codex_desktop() -> Result<(), String> {
+    let _ = Command::new("pkill")
+        .args(["-TERM", "-x", "Codex"])
+        .status();
+    let _ = Command::new("pkill")
+        .args(["-TERM", "-x", "codex"])
+        .status();
+    if wait_until_codex_stopped(Duration::from_secs(5)) {
+        return Ok(());
+    }
+    let _ = Command::new("pkill")
+        .args(["-KILL", "-x", "Codex"])
+        .status();
+    let _ = Command::new("pkill")
+        .args(["-KILL", "-x", "codex"])
+        .status();
+    if wait_until_codex_stopped(Duration::from_secs(3)) {
+        Ok(())
+    } else {
+        Err("Could not stop Codex desktop app".into())
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn start_codex_desktop() -> Result<(), String> {
+    for (program, args) in [
+        ("gtk-launch", &["codex.desktop"][..]),
+        ("gtk-launch", &["Codex.desktop"][..]),
+        ("codex", &[][..]),
+    ] {
+        if Command::new(program)
+            .args(args)
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return Ok(());
+        }
+    }
+    Err("Could not start Codex desktop app".into())
+}
+
+fn wait_until_codex_stopped(timeout: Duration) -> bool {
+    let started_at = Instant::now();
+    while started_at.elapsed() < timeout {
+        if !codex_desktop_running() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    !codex_desktop_running()
+}
+
 #[tauri::command]
 async fn refresh_provider_usage(
     store: tauri::State<'_, AppStore>,
@@ -853,38 +1468,54 @@ async fn refresh_provider_usage(
         .iter()
         .find(|p| p.id == provider_id)
         .ok_or_else(|| "Provider not found".to_string())?;
+    match refresh_official_usage_for_provider(&store, provider).await {
+        Ok(()) => Ok(store.snapshot().await),
+        Err(error) => {
+            if matches!(
+                &provider.kind,
+                ProviderKind::OfficialOpenAiAccount
+                    | ProviderKind::OfficialOpenAi
+                    | ProviderKind::OfficialAnthropicAccount
+                    | ProviderKind::OfficialAnthropicCli
+                    | ProviderKind::OfficialAnthropicDesktop
+            ) {
+                store
+                    .update_provider_usage_snapshot(
+                        provider.id.clone(),
+                        "unavailable".into(),
+                        None,
+                        Some(error.clone()),
+                    )
+                    .await;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn refresh_official_usage_for_provider(
+    store: &AppStore,
+    provider: &Provider,
+) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let quota_result = match provider.kind {
+    let quota = match &provider.kind {
         ProviderKind::OfficialOpenAiAccount => {
             official_usage::fetch_openai_quota(&client, provider).await
         }
         ProviderKind::OfficialOpenAi => official_usage::fetch_codex_openai_quota(&client).await,
-        _ => Err("Only OpenAI official account providers expose account quota".into()),
-    };
-    match quota_result {
-        Ok(quota) => {
-            store
-                .update_provider_usage_snapshot(
-                    provider.id.clone(),
-                    "live".into(),
-                    Some(quota),
-                    None,
-                )
-                .await;
-            Ok(store.snapshot().await)
+        ProviderKind::OfficialAnthropicCli => official_usage::fetch_claude_cli_quota(&client).await,
+        ProviderKind::OfficialAnthropicDesktop => {
+            official_usage::fetch_claude_desktop_quota(&client).await
         }
-        Err(error) => {
-            store
-                .update_provider_usage_snapshot(
-                    provider.id.clone(),
-                    "unavailable".into(),
-                    None,
-                    Some(error.clone()),
-                )
-                .await;
-            Err(error)
+        ProviderKind::OfficialAnthropicAccount => {
+            official_usage::fetch_claude_quota(&client, provider).await
         }
-    }
+        _ => return Err("Only official account providers expose account quota".into()),
+    }?;
+    store
+        .update_provider_usage_snapshot(provider.id.clone(), "live".into(), Some(quota), None)
+        .await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -943,7 +1574,7 @@ async fn get_request_logs(
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_responses_test_payload, openai_official_test_headers,
+        codex_responses_test_payload, codex_restart_action, openai_official_test_headers,
         openai_official_upstream_models, provider_error_message, provider_status_error,
         test_reply_from_value, test_response_value,
     };
@@ -971,6 +1602,12 @@ mod tests {
         ] {
             assert!(payload.get(field).is_none(), "{field} should not be sent");
         }
+    }
+
+    #[test]
+    fn codex_restart_action_reflects_previous_running_state() {
+        assert_eq!(codex_restart_action(false), "started");
+        assert_eq!(codex_restart_action(true), "restarted");
     }
 
     #[test]
@@ -1009,7 +1646,6 @@ mod tests {
             kind: ProviderKind::OfficialOpenAi,
             protocol: ProviderProtocol::OpenAiResponses,
             base_url: "https://api.openai.com/v1".into(),
-            enabled: true,
             key_ref: None,
         };
         let added = Provider {
@@ -1018,7 +1654,6 @@ mod tests {
             kind: ProviderKind::OfficialOpenAiAccount,
             protocol: ProviderProtocol::OpenAiResponses,
             base_url: "https://api.openai.com/v1".into(),
-            enabled: true,
             key_ref: Some("official-token:openai-account".into()),
         };
 
@@ -1198,6 +1833,46 @@ fn hide_main_window(app: &tauri::AppHandle) {
     let _ = app.set_dock_visibility(false);
 }
 
+fn configure_native_window_frame(window: &tauri::WebviewWindow) {
+    configure_platform_window_frame(window);
+}
+
+#[cfg(target_os = "macos")]
+fn configure_platform_window_frame(window: &tauri::WebviewWindow) {
+    let _ = window.set_decorations(true);
+    let _ = window.set_title_bar_style(tauri::TitleBarStyle::Overlay);
+    let _ = window.set_shadow(true);
+}
+
+#[cfg(target_os = "windows")]
+fn configure_platform_window_frame(window: &tauri::WebviewWindow) {
+    use std::mem::size_of;
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE,
+    };
+
+    let _ = window.set_decorations(false);
+    let _ = window.set_shadow(true);
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let preference: u32 = 2;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd.0 as _,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &preference as *const _ as *const std::ffi::c_void,
+            size_of::<u32>() as u32,
+        );
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn configure_platform_window_frame(window: &tauri::WebviewWindow) {
+    let _ = window.set_decorations(true);
+    let _ = window.set_shadow(true);
+}
+
 fn setup_tray(app: &mut tauri::App, exit_requested: Arc<AtomicBool>) -> tauri::Result<()> {
     let menu = MenuBuilder::new(app)
         .text("add_provider", "添加服务商")
@@ -1255,11 +1930,17 @@ pub fn run() {
     let close_exit_requested = exit_requested.clone();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             setup_tray(app, setup_exit_requested.clone())?;
+            if let Some(window) = app.get_webview_window("main") {
+                configure_native_window_frame(&window);
+            }
             let app_data_dir = app
                 .path()
                 .app_data_dir()
@@ -1268,6 +1949,8 @@ pub fn run() {
             let server_store = store.clone();
             let catalog_store = store.clone();
             app.manage(store);
+            app.manage(OpenAiOAuthSessions::default());
+            app.manage(ClaudeOAuthSessions::default());
             tauri::async_runtime::spawn(async move {
                 let codex_home = codex_config::resolve_codex_home();
                 let _ = catalog_store.export_catalog_to(&codex_home).await;
@@ -1298,9 +1981,16 @@ pub fn run() {
             set_provider_key,
             delete_provider_key,
             set_official_provider_token,
+            start_openai_oauth,
+            finish_openai_oauth,
+            start_claude_oauth,
+            finish_claude_oauth,
+            finish_claude_cookie_oauth,
             delete_official_provider_token,
             refresh_official_provider_token,
             read_provider_credential,
+            codex_app_status,
+            restart_codex_app,
             test_route,
             test_model,
             list_upstream_models,

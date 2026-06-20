@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Neko Route",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "dev.neko.route",
   "build": {
     "beforeDevCommand": "npm run web:dev",
@@ -17,7 +17,15 @@
         "height": 820,
         "minWidth": 1060,
         "minHeight": 680,
-        "resizable": true
+        "resizable": true,
+        "decorations": true,
+        "transparent": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 18,
+          "y": 18
+        }
       }
     ],
     "security": {

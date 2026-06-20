@@ -1,5 +1,5 @@
 use crate::types::{
-    DayTokens, ModelTokens, OpenAiAccountQuota, ProviderLocalUsage, ProviderProtocol,
+    DayTokens, ModelTokens, OfficialAccountQuota, ProviderLocalUsage, ProviderProtocol,
     ProviderUsageStatus, RequestLogPage, RequestRecord, TokenStats, TokenTotals, TokenUsage,
 };
 use chrono::{DateTime, Local, Utc};
@@ -382,7 +382,7 @@ impl RequestLog {
                 .get::<_, Option<String>>(4)
                 .ok()
                 .flatten()
-                .and_then(|value| serde_json::from_str::<OpenAiAccountQuota>(&value).ok());
+                .and_then(|value| serde_json::from_str::<OfficialAccountQuota>(&value).ok());
             Ok(ProviderUsageStatus {
                 provider_id: provider_id.clone(),
                 quota,
@@ -403,7 +403,7 @@ impl RequestLog {
         &self,
         provider_id: &str,
         source: &str,
-        quota: Option<&OpenAiAccountQuota>,
+        quota: Option<&OfficialAccountQuota>,
         error: Option<&str>,
     ) {
         let conn = self.conn.lock().unwrap();
@@ -818,9 +818,9 @@ mod tests {
     fn usage_snapshot_error_keeps_existing_quota() {
         let temp = tempfile::tempdir().unwrap();
         let log = RequestLog::open(&temp.path().join("requests.db")).unwrap();
-        let quota = OpenAiAccountQuota {
+        let quota = OfficialAccountQuota {
             account_id: Some("acct".into()),
-            ..OpenAiAccountQuota::default()
+            ..OfficialAccountQuota::default()
         };
         log.upsert_provider_usage_snapshot("openai-account", "passive", Some(&quota), None);
         log.upsert_provider_usage_snapshot(

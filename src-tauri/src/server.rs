@@ -3980,7 +3980,6 @@ mod tests {
             kind: ProviderKind::OfficialOpenAiAccount,
             protocol: ProviderProtocol::OpenAiResponses,
             base_url: "https://api.openai.com/v1".into(),
-            enabled: true,
             key_ref: None,
         };
         let headers = HeaderMap::new();
@@ -4072,7 +4071,6 @@ mod tests {
             kind: ProviderKind::Custom,
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url: "https://deepseek.example/v1".into(),
-            enabled: true,
             key_ref: Some("provider:deepseek".into()),
         });
         let mut deepseek = config.models[0].clone();

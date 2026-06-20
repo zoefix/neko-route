@@ -2,9 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppConfig,
   AppSnapshot,
+  CodexAppRestartResult,
+  CodexAppStatus,
   CodexConfigContent,
   CodexConfigSaveResult,
   ImportResult,
+  OAuthStart,
   ProviderCredential,
   RequestLogPage,
   TestModelResult,
@@ -80,6 +83,66 @@ export const api = {
   refreshOfficialProviderToken: (providerId: string) =>
     isTauri ? invoke<AppSnapshot>("refresh_official_provider_token", { providerId }) : Promise.resolve(demoSnap()),
 
+  startOpenAiOAuth: () =>
+    isTauri
+      ? invoke<OAuthStart>("start_openai_oauth")
+      : Promise.resolve({
+          session_id: "demo-session",
+          auth_url: "https://auth.openai.com/oauth/authorize?demo=1",
+          expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        } as OAuthStart),
+
+  finishOpenAiOAuth: (providerId: string, sessionId: string, callbackOrCode: string) => {
+    if (!isTauri) {
+      const prev = demoSnap();
+      demo = {
+        ...prev,
+        keys: prev.keys.map((k) =>
+          k.provider_id === providerId ? { ...k, present: callbackOrCode.trim().length > 0, available: true, message: null } : k,
+        ),
+      };
+      return Promise.resolve(demo);
+    }
+    return invoke<AppSnapshot>("finish_openai_oauth", { providerId, sessionId, callbackOrCode });
+  },
+
+  startClaudeOAuth: () =>
+    isTauri
+      ? invoke<OAuthStart>("start_claude_oauth")
+      : Promise.resolve({
+          session_id: "demo-claude-session",
+          auth_url: "https://claude.ai/oauth/authorize?demo=1",
+          expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        } as OAuthStart),
+
+  finishClaudeOAuth: (providerId: string, sessionId: string, callbackOrCode: string) => {
+    if (!isTauri) {
+      const prev = demoSnap();
+      demo = {
+        ...prev,
+        keys: prev.keys.map((k) =>
+          k.provider_id === providerId ? { ...k, present: callbackOrCode.trim().length > 0, available: true, message: null } : k,
+        ),
+      };
+      return Promise.resolve(demo);
+    }
+    return invoke<AppSnapshot>("finish_claude_oauth", { providerId, sessionId, callbackOrCode });
+  },
+
+  finishClaudeCookieOAuth: (providerId: string, sessionKey: string) => {
+    if (!isTauri) {
+      const prev = demoSnap();
+      demo = {
+        ...prev,
+        keys: prev.keys.map((k) =>
+          k.provider_id === providerId ? { ...k, present: sessionKey.trim().length > 0, available: true, message: null } : k,
+        ),
+      };
+      return Promise.resolve(demo);
+    }
+    return invoke<AppSnapshot>("finish_claude_cookie_oauth", { providerId, sessionKey });
+  },
+
   readProviderCredential: (providerId: string) => {
     if (!isTauri) {
       const provider = demoSnap().config.providers.find((p) => p.id === providerId);
@@ -127,6 +190,16 @@ export const api = {
     isTauri
       ? invoke<AppSnapshot>("refresh_provider_usage", { providerId })
       : Promise.resolve(demoSnap()),
+
+  codexAppStatus: () =>
+    isTauri
+      ? invoke<CodexAppStatus>("codex_app_status")
+      : Promise.resolve({ running: false } as CodexAppStatus),
+
+  restartCodexApp: () =>
+    isTauri
+      ? invoke<CodexAppRestartResult>("restart_codex_app")
+      : Promise.resolve({ action: "started" } as CodexAppRestartResult),
 
   exportCatalog: () =>
     isTauri ? invoke<string>("export_catalog") : Promise.resolve("/demo/.codex/model-catalogs/neko-route.json"),

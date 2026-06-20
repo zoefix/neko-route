@@ -11,22 +11,38 @@ use keyring::Entry;
 use reqwest::Client;
 use serde_json::{json, Map, Value};
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
 };
+use url::Url;
+use uuid::Uuid;
 
 const KEYCHAIN_SERVICE: &str = "Neko Route Official Tokens";
 const TOKEN_FILE_REF_PREFIX: &str = "file:v1:";
 const DIRECT_KEYCHAIN_UTF16_LIMIT: usize = 2400;
+const OPENAI_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+const OPENAI_AUTHORIZE_SCOPE: &str = "openid profile email offline_access";
 const OPENAI_REFRESH_SCOPE: &str = "openid profile email";
 const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const OPENAI_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-const ANTHROPIC_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+const ANTHROPIC_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+const ANTHROPIC_BASE_URL: &str = "https://claude.ai";
+const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const ANTHROPIC_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
+const ANTHROPIC_AUTHORIZE_SCOPE: &str =
+    "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const ANTHROPIC_COOKIE_SCOPE: &str =
+    "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const REFRESH_SKEW_SECONDS: i64 = 300;
+const OPENAI_OAUTH_SESSION_TTL_SECONDS: i64 = 30 * 60;
+const CLAUDE_OAUTH_SESSION_TTL_SECONDS: i64 = 30 * 60;
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +63,24 @@ pub struct ParsedToken {
     pub refresh_token: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
     pub token_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAiOAuthSession {
+    pub session_id: String,
+    pub state: String,
+    pub code_verifier: String,
+    pub auth_url: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaudeOAuthSession {
+    pub session_id: String,
+    pub state: String,
+    pub code_verifier: String,
+    pub auth_url: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 pub fn account_kind(provider: &Provider) -> Option<OfficialAccountKind> {
@@ -87,9 +121,552 @@ pub fn openai_builtin_models() -> Vec<(String, String)> {
 
 pub fn set_provider_token(provider_id: &str, raw_json: &str) -> Result<(), String> {
     let value = parse_json_value(raw_json)?;
+    set_provider_token_value(provider_id, value)
+}
+
+pub fn set_provider_token_value(provider_id: &str, value: Value) -> Result<(), String> {
     let token = parse_token_value(&value)?;
     let normalized = normalized_token_value(value, &token);
     write_keychain_value(&token_ref(provider_id), &normalized)
+}
+
+pub fn start_openai_oauth_session() -> OpenAiOAuthSession {
+    let session_id = random_oauth_id();
+    let state = random_oauth_secret();
+    let code_verifier = random_oauth_secret();
+    let code_challenge = openai_oauth_code_challenge(&code_verifier);
+    let mut url = Url::parse(OPENAI_AUTHORIZE_URL).expect("OpenAI OAuth authorize URL is valid");
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", OPENAI_CLIENT_ID)
+        .append_pair("redirect_uri", OPENAI_REDIRECT_URI)
+        .append_pair("scope", OPENAI_AUTHORIZE_SCOPE)
+        .append_pair("state", &state)
+        .append_pair("code_challenge", &code_challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("id_token_add_organizations", "true")
+        .append_pair("codex_cli_simplified_flow", "true");
+    OpenAiOAuthSession {
+        session_id,
+        state,
+        code_verifier,
+        auth_url: url.to_string(),
+        expires_at: Utc::now() + Duration::seconds(OPENAI_OAUTH_SESSION_TTL_SECONDS),
+    }
+}
+
+pub fn start_claude_oauth_session() -> ClaudeOAuthSession {
+    let session_id = random_oauth_id();
+    let state = random_oauth_secret();
+    let code_verifier = random_oauth_secret();
+    let code_challenge = claude_oauth_code_challenge(&code_verifier);
+    let mut url = Url::parse(ANTHROPIC_AUTHORIZE_URL).expect("Claude OAuth authorize URL is valid");
+    url.query_pairs_mut()
+        .append_pair("code", "true")
+        .append_pair("client_id", ANTHROPIC_CLIENT_ID)
+        .append_pair("response_type", "code")
+        .append_pair("redirect_uri", ANTHROPIC_REDIRECT_URI)
+        .append_pair("scope", ANTHROPIC_AUTHORIZE_SCOPE)
+        .append_pair("code_challenge", &code_challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", &state);
+    ClaudeOAuthSession {
+        session_id,
+        state,
+        code_verifier,
+        auth_url: url.to_string(),
+        expires_at: Utc::now() + Duration::seconds(CLAUDE_OAUTH_SESSION_TTL_SECONDS),
+    }
+}
+
+pub fn openai_oauth_code_challenge(code_verifier: &str) -> String {
+    oauth_code_challenge(code_verifier)
+}
+
+pub fn claude_oauth_code_challenge(code_verifier: &str) -> String {
+    oauth_code_challenge(code_verifier)
+}
+
+fn oauth_code_challenge(code_verifier: &str) -> String {
+    let hash = Sha256::digest(code_verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(hash)
+}
+
+fn random_oauth_id() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
+fn random_oauth_secret() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+pub fn extract_openai_oauth_code(input: &str, expected_state: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("OpenAI OAuth callback URL or code is required".into());
+    }
+
+    if let Ok(url) = Url::parse(trimmed) {
+        return extract_openai_oauth_code_from_pairs(url.query_pairs(), Some(expected_state));
+    }
+
+    if trimmed.contains('=') {
+        let query = trimmed
+            .split_once('?')
+            .map(|(_, query)| query)
+            .unwrap_or(trimmed);
+        let pairs = url::form_urlencoded::parse(query.as_bytes());
+        return extract_openai_oauth_code_from_pairs(pairs, Some(expected_state));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn extract_openai_oauth_code_from_pairs<'a, I>(
+    pairs: I,
+    expected_state: Option<&str>,
+) -> Result<String, String>
+where
+    I: IntoIterator<Item = (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)>,
+{
+    let mut code = None;
+    let mut state = None;
+    for (key, value) in pairs {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    if let Some(expected) = expected_state {
+        if let Some(actual) = state.as_deref() {
+            if actual != expected {
+                return Err("OpenAI OAuth state does not match this authorization session".into());
+            }
+        }
+    }
+    code.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "OpenAI OAuth callback does not contain code".to_string())
+}
+
+pub fn extract_claude_oauth_code(input: &str, expected_state: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Claude OAuth callback URL or code is required".into());
+    }
+
+    if let Ok(url) = Url::parse(trimmed) {
+        return extract_claude_oauth_code_from_pairs(url.query_pairs(), Some(expected_state));
+    }
+
+    if trimmed.contains('=') {
+        let query = trimmed
+            .split_once('?')
+            .map(|(_, query)| query)
+            .unwrap_or(trimmed);
+        let pairs = url::form_urlencoded::parse(query.as_bytes());
+        return extract_claude_oauth_code_from_pairs(pairs, Some(expected_state));
+    }
+
+    let (code, state) = split_claude_code_state(trimmed);
+    if let Some(actual) = state.as_deref() {
+        if actual != expected_state {
+            return Err("Claude OAuth state does not match this authorization session".into());
+        }
+    }
+    code.filter(|value| !value.is_empty())
+        .map(|value| combine_claude_code_state(&value, state.as_deref()))
+        .ok_or_else(|| "Claude OAuth callback does not contain code".to_string())
+}
+
+fn extract_claude_oauth_code_from_pairs<'a, I>(
+    pairs: I,
+    expected_state: Option<&str>,
+) -> Result<String, String>
+where
+    I: IntoIterator<Item = (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)>,
+{
+    let mut code = None;
+    let mut state = None;
+    for (key, value) in pairs {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    if let Some(expected) = expected_state {
+        if let Some(actual) = state.as_deref() {
+            if actual != expected {
+                return Err("Claude OAuth state does not match this authorization session".into());
+            }
+        }
+    }
+    code.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| combine_claude_code_state(&value, state.as_deref()))
+        .ok_or_else(|| "Claude OAuth callback does not contain code".to_string())
+}
+
+fn split_claude_code_state(value: &str) -> (Option<String>, Option<String>) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return (None, None);
+    }
+    if let Some((code, state)) = trimmed.split_once('#') {
+        let code = code.trim();
+        let state = state.trim();
+        return (
+            (!code.is_empty()).then(|| code.to_string()),
+            (!state.is_empty()).then(|| state.to_string()),
+        );
+    }
+    (Some(trimmed.to_string()), None)
+}
+
+fn combine_claude_code_state(code: &str, state: Option<&str>) -> String {
+    match state.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(state) => format!("{code}#{state}"),
+        None => code.to_string(),
+    }
+}
+
+pub async fn exchange_openai_oauth_code(
+    client: &Client,
+    code: &str,
+    code_verifier: &str,
+) -> Result<Value, String> {
+    exchange_openai_oauth_code_at(client, OPENAI_TOKEN_URL, code, code_verifier).await
+}
+
+async fn exchange_openai_oauth_code_at(
+    client: &Client,
+    token_url: &str,
+    code: &str,
+    code_verifier: &str,
+) -> Result<Value, String> {
+    let response = client
+        .post(token_url)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", OPENAI_CLIENT_ID),
+            ("code", code),
+            ("redirect_uri", OPENAI_REDIRECT_URI),
+            ("code_verifier", code_verifier),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Could not exchange OpenAI OAuth code: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("Could not read OpenAI OAuth response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "OpenAI OAuth returned {}: {}",
+            status.as_u16(),
+            truncate(&text, 240)
+        ));
+    }
+    let mut value = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("OpenAI OAuth returned invalid JSON: {error}"))?;
+    let token = parse_token_value(&value)?;
+    if let Value::Object(object) = &mut value {
+        object.insert("client_id".into(), Value::String(OPENAI_CLIENT_ID.into()));
+        object.insert(
+            "redirect_uri".into(),
+            Value::String(OPENAI_REDIRECT_URI.into()),
+        );
+    }
+    Ok(normalized_token_value(value, &token))
+}
+
+pub async fn exchange_claude_oauth_code(
+    client: &Client,
+    code: &str,
+    code_verifier: &str,
+) -> Result<Value, String> {
+    exchange_claude_oauth_code_at(
+        client,
+        ANTHROPIC_TOKEN_URL,
+        code,
+        code_verifier,
+        ANTHROPIC_AUTHORIZE_SCOPE,
+    )
+    .await
+}
+
+async fn exchange_claude_oauth_code_at(
+    client: &Client,
+    token_url: &str,
+    code: &str,
+    code_verifier: &str,
+    scope: &str,
+) -> Result<Value, String> {
+    let (code, state) = split_claude_code_state(code);
+    let code = code.ok_or_else(|| "Claude OAuth authorization code is required".to_string())?;
+    let mut payload = Map::new();
+    payload.insert("code".into(), Value::String(code));
+    payload.insert(
+        "grant_type".into(),
+        Value::String("authorization_code".into()),
+    );
+    payload.insert(
+        "client_id".into(),
+        Value::String(ANTHROPIC_CLIENT_ID.into()),
+    );
+    payload.insert(
+        "redirect_uri".into(),
+        Value::String(ANTHROPIC_REDIRECT_URI.into()),
+    );
+    payload.insert("code_verifier".into(), Value::String(code_verifier.into()));
+    if let Some(state) = state {
+        payload.insert("state".into(), Value::String(state));
+    }
+
+    let response = client
+        .post(token_url)
+        .header("accept", "application/json, text/plain, */*")
+        .header("content-type", "application/json")
+        .header("user-agent", "axios/1.13.6")
+        .json(&Value::Object(payload))
+        .send()
+        .await
+        .map_err(|error| format!("Could not exchange Claude OAuth code: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("Could not read Claude OAuth response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Claude OAuth returned {}: {}",
+            status.as_u16(),
+            truncate(&text, 240)
+        ));
+    }
+    let value = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("Claude OAuth returned invalid JSON: {error}"))?;
+    claude_oauth_token_value(value, token_url, scope, None)
+}
+
+pub async fn exchange_claude_cookie_session_key(
+    client: &Client,
+    session_key: &str,
+) -> Result<Value, String> {
+    exchange_claude_cookie_session_key_at(
+        client,
+        ANTHROPIC_BASE_URL,
+        ANTHROPIC_TOKEN_URL,
+        session_key,
+    )
+    .await
+}
+
+async fn exchange_claude_cookie_session_key_at(
+    client: &Client,
+    base_url: &str,
+    token_url: &str,
+    session_key: &str,
+) -> Result<Value, String> {
+    let session_key = session_key.trim();
+    if session_key.is_empty() {
+        return Err("Claude sessionKey is required".into());
+    }
+    let organization_uuid =
+        fetch_claude_organization_uuid_at(client, base_url, session_key).await?;
+    let state = random_oauth_secret();
+    let code_verifier = random_oauth_secret();
+    let code_challenge = claude_oauth_code_challenge(&code_verifier);
+    let code = request_claude_authorization_code_at(
+        client,
+        base_url,
+        session_key,
+        &organization_uuid,
+        ANTHROPIC_COOKIE_SCOPE,
+        &code_challenge,
+        &state,
+    )
+    .await?;
+    let value = exchange_claude_oauth_code_at(
+        client,
+        token_url,
+        &code,
+        &code_verifier,
+        ANTHROPIC_COOKIE_SCOPE,
+    )
+    .await?;
+    claude_oauth_token_value(
+        value,
+        token_url,
+        ANTHROPIC_COOKIE_SCOPE,
+        Some(&organization_uuid),
+    )
+}
+
+async fn fetch_claude_organization_uuid_at(
+    client: &Client,
+    base_url: &str,
+    session_key: &str,
+) -> Result<String, String> {
+    let url = format!("{}/api/organizations", base_url.trim_end_matches('/'));
+    let response = client
+        .get(&url)
+        .header("accept", "application/json")
+        .header("cookie", format!("sessionKey={session_key}"))
+        .send()
+        .await
+        .map_err(|error| format!("Could not query Claude organizations: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("Could not read Claude organizations response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Claude organizations returned {}: {}",
+            status.as_u16(),
+            truncate(&text, 240)
+        ));
+    }
+    let value = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("Claude organizations returned invalid JSON: {error}"))?;
+    claude_organization_uuid_from_value(&value)
+        .ok_or_else(|| "Claude organizations response did not include an organization".to_string())
+}
+
+pub fn claude_organization_uuid_from_value(value: &Value) -> Option<String> {
+    let organizations = value.as_array()?;
+    organizations
+        .iter()
+        .filter_map(Value::as_object)
+        .find(|organization| {
+            organization
+                .get("raven_type")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case("team"))
+                && object_string(organization, "uuid").is_some()
+        })
+        .and_then(|organization| object_string(organization, "uuid"))
+        .or_else(|| {
+            organizations
+                .iter()
+                .filter_map(Value::as_object)
+                .find_map(|organization| object_string(organization, "uuid"))
+        })
+}
+
+async fn request_claude_authorization_code_at(
+    client: &Client,
+    base_url: &str,
+    session_key: &str,
+    organization_uuid: &str,
+    scope: &str,
+    code_challenge: &str,
+    state: &str,
+) -> Result<String, String> {
+    let url = format!(
+        "{}/v1/oauth/{}/authorize",
+        base_url.trim_end_matches('/'),
+        organization_uuid
+    );
+    let payload = json!({
+        "response_type": "code",
+        "client_id": ANTHROPIC_CLIENT_ID,
+        "organization_uuid": organization_uuid,
+        "redirect_uri": ANTHROPIC_REDIRECT_URI,
+        "scope": scope,
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    });
+    let response = client
+        .post(&url)
+        .header("accept", "application/json")
+        .header("accept-language", "en-US,en;q=0.9")
+        .header("cache-control", "no-cache")
+        .header("origin", "https://claude.ai")
+        .header("referer", "https://claude.ai/new")
+        .header("content-type", "application/json")
+        .header("cookie", format!("sessionKey={session_key}"))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| format!("Could not authorize Claude sessionKey: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("Could not read Claude authorization response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Claude authorization returned {}: {}",
+            status.as_u16(),
+            truncate(&text, 240)
+        ));
+    }
+    let value = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("Claude authorization returned invalid JSON: {error}"))?;
+    let redirect_uri = find_string(&value, &["redirect_uri", "redirectUri"])
+        .ok_or_else(|| "Claude authorization response did not include redirect_uri".to_string())?;
+    extract_claude_oauth_code(&redirect_uri, state)
+}
+
+fn claude_oauth_token_value(
+    mut value: Value,
+    token_url: &str,
+    scope: &str,
+    organization_uuid: Option<&str>,
+) -> Result<Value, String> {
+    let token = parse_token_value(&value)?;
+    let response_organization_uuid = value
+        .get("organization")
+        .and_then(|organization| find_string(organization, &["uuid"]));
+    let response_account_uuid = value
+        .get("account")
+        .and_then(|account| find_string(account, &["uuid"]));
+    let response_email = value
+        .get("account")
+        .and_then(|account| find_string(account, &["email_address", "email"]));
+    if !value.is_object() {
+        value = json!({});
+    }
+    if let Value::Object(object) = &mut value {
+        object.insert(
+            "client_id".into(),
+            Value::String(ANTHROPIC_CLIENT_ID.into()),
+        );
+        object.insert(
+            "redirect_uri".into(),
+            Value::String(ANTHROPIC_REDIRECT_URI.into()),
+        );
+        object.insert("token_url".into(), Value::String(token_url.into()));
+        object.insert("scope".into(), Value::String(scope.into()));
+        if let Some(organization_uuid) = organization_uuid {
+            object
+                .entry("org_uuid")
+                .or_insert_with(|| Value::String(organization_uuid.into()));
+        }
+        if let Some(organization_uuid) = response_organization_uuid {
+            object
+                .entry("org_uuid")
+                .or_insert_with(|| Value::String(organization_uuid));
+        }
+        if let Some(account_uuid) = response_account_uuid {
+            object
+                .entry("account_uuid")
+                .or_insert_with(|| Value::String(account_uuid));
+        }
+        if let Some(email) = response_email {
+            object
+                .entry("email_address")
+                .or_insert_with(|| Value::String(email));
+        }
+    }
+    Ok(normalized_token_value(value, &token))
 }
 
 pub fn delete_provider_token(provider_id: &str) -> Result<(), String> {
@@ -233,11 +810,94 @@ pub async fn openai_token_for_provider(
     Ok((value, token, account_id))
 }
 
+pub async fn anthropic_token_for_provider(
+    client: &Client,
+    provider: &Provider,
+) -> Result<(Value, ParsedToken), String> {
+    if account_kind(provider) != Some(OfficialAccountKind::Anthropic) {
+        return Err("Provider is not a Claude official account".into());
+    }
+    let (mut value, mut token) = read_provider_token(&provider.id)?
+        .ok_or_else(|| format!("Provider '{}' is not signed in", provider.name))?;
+    if should_refresh(&token) {
+        value = refresh_token(client, OfficialAccountKind::Anthropic, value, &token).await?;
+        token = parse_token_value(&value)?;
+        write_keychain_value(&token_ref(&provider.id), &value)?;
+    }
+    if token_is_expired(&token) {
+        return Err(format!(
+            "Provider '{}' token expired. Paste a fresh token JSON.",
+            provider.name
+        ));
+    }
+    Ok((value, token))
+}
+
 pub async fn openai_token_for_codex(
     client: &Client,
 ) -> Result<(Value, ParsedToken, String), String> {
     let auth_path = codex_config::resolve_codex_home().join("auth.json");
     openai_token_from_codex_auth_file(client, &auth_path).await
+}
+
+pub fn codex_openai_status(provider: &Provider) -> KeyStatus {
+    let auth_path = codex_config::resolve_codex_home().join("auth.json");
+    let raw = match std::fs::read_to_string(&auth_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return KeyStatus {
+                provider_id: provider.id.clone(),
+                present: false,
+                available: false,
+                message: Some("key.notSignedIn".into()),
+            };
+        }
+        Err(error) => {
+            return KeyStatus {
+                provider_id: provider.id.clone(),
+                present: false,
+                available: false,
+                message: Some(format!("Could not read Codex auth.json: {error}")),
+            };
+        }
+    };
+    let value = match parse_json_value(&raw) {
+        Ok(value) => value,
+        Err(message) => {
+            return KeyStatus {
+                provider_id: provider.id.clone(),
+                present: true,
+                available: false,
+                message: Some(message),
+            };
+        }
+    };
+    let token = match parse_token_value(&value) {
+        Ok(token) => token,
+        Err(message) => {
+            return KeyStatus {
+                provider_id: provider.id.clone(),
+                present: true,
+                available: false,
+                message: Some(message),
+            };
+        }
+    };
+    if openai_chatgpt_account_id(&value).is_none() {
+        return KeyStatus {
+            provider_id: provider.id.clone(),
+            present: true,
+            available: false,
+            message: Some("Codex auth.json is missing chatgpt_account_id".into()),
+        };
+    }
+    let expired = token_is_expired(&token);
+    KeyStatus {
+        provider_id: provider.id.clone(),
+        present: true,
+        available: !expired || token.refresh_token.is_some(),
+        message: expired.then(|| "key.expired".into()),
+    }
 }
 
 pub async fn auth_for_codex_openai(client: &Client) -> Result<OfficialAuth, String> {
@@ -375,9 +1035,9 @@ async fn refresh_token(
         let mut payload = Map::new();
         payload.insert("grant_type".into(), Value::String("refresh_token".into()));
         payload.insert("refresh_token".into(), Value::String(refresh.into()));
-        if let Some(client_id) = find_string(&original, &["client_id", "clientId"]) {
-            payload.insert("client_id".into(), Value::String(client_id));
-        }
+        let client_id = find_string(&original, &["client_id", "clientId"])
+            .unwrap_or_else(|| ANTHROPIC_CLIENT_ID.into());
+        payload.insert("client_id".into(), Value::String(client_id));
         if let Some(client_secret) = find_string(&original, &["client_secret", "clientSecret"]) {
             payload.insert("client_secret".into(), Value::String(client_secret));
         }
@@ -545,6 +1205,15 @@ fn find_string(value: &Value, keys: &[&str]) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
     })
+}
+
+fn object_string(object: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn find_value<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
@@ -716,17 +1385,30 @@ fn official_token_dir() -> PathBuf {
         .join("official-tokens")
 }
 
+fn truncate(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        value.to_string()
+    } else {
+        format!("{}...", &value[..max])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        keychain_value_too_large, merge_token_values, openai_chatgpt_account_id,
-        openai_token_from_codex_auth_file, parse_token_value, read_stored_token_value_from_dir,
-        token_file_marker, write_token_file_in_dir,
+        claude_oauth_code_challenge, claude_organization_uuid_from_value,
+        exchange_claude_cookie_session_key_at, extract_claude_oauth_code,
+        extract_openai_oauth_code, keychain_value_too_large, merge_token_values,
+        openai_chatgpt_account_id, openai_oauth_code_challenge, openai_token_from_codex_auth_file,
+        parse_token_value, read_stored_token_value_from_dir, start_claude_oauth_session,
+        start_openai_oauth_session, token_file_marker, write_token_file_in_dir,
     };
+    use axum::{http::HeaderMap, routing::get, routing::post, Json, Router};
     use base64::Engine as _;
     use chrono::Utc;
     use serde_json::json;
     use std::fs;
+    use tokio::net::TcpListener;
 
     #[test]
     fn parses_nested_token_json() {
@@ -751,6 +1433,253 @@ mod tests {
         }))
         .unwrap();
         assert!(token.expires_at.unwrap() > Utc::now());
+    }
+
+    #[test]
+    fn openai_oauth_url_contains_codex_pkce_parameters() {
+        let session = start_openai_oauth_session();
+        let url = url::Url::parse(&session.auth_url).unwrap();
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            url.as_str().split('?').next().unwrap(),
+            "https://auth.openai.com/oauth/authorize"
+        );
+        assert_eq!(
+            query.get("client_id").map(|value| value.as_ref()),
+            Some("app_EMoamEEZ73f0CkXaXp7hrann")
+        );
+        assert_eq!(
+            query.get("redirect_uri").map(|value| value.as_ref()),
+            Some("http://localhost:1455/auth/callback")
+        );
+        assert_eq!(
+            query.get("scope").map(|value| value.as_ref()),
+            Some("openid profile email offline_access")
+        );
+        assert_eq!(
+            query.get("state").map(|value| value.as_ref()),
+            Some(session.state.as_str())
+        );
+        assert_eq!(
+            query
+                .get("code_challenge_method")
+                .map(|value| value.as_ref()),
+            Some("S256")
+        );
+        assert_eq!(
+            query
+                .get("id_token_add_organizations")
+                .map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(
+            query
+                .get("codex_cli_simplified_flow")
+                .map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(
+            query.get("code_challenge").map(|value| value.as_ref()),
+            Some(openai_oauth_code_challenge(&session.code_verifier).as_str())
+        );
+    }
+
+    #[test]
+    fn extracts_openai_oauth_code_from_callback_or_raw_code() {
+        let code = extract_openai_oauth_code(
+            "http://localhost:1455/auth/callback?code=abc123&state=state-1",
+            "state-1",
+        )
+        .unwrap();
+        assert_eq!(code, "abc123");
+
+        let code = extract_openai_oauth_code("raw-code", "state-1").unwrap();
+        assert_eq!(code, "raw-code");
+    }
+
+    #[test]
+    fn rejects_mismatched_openai_oauth_state() {
+        let error = extract_openai_oauth_code(
+            "http://localhost:1455/auth/callback?code=abc123&state=bad",
+            "state-1",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("state"));
+    }
+
+    #[test]
+    fn claude_oauth_url_contains_pkce_parameters() {
+        let session = start_claude_oauth_session();
+        let url = url::Url::parse(&session.auth_url).unwrap();
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            url.as_str().split('?').next().unwrap(),
+            "https://claude.ai/oauth/authorize"
+        );
+        assert_eq!(
+            query.get("client_id").map(|value| value.as_ref()),
+            Some("9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+        );
+        assert_eq!(
+            query.get("redirect_uri").map(|value| value.as_ref()),
+            Some("https://platform.claude.com/oauth/code/callback")
+        );
+        assert_eq!(
+            query.get("scope").map(|value| value.as_ref()),
+            Some("org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload")
+        );
+        assert_eq!(
+            query.get("state").map(|value| value.as_ref()),
+            Some(session.state.as_str())
+        );
+        assert_eq!(
+            query
+                .get("code_challenge_method")
+                .map(|value| value.as_ref()),
+            Some("S256")
+        );
+        assert_eq!(
+            query.get("code_challenge").map(|value| value.as_ref()),
+            Some(claude_oauth_code_challenge(&session.code_verifier).as_str())
+        );
+    }
+
+    #[test]
+    fn extracts_claude_oauth_code_from_callback_raw_and_code_state() {
+        let code = extract_claude_oauth_code(
+            "https://platform.claude.com/oauth/code/callback?code=abc123&state=state-1",
+            "state-1",
+        )
+        .unwrap();
+        assert_eq!(code, "abc123#state-1");
+
+        let code = extract_claude_oauth_code("raw-code", "state-1").unwrap();
+        assert_eq!(code, "raw-code");
+
+        let code = extract_claude_oauth_code("abc123#state-1", "state-1").unwrap();
+        assert_eq!(code, "abc123#state-1");
+    }
+
+    #[test]
+    fn rejects_mismatched_claude_oauth_state() {
+        let error = extract_claude_oauth_code(
+            "https://platform.claude.com/oauth/code/callback?code=abc123&state=bad",
+            "state-1",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("state"));
+    }
+
+    #[test]
+    fn selects_claude_team_organization_first() {
+        let uuid = claude_organization_uuid_from_value(&json!([
+            { "uuid": "personal-org", "name": "Personal" },
+            { "uuid": "team-org", "name": "Team", "raven_type": "team" }
+        ]))
+        .unwrap();
+        assert_eq!(uuid, "team-org");
+
+        let uuid = claude_organization_uuid_from_value(&json!([
+            { "uuid": "first-org", "name": "First" },
+            { "uuid": "second-org", "name": "Second" }
+        ]))
+        .unwrap();
+        assert_eq!(uuid, "first-org");
+    }
+
+    #[tokio::test]
+    async fn cookie_claude_oauth_exchanges_session_key_with_mock_server() {
+        let router = Router::new()
+            .route(
+                "/api/organizations",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(
+                        headers.get("cookie").and_then(|value| value.to_str().ok()),
+                        Some("sessionKey=session-1")
+                    );
+                    Json(json!([
+                        { "uuid": "personal-org", "name": "Personal" },
+                        { "uuid": "team-org", "name": "Team", "raven_type": "team" }
+                    ]))
+                }),
+            )
+            .route(
+                "/v1/oauth/team-org/authorize",
+                post(|headers: HeaderMap, Json(body): Json<serde_json::Value>| async move {
+                    assert_eq!(
+                        headers.get("cookie").and_then(|value| value.to_str().ok()),
+                        Some("sessionKey=session-1")
+                    );
+                    assert_eq!(
+                        body["client_id"],
+                        "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+                    );
+                    assert_eq!(body["organization_uuid"], "team-org");
+                    assert_eq!(
+                        body["scope"],
+                        "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+                    );
+                    let state = body["state"].as_str().unwrap();
+                    Json(json!({
+                        "redirect_uri": format!(
+                            "https://platform.claude.com/oauth/code/callback?code=AUTH-CODE&state={state}"
+                        )
+                    }))
+                }),
+            )
+            .route(
+                "/token",
+                post(|Json(body): Json<serde_json::Value>| async move {
+                    assert_eq!(body["code"], "AUTH-CODE");
+                    assert_eq!(
+                        body["client_id"],
+                        "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+                    );
+                    assert_eq!(
+                        body["redirect_uri"],
+                        "https://platform.claude.com/oauth/code/callback"
+                    );
+                    assert!(body["state"].as_str().is_some_and(|value| !value.is_empty()));
+                    Json(json!({
+                        "access_token": "access-1",
+                        "refresh_token": "refresh-1",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "organization": { "uuid": "team-org" },
+                        "account": { "uuid": "account-1", "email_address": "zoe@example.com" }
+                    }))
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let token_url = format!("{base_url}/token");
+        let client = reqwest::Client::new();
+
+        let value =
+            exchange_claude_cookie_session_key_at(&client, &base_url, &token_url, "session-1")
+                .await
+                .unwrap();
+
+        assert_eq!(value["access_token"], "access-1");
+        assert_eq!(value["refresh_token"], "refresh-1");
+        assert_eq!(value["client_id"], "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+        assert_eq!(value["token_url"], token_url);
+        assert_eq!(value["org_uuid"], "team-org");
+        assert_eq!(value["account_uuid"], "account-1");
+        assert_eq!(value["email_address"], "zoe@example.com");
+        assert!(value["expires_at"].as_str().is_some());
     }
 
     #[test]

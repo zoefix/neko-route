@@ -68,10 +68,10 @@ fn route_match_from_model(
     let provider = config
         .providers
         .iter()
-        .find(|provider| provider.id == model.provider_id && provider.enabled)
+        .find(|provider| provider.id == model.provider_id)
         .ok_or_else(|| {
             format!(
-                "Model '{}' uses provider '{}' but that provider is disabled or missing",
+                "Model '{}' uses provider '{}' but that provider is missing",
                 model.id, model.provider_id
             )
         })?;
@@ -211,7 +211,6 @@ mod tests {
             kind: ProviderKind::Custom,
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url: "https://proxy.example/v1".into(),
-            enabled: true,
             key_ref: Some("provider:custom-chat".into()),
         });
         let model = config
@@ -250,7 +249,6 @@ mod tests {
             kind: ProviderKind::OfficialOpenAiAccount,
             protocol: ProviderProtocol::OpenAiResponses,
             base_url: "https://api.openai.com/v1".into(),
-            enabled: true,
             key_ref: Some("official-token:openai-account-user".into()),
         });
         let mut account_model = config
@@ -384,7 +382,6 @@ mod tests {
             kind: ProviderKind::Custom,
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url: "https://deepseek.example/v1".into(),
-            enabled: true,
             key_ref: Some("provider:deepseek".into()),
         });
         let mut model = config.models[0].clone();

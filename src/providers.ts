@@ -55,7 +55,6 @@ export function newCustomProvider(): Provider {
     kind: "custom",
     protocol: "open_ai_responses",
     base_url: "https://api.example.com/v1",
-    enabled: true,
     key_ref: `provider:${id}`,
   };
 }
@@ -68,7 +67,6 @@ export function newOpenAiAccountProvider(): Provider {
     kind: "official_open_ai_account",
     protocol: "open_ai_responses",
     base_url: "https://api.openai.com/v1",
-    enabled: true,
     key_ref: `official-token:${id}`,
   };
 }
@@ -81,7 +79,6 @@ export function newClaudeAccountProvider(): Provider {
     kind: "official_anthropic_account",
     protocol: "anthropic_messages",
     base_url: "https://api.anthropic.com/v1",
-    enabled: true,
     key_ref: `official-token:${id}`,
   };
 }

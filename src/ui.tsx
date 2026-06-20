@@ -399,6 +399,8 @@ export function Modal({
   footer,
   width = 540,
   onEnter,
+  showClose = true,
+  closeOnOverlay = true,
 }: {
   open: boolean;
   onClose: () => void;
@@ -410,6 +412,8 @@ export function Modal({
   footer?: React.ReactNode;
   width?: number;
   onEnter?: () => void;
+  showClose?: boolean;
+  closeOnOverlay?: boolean;
 }) {
   const [mounted, setMounted] = React.useState(open);
   const [visible, setVisible] = React.useState(false);
@@ -446,7 +450,7 @@ export function Modal({
   if (!mounted) return null;
 
   return createPortal(
-    <div className={`modal-overlay ${visible ? "show" : ""}`} onMouseDown={onClose}>
+    <div className={`modal-overlay ${visible ? "show" : ""}`} onMouseDown={closeOnOverlay ? onClose : undefined}>
       <div
         className={`modal ${visible ? "show" : ""}`}
         style={{ maxWidth: width }}
@@ -460,9 +464,11 @@ export function Modal({
             <h2>{title}</h2>
             {sub ? <p className="head-sub">{sub}</p> : null}
           </div>
-          <button className="icon-btn modal-x" onClick={onClose} aria-label="close">
-            <X size={18} />
-          </button>
+          {showClose ? (
+            <button className="icon-btn modal-x" onClick={onClose} aria-label="close">
+              <X size={18} />
+            </button>
+          ) : null}
         </div>
         <div className="modal-body">{children}</div>
         {footer ? <div className="modal-foot">{footer}</div> : null}

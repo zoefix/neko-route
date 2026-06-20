@@ -98,6 +98,29 @@ if (( ${#missing[@]} > 0 )) && [[ "$ALLOW_MISSING" != "1" ]]; then
   exit 1
 fi
 
+if [[ "${PUBLISH_RELEASE:-0}" == "1" ]]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "Missing required command: gh" >&2
+    exit 1
+  fi
+  export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+  if [[ -z "$GH_TOKEN" ]]; then
+    echo "GH_TOKEN or GITHUB_TOKEN is required when PUBLISH_RELEASE=1" >&2
+    exit 1
+  fi
+
+  if gh release view "$TAG" >/dev/null 2>&1; then
+    release_body="$(gh release view "$TAG" --json body --jq '.body // ""')"
+    if [[ -n "$release_body" ]]; then
+      NOTES="$release_body"
+    fi
+  else
+    gh release create "$TAG" \
+      --title "Neko Route $TAG" \
+      --notes "$NOTES"
+  fi
+fi
+
 mkdir -p "$(dirname "$OUT")"
 
 node --input-type=module - \
@@ -133,25 +156,12 @@ NODE
 echo "Updater manifest: $OUT"
 
 if [[ "${PUBLISH_RELEASE:-0}" == "1" ]]; then
-  if ! command -v gh >/dev/null 2>&1; then
-    echo "Missing required command: gh" >&2
-    exit 1
-  fi
-  export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-  if [[ -z "$GH_TOKEN" ]]; then
-    echo "GH_TOKEN or GITHUB_TOKEN is required when PUBLISH_RELEASE=1" >&2
-    exit 1
-  fi
-
   mapfile -d '' assets < <(find release -mindepth 2 -type f ! -name ".DS_Store" -print0 | sort -z)
   if (( ${#assets[@]} == 0 )); then
     echo "No release assets found under release/*" >&2
     exit 1
   fi
 
-  gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
-    --title "Neko Route $TAG" \
-    --notes "$NOTES"
   gh release upload "$TAG" "$OUT" "${assets[@]}" --clobber
   echo "Published GitHub release assets for $TAG"
 fi

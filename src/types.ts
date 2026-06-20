@@ -28,7 +28,6 @@ export type Provider = {
   kind: ProviderKind;
   protocol: ProviderProtocol;
   base_url: string;
-  enabled: boolean;
   key_ref: string | null;
 };
 
@@ -176,6 +175,22 @@ export type ProviderCredential = {
   deletable: boolean;
 };
 
+export type OAuthStart = {
+  session_id: string;
+  auth_url: string;
+  expires_at: string;
+};
+
+export type OpenAiOAuthStart = OAuthStart;
+
+export type CodexAppStatus = {
+  running: boolean;
+};
+
+export type CodexAppRestartResult = {
+  action: "started" | "restarted";
+};
+
 export type UpstreamModel = {
   id: string;
   label: string;
@@ -186,20 +201,22 @@ export type UpstreamModelList = {
   error: string | null;
 };
 
-export type OpenAiQuotaWindow = {
+export type OfficialQuotaWindow = {
   used_percent: number;
   limit_window_seconds: number;
   reset_after_seconds: number;
   reset_at: string | null;
 };
 
-export type OpenAiAccountQuota = {
+export type OfficialAccountQuota = {
   account_id: string | null;
   user_id: string | null;
   email: string | null;
   plan_type: string | null;
-  five_hour: OpenAiQuotaWindow | null;
-  seven_day: OpenAiQuotaWindow | null;
+  plan_label: string | null;
+  subscription_expires_at: string | null;
+  five_hour: OfficialQuotaWindow | null;
+  seven_day: OfficialQuotaWindow | null;
   reset_credits: number | null;
 };
 
@@ -217,7 +234,7 @@ export type ProviderLocalUsage = {
 
 export type ProviderUsageStatus = {
   provider_id: string;
-  quota: OpenAiAccountQuota | null;
+  quota: OfficialAccountQuota | null;
   local_usage: ProviderLocalUsage;
   updated_at: string | null;
   source: string;

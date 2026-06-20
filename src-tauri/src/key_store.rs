@@ -77,6 +77,10 @@ impl KeyStore {
             };
         }
 
+        if provider.kind == ProviderKind::OfficialOpenAi {
+            return official_auth::codex_openai_status(provider);
+        }
+
         if matches!(
             provider.kind,
             ProviderKind::OfficialOpenAiAccount | ProviderKind::OfficialAnthropicAccount

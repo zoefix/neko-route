@@ -6,5 +6,6 @@ release/
 .claude/
 *.log
 .DS_Store
+.idea/
 *.local
 *.local.pub

@@ -3,8 +3,9 @@ use crate::key_store::KeyStore;
 use crate::request_log::RequestLog;
 use crate::types::{
     default_config, reasoning_defaults_for_protocol, AppConfig, AppSnapshot, CodexInjectionMode,
-    KeyStatus, OpenAiAccountQuota, Provider, ProviderKind, ProviderLocalUsage, ProviderUsageStatus,
-    RequestLogPage, RequestRecord, ServerStatus, Settings, TokenStats, TokenUsage,
+    KeyStatus, OfficialAccountQuota, Provider, ProviderKind, ProviderLocalUsage,
+    ProviderUsageStatus, RequestLogPage, RequestRecord, ServerStatus, Settings, TokenStats,
+    TokenUsage,
 };
 use crate::{catalog, claude_auth, official_auth};
 use serde_json::to_string_pretty;
@@ -215,7 +216,7 @@ impl AppStore {
         &self,
         provider_id: String,
         source: String,
-        quota: Option<OpenAiAccountQuota>,
+        quota: Option<OfficialAccountQuota>,
         error: Option<String>,
     ) {
         let log = self.inner.log.clone();
@@ -272,7 +273,7 @@ impl AppStore {
         }
 
         let mut provider_ids = HashSet::new();
-        for provider in config.providers.iter().filter(|provider| provider.enabled) {
+        for provider in &config.providers {
             if self.third_party_provider_available(provider)? {
                 provider_ids.insert(provider.id.clone());
             }
@@ -480,7 +481,7 @@ pub fn normalize_config(mut config: AppConfig) -> AppConfig {
         model.supported_reasoning_levels = supported_levels;
     }
     codex_alias::normalize_model_aliases(&mut config.models);
-    let fallback_allowed = |model: &crate::types::ModelEntry| {
+    let codex_setting_allowed = |model: &crate::types::ModelEntry| {
         if !model.enabled {
             return false;
         }
@@ -489,28 +490,32 @@ pub fn normalize_config(mut config: AppConfig) -> AppConfig {
         }
         providers
             .iter()
-            .find(|provider| provider.id == model.provider_id && provider.enabled)
+            .find(|provider| provider.id == model.provider_id)
             .is_some_and(|provider| provider.kind != ProviderKind::OfficialOpenAi)
     };
-    let fallback_valid = config
-        .settings
-        .fallback_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|fallback| {
-            config
-                .models
-                .iter()
-                .any(|model| model.id == *fallback && fallback_allowed(model))
-        })
-        .map(str::to_string);
-    config.settings.fallback_model = fallback_valid.or_else(|| {
-        config
-            .models
-            .iter()
-            .find(|model| fallback_allowed(model))
-            .map(|model| model.id.clone())
-    });
+    let codex_setting_model_ids = config
+        .models
+        .iter()
+        .filter(|model| codex_setting_allowed(model))
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let first_codex_setting_model = codex_setting_model_ids.first().cloned();
+    let normalize_codex_setting = |selected: Option<String>| {
+        selected
+            .as_deref()
+            .map(str::trim)
+            .filter(|selected| {
+                codex_setting_model_ids
+                    .iter()
+                    .any(|model| model == *selected)
+            })
+            .map(str::to_string)
+            .or_else(|| first_codex_setting_model.clone())
+    };
+    config.settings.codex_default_model =
+        normalize_codex_setting(config.settings.codex_default_model.clone());
+    config.settings.fallback_model =
+        normalize_codex_setting(config.settings.fallback_model.clone());
     config.providers = providers;
     config
 }
@@ -661,7 +666,6 @@ mod tests {
             .find(|provider| provider.kind == ProviderKind::OfficialOpenAi)
             .unwrap();
         official.base_url = "https://proxy.example/v1".into();
-        official.enabled = false;
         official.key_ref = Some("provider:bad".into());
 
         let normalized = normalize_config(config);
@@ -671,7 +675,6 @@ mod tests {
             .find(|provider| provider.kind == ProviderKind::OfficialOpenAi)
             .unwrap();
         assert_eq!(official.base_url, "https://api.openai.com/v1");
-        assert!(official.enabled);
         assert_eq!(official.protocol, ProviderProtocol::OpenAiResponses);
         assert!(official.key_ref.is_none());
     }
@@ -694,7 +697,6 @@ mod tests {
             .find(|provider| provider.kind == ProviderKind::OfficialAnthropicCli)
             .unwrap();
         assert_eq!(official.base_url, "local://claude-code");
-        assert!(official.enabled);
         assert_eq!(official.protocol, ProviderProtocol::AnthropicMessages);
         assert!(official.key_ref.is_none());
     }
@@ -717,7 +719,6 @@ mod tests {
             .find(|provider| provider.kind == ProviderKind::OfficialAnthropicDesktop)
             .unwrap();
         assert_eq!(official.base_url, "local://claude-desktop");
-        assert!(official.enabled);
         assert_eq!(official.protocol, ProviderProtocol::AnthropicMessages);
         assert!(official.key_ref.is_none());
     }
@@ -826,7 +827,6 @@ mod tests {
             kind: ProviderKind::OfficialOpenAiAccount,
             protocol: ProviderProtocol::AnthropicMessages,
             base_url: "https://bad.example/v1".into(),
-            enabled: true,
             key_ref: None,
         });
         config.providers.push(Provider {
@@ -835,7 +835,6 @@ mod tests {
             kind: ProviderKind::OfficialAnthropicAccount,
             protocol: ProviderProtocol::OpenAiResponses,
             base_url: "https://bad.example/v1".into(),
-            enabled: true,
             key_ref: None,
         });
 
@@ -1001,6 +1000,10 @@ mod tests {
             normalized.settings.fallback_model.as_deref(),
             Some("gpt-5.5")
         );
+        assert_eq!(
+            normalized.settings.codex_default_model.as_deref(),
+            Some("gpt-5.5")
+        );
         assert_eq!(gpt.timeout_ms, 0);
         assert_eq!(gpt.retry_count, 0);
         assert!(gpt.reasoning_enabled);
@@ -1012,13 +1015,69 @@ mod tests {
     }
 
     #[test]
-    fn third_party_mode_fallback_skips_openai_official() {
+    fn disabled_codex_default_and_fallback_switch_to_available_model() {
+        let mut config = default_config();
+        config.settings.codex_default_model = Some("gpt-5.5".into());
+        config.settings.fallback_model = Some("gpt-5.5".into());
+        config.models[0].enabled = false;
+
+        let normalized = normalize_config(config);
+
+        assert_eq!(
+            normalized.settings.codex_default_model.as_deref(),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(
+            normalized.settings.fallback_model.as_deref(),
+            Some("claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn codex_default_and_fallback_empty_until_model_is_enabled_again() {
+        let mut config = default_config();
+        for model in &mut config.models {
+            model.enabled = false;
+        }
+
+        let normalized = normalize_config(config);
+
+        assert_eq!(normalized.settings.codex_default_model, None);
+        assert_eq!(normalized.settings.fallback_model, None);
+
+        let mut config = normalized;
+        let model = config
+            .models
+            .iter_mut()
+            .find(|model| model.id == "claude-sonnet-4-5")
+            .unwrap();
+        model.enabled = true;
+
+        let normalized = normalize_config(config);
+
+        assert_eq!(
+            normalized.settings.codex_default_model.as_deref(),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(
+            normalized.settings.fallback_model.as_deref(),
+            Some("claude-sonnet-4-5")
+        );
+    }
+
+    #[test]
+    fn third_party_mode_codex_settings_skip_openai_official() {
         let mut config = default_config();
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
+        config.settings.codex_default_model = Some("gpt-5.5".into());
         config.settings.fallback_model = Some("gpt-5.5".into());
 
         let normalized = normalize_config(config);
 
+        assert_eq!(
+            normalized.settings.codex_default_model.as_deref(),
+            Some("claude-opus-4-8")
+        );
         assert_eq!(
             normalized.settings.fallback_model.as_deref(),
             Some("claude-opus-4-8")
@@ -1037,7 +1096,6 @@ mod tests {
             kind: ProviderKind::Custom,
             protocol,
             base_url: base_url.into(),
-            enabled: true,
             key_ref: uses_key.then(|| format!("provider:{id}")),
         }
     }

@@ -438,7 +438,6 @@ mod tests {
             kind: ProviderKind::Custom,
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url: "https://deepseek.example/v1".into(),
-            enabled: true,
             key_ref: Some("provider:deepseek".into()),
         });
         let mut model = config.models[0].clone();

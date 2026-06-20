@@ -1,9 +1,6 @@
 import React from "react";
 import { createPortal } from "react-dom";
-import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import {
   IconActivity as Activity,
   IconBook2 as BookOpen,
@@ -44,12 +41,11 @@ import type {
   AppSnapshot,
   CodexInjectionMode,
   ModelEntry,
-  OpenAiQuotaWindow,
+  OfficialQuotaWindow,
   Provider,
   ProviderUsageStatus,
   ProviderProtocol,
   ReasoningEffort,
-  StreamState,
   TestModelResult,
   TokenTotals,
 } from "./types";
@@ -64,6 +60,12 @@ import {
   protocolKey,
   reasoningDefaultsForProtocol,
 } from "./providers";
+import {
+  formatBytes,
+  isTauriRuntime,
+  type ReleaseNotes,
+  type UpdateStatus,
+} from "./updates";
 import { TrendChart } from "./TrendChart";
 import {
   Button,
@@ -85,7 +87,6 @@ import type { Option } from "./ui";
 import providerClaudeIcon from "./assets/provider-claude.png";
 import providerOpenAiIcon from "./assets/provider-openai.png";
 import appIcon from "./assets/app-icon.png";
-import packageMeta from "../package.json";
 
 export type PageProps = {
   snapshot: AppSnapshot;
@@ -97,6 +98,12 @@ export type PageProps = {
   busy: boolean;
   setBusy: (v: boolean) => void;
   appAction: AppAction | null;
+  appVersion: string;
+  updateStatus: UpdateStatus;
+  currentRelease: ReleaseNotes | null;
+  currentReleaseLoading: boolean;
+  currentReleaseError: string;
+  checkForUpdate: () => Promise<void>;
 };
 
 function providerIcon(p: Provider) {
@@ -142,7 +149,7 @@ function formatQuotaPercent(value: number | null | undefined) {
   return `${Math.max(0, Math.min(100, value)).toFixed(value >= 10 ? 0 : 1)}%`;
 }
 
-function quotaResetText(window?: OpenAiQuotaWindow | null) {
+function quotaResetText(window?: OfficialQuotaWindow | null) {
   if (!window) return "";
   const resetAtMs = window.reset_at ? Date.parse(window.reset_at) : NaN;
   const seconds = Number.isFinite(resetAtMs)
@@ -163,28 +170,16 @@ function quotaResetText(window?: OpenAiQuotaWindow | null) {
   return `${Math.max(1, minutes)}m`;
 }
 
-function streamStateKey(state: StreamState): MsgKey {
-  switch (state) {
-    case "pending":
-      return "stream.pending";
-    case "completed":
-      return "stream.completed";
-    case "failed":
-      return "stream.failed";
-    case "cancelled":
-      return "stream.cancelled";
-    case "interrupted":
-      return "stream.interrupted";
-    case "incomplete":
-      return "stream.incomplete";
-    case "client_disconnected":
-      return "stream.clientDisconnected";
-  }
+function formatLatency(ms: number) {
+  const seconds = Math.round((Math.max(0, ms) / 1000) * 10) / 10;
+  const value = Number.isInteger(seconds) ? seconds.toFixed(0) : seconds.toFixed(1);
+  return `${value} s`;
 }
 
-function streamStateTone(state: StreamState) {
-  if (state === "completed") return "good";
-  if (state === "pending") return "pending";
+function latencyTone(ms: number) {
+  const seconds = Math.max(0, ms) / 1000;
+  if (seconds < 10) return "good";
+  if (seconds < 60) return "warn";
   return "bad";
 }
 
@@ -197,72 +192,20 @@ const CODEX_RESERVED_MODEL_IDS = new Set([
   "gpt-4.1-mini",
 ]);
 
-function formatBytes(bytes: number) {
-  if (bytes >= 1024 * 1024 * 1024) {
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(bytes >= 10 * 1024 * 1024 * 1024 ? 0 : 1)} GB`;
-  }
-  if (bytes >= 1024 * 1024) {
-    return `${(bytes / (1024 * 1024)).toFixed(bytes >= 10 * 1024 * 1024 ? 0 : 1)} MB`;
-  }
-  if (bytes >= 1024) {
-    return `${(bytes / 1024).toFixed(bytes >= 10 * 1024 ? 0 : 1)} KB`;
-  }
-  return `${bytes} B`;
-}
-
-type UpdateStatus =
-  | "idle"
-  | "checking"
-  | "current"
-  | "available"
-  | "downloading"
-  | "installing"
-  | "restarting"
-  | "error";
-
-function isTauriRuntime() {
-  return typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
-}
-
-function updateStatusLabel(t: ReturnType<typeof useI18n>["t"], status: UpdateStatus, progress: { downloaded: number; total: number | null }) {
-  switch (status) {
-    case "checking":
-      return t("about.updateChecking");
-    case "current":
-      return t("about.updateCurrent");
-    case "available":
-      return t("about.updateAvailable");
-    case "downloading":
-      return progress.total
-        ? t("about.updateDownloading", { done: formatBytes(progress.downloaded), total: formatBytes(progress.total) })
-        : t("about.updateDownloadingUnknown", { done: formatBytes(progress.downloaded) });
-    case "installing":
-      return t("about.updateInstalling");
-    case "restarting":
-      return t("about.updateRestarting");
-    case "error":
-      return t("about.updateFailed");
-    case "idle":
-    default:
-      return t("about.updateIdle");
-  }
-}
-
 /* ============================================================
    About
    ============================================================ */
-export function About({ notify, notifyRaw }: PageProps) {
+export function About({
+  notify,
+  notifyRaw,
+  appVersion,
+  updateStatus,
+  currentRelease,
+  currentReleaseLoading,
+  currentReleaseError,
+  checkForUpdate,
+}: PageProps) {
   const { t } = useI18n();
-  const [version, setVersion] = React.useState(packageMeta.version);
-  const [status, setStatus] = React.useState<UpdateStatus>("idle");
-  const [availableUpdate, setAvailableUpdate] = React.useState<Update | null>(null);
-  const [updateError, setUpdateError] = React.useState("");
-  const [progress, setProgress] = React.useState<{ downloaded: number; total: number | null }>({ downloaded: 0, total: null });
-
-  React.useEffect(() => {
-    if (!isTauriRuntime()) return;
-    getVersion().then(setVersion).catch(() => undefined);
-  }, []);
 
   async function openExternal(url: string) {
     try {
@@ -285,56 +228,6 @@ export function About({ notify, notifyRaw }: PageProps) {
     }
   }
 
-  async function checkForUpdate() {
-    setStatus("checking");
-    setUpdateError("");
-    setAvailableUpdate(null);
-    setProgress({ downloaded: 0, total: null });
-    try {
-      if (!isTauriRuntime()) {
-        throw new Error(t("about.updateAppOnly"));
-      }
-      const result = await check();
-      if (!result) {
-        setStatus("current");
-        return;
-      }
-      setAvailableUpdate(result);
-      setStatus("available");
-    } catch (error) {
-      setUpdateError(String(error));
-      setStatus("error");
-    }
-  }
-
-  async function installUpdate() {
-    if (!availableUpdate) return;
-    setStatus("downloading");
-    setUpdateError("");
-    setProgress({ downloaded: 0, total: null });
-    let downloaded = 0;
-    try {
-      await availableUpdate.downloadAndInstall((event: DownloadEvent) => {
-        if (event.event === "Started") {
-          downloaded = 0;
-          setProgress({ downloaded, total: event.data.contentLength ?? null });
-        } else if (event.event === "Progress") {
-          downloaded += event.data.chunkLength;
-          setProgress((current) => ({ downloaded, total: current.total }));
-        } else if (event.event === "Finished") {
-          setStatus("installing");
-        }
-      });
-      setStatus("restarting");
-      await relaunch();
-    } catch (error) {
-      setUpdateError(String(error));
-      setStatus("error");
-    }
-  }
-
-  const updatePercent = progress.total ? Math.max(0, Math.min(100, (progress.downloaded / progress.total) * 100)) : 0;
-  const statusText = updateStatusLabel(t, status, progress);
   const socialLinks = [
     {
       label: t("about.github"),
@@ -381,10 +274,9 @@ export function About({ notify, notifyRaw }: PageProps) {
           <span className="about-app-icon"><img src={appIcon} alt="" /></span>
           <div>
             <h2>Neko Route</h2>
-            <p>{t("about.subtitle")}</p>
             <div className="about-version">
               <span>{t("about.currentVersion")}</span>
-              <strong>{version}</strong>
+              <strong>{appVersion}</strong>
               <Pill tone="ok" label="Stable" />
             </div>
           </div>
@@ -393,8 +285,8 @@ export function About({ notify, notifyRaw }: PageProps) {
           variant="ghost"
           icon={<RotateCcw size={18} />}
           onClick={checkForUpdate}
-          loading={status === "checking"}
-          disabled={status === "downloading" || status === "installing" || status === "restarting"}
+          loading={updateStatus === "checking"}
+          disabled={updateStatus === "downloading" || updateStatus === "installing" || updateStatus === "restarting"}
           className="about-check-btn"
         >
           {t("about.checkUpdate")}
@@ -430,35 +322,20 @@ export function About({ notify, notifyRaw }: PageProps) {
           <div className="about-card-head">
             <span><Rocket size={18} /></span>
             <div>
-              <h3>{t("about.updateTitle")}</h3>
-              <p>{t("about.updateSub")}</p>
+              <h3>{t("about.currentReleaseTitle")}</h3>
+              <p>{t("about.currentReleaseSub", { version: appVersion })}</p>
             </div>
           </div>
-          <div className={`update-state ${status}`}>
-            <div>
-              <strong>{statusText}</strong>
-              {availableUpdate ? (
-                <span>
-                  {t("about.updateVersion", { version: availableUpdate.version })}
-                  {availableUpdate.date ? ` · ${new Date(availableUpdate.date).toLocaleDateString()}` : ""}
-                </span>
-              ) : (
-                <span>{t("about.updateEndpoint")}</span>
-              )}
-            </div>
-            {status === "available" ? (
-              <Button variant="primary" icon={<DownloadCloud size={16} />} onClick={installUpdate}>
-                {t("about.installUpdate")}
-              </Button>
-            ) : null}
-          </div>
-          {status === "downloading" || status === "installing" ? (
-            <div className="about-progress">
-              <span style={{ width: `${updatePercent}%` }} />
-            </div>
+          {currentReleaseLoading ? (
+            <div className="about-release-placeholder">{t("about.releaseLoading")}</div>
+          ) : currentRelease?.body ? (
+            <pre className="about-release-notes">{currentRelease.body}</pre>
+          ) : (
+            <div className="about-release-placeholder">{t("about.releaseEmpty")}</div>
+          )}
+          {currentReleaseError ? (
+            <div className="inline-warning">{t("about.releaseLoadFailed", { error: currentReleaseError })}</div>
           ) : null}
-          {availableUpdate?.body ? <pre className="about-release-notes">{availableUpdate.body}</pre> : null}
-          {updateError ? <div className="inline-warning">{updateError}</div> : null}
         </div>
       </section>
     </div>
@@ -491,8 +368,7 @@ export function RequestTable({
           <span>{t("table.reasoning")}</span>
           <span>{t("table.tokens")}</span>
           <span>{t("table.status")}</span>
-          <span>{t("table.stream")}</span>
-          <span className="hide-sm">{t("table.latency")}</span>
+          <span className="req-stream-cell">{t("table.stream")}</span>
         </div>
         {requests.map((r) => {
           const u = r.usage;
@@ -534,27 +410,22 @@ export function RequestTable({
               <span>
                 <span className={`status-chip ${r.status < 400 ? "good" : "bad"}`}>{r.status}</span>
               </span>
-              <span>
-                {r.stream_state ? (
-                  <span
-                    className={`stream-chip ${streamStateTone(r.stream_state)}`}
-                    title={[
-                      r.stream_state === "pending" && r.stream_bytes > 0
-                        ? `${t("tokens.streamBytes")}: ${formatBytes(r.stream_bytes)}`
-                        : null,
-                      r.last_event,
-                      r.stream_error,
-                    ].filter(Boolean).join(" · ")}
-                  >
-                    {r.stream_state === "pending" && r.stream_bytes > 0
-                      ? formatBytes(r.stream_bytes)
-                      : t(streamStateKey(r.stream_state))}
-                  </span>
-                ) : (
-                  <span style={{ color: "var(--faint)" }}>—</span>
-                )}
+              <span className="req-stream-cell">
+                <span
+                  className={`latency-chip ${latencyTone(r.latency_ms)}`}
+                  title={[
+                    `${r.latency_ms}ms`,
+                    r.stream_state,
+                    r.stream_state === "pending" && r.stream_bytes > 0
+                      ? `${t("tokens.streamBytes")}: ${formatBytes(r.stream_bytes)}`
+                      : null,
+                    r.last_event,
+                    r.stream_error,
+                  ].filter(Boolean).join(" · ")}
+                >
+                  {formatLatency(r.latency_ms)}
+                </span>
               </span>
-              <span className="hide-sm mono">{r.latency_ms}ms</span>
             </div>
           );
         })}
@@ -657,7 +528,7 @@ export function Dashboard({ snapshot, config }: PageProps) {
   const { t } = useI18n();
   const [range, setRange] = React.useState<Range>("today");
   const enabledModels = config.models.filter((m) => m.enabled).length;
-  const enabledProviders = config.providers.filter((p) => p.enabled).length;
+  const providerCount = config.providers.length;
   const total = snapshot.requests.length;
   const success =
     total === 0
@@ -675,7 +546,7 @@ export function Dashboard({ snapshot, config }: PageProps) {
       <div className="grid grid-4">
         <Stat icon={<Coins size={15} />} label={t("dash.statTokens")} value={formatTokens(stats.all_time.total_tokens)} foot={t("dash.statTokensFoot", { requests: stats.all_time.requests })} grad />
         <Stat icon={<Cpu size={15} />} label={t("dash.statModels")} value={enabledModels} foot={t("dash.statModelsFoot", { total: config.models.length })} grad />
-        <Stat icon={<Server size={15} />} label={t("dash.statProviders")} value={enabledProviders} foot={t("dash.statProvidersFoot", { total: config.providers.length })} grad />
+        <Stat icon={<Server size={15} />} label={t("dash.statProviders")} value={providerCount} foot={t("dash.statProvidersFoot", { total: providerCount })} grad />
         <Stat icon={<Gauge size={15} />} label={t("dash.statSuccess")} value={`${success}%`} foot={total === 0 ? t("dash.successIdle") : t("dash.statSuccessFoot", { count: total, ms: avgLatency })} grad />
       </div>
 
@@ -1050,6 +921,22 @@ function TokenChip({ label, value, accent }: { label: string; value: number; acc
   );
 }
 
+type DisplayModel = {
+  model: ModelEntry;
+  index: number;
+  visualIndex: number;
+};
+
+function modelsForDisplay(models: ModelEntry[]): DisplayModel[] {
+  return models
+    .map((model, index) => ({ model, index }))
+    .sort((a, b) => {
+      if (a.model.enabled !== b.model.enabled) return a.model.enabled ? -1 : 1;
+      return a.index - b.index;
+    })
+    .map((item, visualIndex) => ({ ...item, visualIndex }));
+}
+
 /* ============================================================
    Models page
    ============================================================ */
@@ -1078,6 +965,12 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
     }
     return stats;
   }, [config.models]);
+  const displayModels = React.useMemo(() => modelsForDisplay(config.models), [config.models]);
+  const displayPositionByIndex = React.useMemo(() => {
+    const positions = new Map<number, number>();
+    displayModels.forEach((item) => positions.set(item.index, item.visualIndex));
+    return positions;
+  }, [displayModels]);
 
   function openAdd() {
     setEditIndex(null);
@@ -1244,25 +1137,27 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
         <Empty icon={<Cpu size={26} />} title={t("models.empty")} hint={t("models.emptyHint")} />
       ) : (
         <div className="entity-list">
-          {config.models.map((model, index) => {
+          {displayModels.map(({ model, index, visualIndex }) => {
             const prov = config.providers.find((p) => p.id === model.provider_id);
             const ident = prov ? providerIcon(prov) : { icon: <CustomProviderIcon size={20} />, cls: "custom" };
             const tokens = modelTokens(model.id);
             const modelStats = duplicateModelStats.get(modelIdKey(model.id));
             const hasDuplicateId = (modelStats?.total ?? 0) > 1;
             const hasEnabledConflict = model.enabled && (modelStats?.enabled ?? 0) > 1;
+            const dragVisualIndex = dragIndex === null ? null : displayPositionByIndex.get(dragIndex) ?? null;
+            const dragOverVisualIndex = dragOverIndex === null ? null : displayPositionByIndex.get(dragOverIndex) ?? null;
             const shiftingDown =
-              dragIndex !== null &&
-              dragOverIndex !== null &&
-              dragOverIndex < dragIndex &&
-              index >= dragOverIndex &&
-              index < dragIndex;
+              dragVisualIndex !== null &&
+              dragOverVisualIndex !== null &&
+              dragOverVisualIndex < dragVisualIndex &&
+              visualIndex >= dragOverVisualIndex &&
+              visualIndex < dragVisualIndex;
             const shiftingUp =
-              dragIndex !== null &&
-              dragOverIndex !== null &&
-              dragOverIndex > dragIndex &&
-              index > dragIndex &&
-              index <= dragOverIndex;
+              dragVisualIndex !== null &&
+              dragOverVisualIndex !== null &&
+              dragOverVisualIndex > dragVisualIndex &&
+              visualIndex > dragVisualIndex &&
+              visualIndex <= dragOverVisualIndex;
             return (
               <div
                 className={[
@@ -1270,14 +1165,14 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
                   model.enabled ? "" : "off",
                   dragIndex === index ? "dragging" : "",
                   dragOverIndex === index && dragIndex !== index ? "drag-over" : "",
-                  dragOverIndex === index && dragIndex !== null && dragOverIndex < dragIndex ? "insert-before" : "",
-                  dragOverIndex === index && dragIndex !== null && dragOverIndex > dragIndex ? "insert-after" : "",
+                  dragOverIndex === index && dragVisualIndex !== null && dragOverVisualIndex !== null && dragOverVisualIndex < dragVisualIndex ? "insert-before" : "",
+                  dragOverIndex === index && dragVisualIndex !== null && dragOverVisualIndex !== null && dragOverVisualIndex > dragVisualIndex ? "insert-after" : "",
                   shiftingDown ? "drag-shift-down" : "",
                   shiftingUp ? "drag-shift-up" : "",
                 ].filter(Boolean).join(" ")}
                 key={`${model.provider_id}:${model.id}:${index}`}
                 data-model-index={index}
-                style={{ animationDelay: `${index * 0.04}s` }}
+                style={{ animationDelay: `${visualIndex * 0.04}s` }}
               >
                 <button
                   type="button"
@@ -1288,13 +1183,13 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
                   onPointerDown={(event) => beginModelDrag(index, event)}
                   onKeyDown={(event) => {
                     if (busy) return;
-                    if (event.key === "ArrowUp" && index > 0) {
+                    if (event.key === "ArrowUp" && visualIndex > 0) {
                       event.preventDefault();
-                      void reorderModels(index, index - 1);
+                      void reorderModels(index, displayModels[visualIndex - 1]?.index ?? index);
                     }
-                    if (event.key === "ArrowDown" && index < config.models.length - 1) {
+                    if (event.key === "ArrowDown" && visualIndex < displayModels.length - 1) {
                       event.preventDefault();
-                      void reorderModels(index, index + 1);
+                      void reorderModels(index, displayModels[visualIndex + 1]?.index ?? index);
                     }
                   }}
                 >
@@ -1366,6 +1261,8 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
    Provider add/edit modal
    ============================================================ */
 type ProviderFormKind = "custom" | "openai_account" | "claude_account";
+type OpenAiAuthMode = "oauth" | "json";
+type ClaudeAuthMode = "manual" | "cookie" | "json";
 
 function providerFormKind(provider: Provider | null): ProviderFormKind {
   if (provider?.kind === "official_open_ai_account") return "openai_account";
@@ -1404,10 +1301,16 @@ function ProviderModal({
   const [name, setName] = React.useState("");
   const [protocol, setProtocol] = React.useState<ProviderProtocol>("open_ai_responses");
   const [baseUrl, setBaseUrl] = React.useState("");
-  const [enabled, setEnabled] = React.useState(true);
   const [useKey, setUseKey] = React.useState(true);
   const [secret, setSecret] = React.useState("");
   const [tokenJson, setTokenJson] = React.useState("");
+  const [openAiAuthMode, setOpenAiAuthMode] = React.useState<OpenAiAuthMode>("oauth");
+  const [claudeAuthMode, setClaudeAuthMode] = React.useState<ClaudeAuthMode>("manual");
+  const [oauthSessionId, setOauthSessionId] = React.useState("");
+  const [oauthAuthUrl, setOauthAuthUrl] = React.useState("");
+  const [oauthCallback, setOauthCallback] = React.useState("");
+  const [claudeSessionKey, setClaudeSessionKey] = React.useState("");
+  const [oauthLoading, setOauthLoading] = React.useState(false);
 
   useSeedOnOpen(open, () => {
     if (existing) {
@@ -1415,23 +1318,40 @@ function ProviderModal({
       setName(existing.name);
       setProtocol(existing.protocol);
       setBaseUrl(existing.base_url);
-      setEnabled(existing.enabled);
       setUseKey(Boolean(existing.key_ref));
+      setOpenAiAuthMode(existing.kind === "official_open_ai_account" ? "oauth" : "json");
+      setClaudeAuthMode(existing.kind === "official_anthropic_account" ? "manual" : "json");
     } else {
       const seed = newCustomProvider();
       setFormKind("custom");
       setName(seed.name);
       setProtocol(seed.protocol);
       setBaseUrl(seed.base_url);
-      setEnabled(true);
       setUseKey(true);
+      setOpenAiAuthMode("oauth");
+      setClaudeAuthMode("manual");
     }
     setSecret("");
     setTokenJson("");
+    setOauthSessionId("");
+    setOauthAuthUrl("");
+    setOauthCallback("");
+    setClaudeSessionKey("");
   });
 
   const officialAccount = formKind !== "custom";
-  const valid = name.trim().length > 0 && (officialAccount ? isEdit || tokenJson.trim().length > 0 : baseUrl.trim().length > 0);
+  const openAiAccount = formKind === "openai_account";
+  const claudeAccount = formKind === "claude_account";
+  const openAiOAuthMode = openAiAccount && openAiAuthMode === "oauth";
+  const claudeManualMode = claudeAccount && claudeAuthMode === "manual";
+  const claudeCookieMode = claudeAccount && claudeAuthMode === "cookie";
+  const officialJsonMode = (openAiAccount && openAiAuthMode === "json") || (claudeAccount && claudeAuthMode === "json");
+  const officialCredentialReady = openAiOAuthMode || claudeManualMode
+    ? oauthCallback.trim().length > 0
+    : claudeCookieMode
+      ? claudeSessionKey.trim().length > 0
+      : tokenJson.trim().length > 0;
+  const valid = name.trim().length > 0 && (officialAccount ? isEdit || officialCredentialReady : baseUrl.trim().length > 0);
 
   const protoOptions = [
     { value: "open_ai_responses", label: t("proto.responses") },
@@ -1459,18 +1379,60 @@ function ProviderModal({
       setProtocol(seed.protocol);
       setBaseUrl(seed.base_url);
       setUseKey(false);
+      setOpenAiAuthMode("oauth");
+      setClaudeAuthMode("manual");
     } else {
       const seed = newClaudeAccountProvider();
       setName(seed.name);
       setProtocol(seed.protocol);
       setBaseUrl(seed.base_url);
       setUseKey(false);
+      setOpenAiAuthMode("oauth");
+      setClaudeAuthMode("manual");
+    }
+  }
+
+  async function generateAuthLink(kind: "openai" | "claude") {
+    setOauthLoading(true);
+    try {
+      const session = kind === "openai" ? await api.startOpenAiOAuth() : await api.startClaudeOAuth();
+      setOauthSessionId(session.session_id);
+      setOauthAuthUrl(session.auth_url);
+      setOauthCallback("");
+      notify("provider.authLinkReady");
+    } catch (error) {
+      notifyRaw(String(error), "bad");
+    } finally {
+      setOauthLoading(false);
+    }
+  }
+
+  async function openAuthLink() {
+    if (!oauthAuthUrl) return;
+    try {
+      await openUrl(oauthAuthUrl);
+    } catch (error) {
+      notifyRaw(String(error), "bad");
+    }
+  }
+
+  async function copyAuthLink() {
+    if (!oauthAuthUrl) return;
+    try {
+      await navigator.clipboard.writeText(oauthAuthUrl);
+      notify("toast.copied");
+    } catch (error) {
+      notifyRaw(String(error), "bad");
     }
   }
 
   async function submit() {
     if (!valid) return;
-    if (officialAccount && tokenJson.trim()) {
+    if ((openAiOAuthMode || claudeManualMode) && oauthCallback.trim() && !oauthSessionId) {
+      notify("provider.oauthSessionMissing", "bad");
+      return;
+    }
+    if (officialJsonMode && tokenJson.trim()) {
       try {
         JSON.parse(tokenJson);
       } catch (error) {
@@ -1485,7 +1447,6 @@ function ProviderModal({
         const idx = d.providers.findIndex((p) => p.id === existing.id);
         if (idx >= 0) {
           d.providers[idx].name = name.trim();
-          d.providers[idx].enabled = enabled;
           if (existing.kind === "custom") {
             d.providers[idx].protocol = protocol;
             d.providers[idx].base_url = cleanUrl;
@@ -1505,11 +1466,11 @@ function ProviderModal({
       } else if (formKind === "openai_account") {
         const seed = newOpenAiAccountProvider();
         providerId = seed.id;
-        d.providers.push({ ...seed, name: name.trim(), enabled });
+        d.providers.push({ ...seed, name: name.trim() });
       } else if (formKind === "claude_account") {
         const seed = newClaudeAccountProvider();
         providerId = seed.id;
-        d.providers.push({ ...seed, name: name.trim(), enabled });
+        d.providers.push({ ...seed, name: name.trim() });
       } else {
         const seed = newCustomProvider();
         providerId = seed.id;
@@ -1518,7 +1479,6 @@ function ProviderModal({
           name: name.trim(),
           protocol,
           base_url: cleanUrl,
-          enabled,
           key_ref: useKey ? seed.key_ref : null,
         });
       }
@@ -1526,7 +1486,40 @@ function ProviderModal({
 
     if (!ok) return;
 
-    if (officialAccount && tokenJson.trim() && providerId) {
+    if (openAiOAuthMode && oauthCallback.trim() && providerId) {
+      setBusy(true);
+      try {
+        await api.finishOpenAiOAuth(providerId, oauthSessionId, oauthCallback.trim());
+        notify("toast.keySaved");
+        await refresh();
+      } catch (error) {
+        notifyRaw(String(error), "bad");
+      } finally {
+        setBusy(false);
+      }
+    } else if (claudeManualMode && oauthCallback.trim() && providerId) {
+      setBusy(true);
+      try {
+        await api.finishClaudeOAuth(providerId, oauthSessionId, oauthCallback.trim());
+        notify("toast.keySaved");
+        await refresh();
+      } catch (error) {
+        notifyRaw(String(error), "bad");
+      } finally {
+        setBusy(false);
+      }
+    } else if (claudeCookieMode && claudeSessionKey.trim() && providerId) {
+      setBusy(true);
+      try {
+        await api.finishClaudeCookieOAuth(providerId, claudeSessionKey.trim());
+        notify("toast.keySaved");
+        await refresh();
+      } catch (error) {
+        notifyRaw(String(error), "bad");
+      } finally {
+        setBusy(false);
+      }
+    } else if (officialJsonMode && tokenJson.trim() && providerId) {
       setBusy(true);
       try {
         await api.setOfficialProviderToken(providerId, tokenJson.trim());
@@ -1576,7 +1569,169 @@ function ProviderModal({
       <Field label={t("provider.name")}>
         <Input value={name} autoFocus onChange={(e) => setName(e.target.value)} />
       </Field>
-      {officialAccount ? (
+      {openAiAccount ? (
+        <>
+          <Field label={t("provider.authMethod")}>
+            <div className="segmented provider-auth-mode">
+              {(["oauth", "json"] as OpenAiAuthMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  className={`seg ${openAiAuthMode === mode ? "active" : ""}`}
+                  onClick={() => setOpenAiAuthMode(mode)}
+                  type="button"
+                >
+                  {t(mode === "oauth" ? "provider.openAiOAuth" : "provider.codexJson")}
+                </button>
+              ))}
+            </div>
+          </Field>
+          {openAiAuthMode === "oauth" ? (
+            <div className="oauth-flow-box">
+              <div className="row wrap">
+                <Button
+                  variant="primary"
+                  icon={<ExternalLink size={16} />}
+                  onClick={() => generateAuthLink("openai")}
+                  loading={oauthLoading}
+                >
+                  {t("provider.generateAuthLink")}
+                </Button>
+                <Button
+                  variant="ghost"
+                  icon={<ExternalLink size={16} />}
+                  onClick={openAuthLink}
+                  disabled={!oauthAuthUrl}
+                >
+                  {t("provider.openAuthLink")}
+                </Button>
+                <Button
+                  variant="ghost"
+                  icon={<Copy size={16} />}
+                  onClick={copyAuthLink}
+                  disabled={!oauthAuthUrl}
+                >
+                  {t("provider.copyAuthLink")}
+                </Button>
+              </div>
+              {oauthAuthUrl ? (
+                <Input value={oauthAuthUrl} readOnly />
+              ) : null}
+              <Field label={t("provider.oauthCallback")} hint={t("provider.oauthHint")}>
+                <textarea
+                  className="input oauth-code-input"
+                  value={oauthCallback}
+                  placeholder={t("provider.oauthCallbackPlaceholder")}
+                  onChange={(event) => setOauthCallback(event.target.value)}
+                />
+              </Field>
+            </div>
+          ) : (
+            <Field label={t("provider.tokenJson")} hint={isEdit ? t("provider.tokenJsonEditHint") : t("provider.tokenJsonHint")}>
+              <textarea
+                className="input token-json-input"
+                value={tokenJson}
+                placeholder={'{\n  "access_token": "...",\n  "refresh_token": "...",\n  "expires_at": "2099-01-01T00:00:00Z"\n}'}
+                onChange={(event) => setTokenJson(event.target.value)}
+              />
+            </Field>
+          )}
+        </>
+      ) : claudeAccount ? (
+        <>
+          <Field label={t("provider.authMethod")}>
+            <div className="segmented provider-auth-mode">
+              {(["manual", "cookie", "json"] as ClaudeAuthMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  className={`seg ${claudeAuthMode === mode ? "active" : ""}`}
+                  onClick={() => {
+                    setClaudeAuthMode(mode);
+                    setOauthSessionId("");
+                    setOauthAuthUrl("");
+                    setOauthCallback("");
+                    setClaudeSessionKey("");
+                  }}
+                  type="button"
+                >
+                  {t(
+                    mode === "manual"
+                      ? "provider.claudeManualAuth"
+                      : mode === "cookie"
+                        ? "provider.claudeCookieAuth"
+                        : "provider.claudeJson",
+                  )}
+                </button>
+              ))}
+            </div>
+          </Field>
+          {claudeAuthMode === "manual" ? (
+            <div className="oauth-flow-box">
+              <div className="row wrap">
+                <Button
+                  variant="primary"
+                  icon={<ExternalLink size={16} />}
+                  onClick={() => generateAuthLink("claude")}
+                  loading={oauthLoading}
+                >
+                  {t("provider.generateAuthLink")}
+                </Button>
+                <Button
+                  variant="ghost"
+                  icon={<ExternalLink size={16} />}
+                  onClick={openAuthLink}
+                  disabled={!oauthAuthUrl}
+                >
+                  {t("provider.openAuthLink")}
+                </Button>
+                <Button
+                  variant="ghost"
+                  icon={<Copy size={16} />}
+                  onClick={copyAuthLink}
+                  disabled={!oauthAuthUrl}
+                >
+                  {t("provider.copyAuthLink")}
+                </Button>
+              </div>
+              {oauthAuthUrl ? (
+                <Input value={oauthAuthUrl} readOnly />
+              ) : null}
+              <Field label={t("provider.oauthCallback")} hint={t("provider.claudeOauthHint")}>
+                <textarea
+                  className="input oauth-code-input"
+                  value={oauthCallback}
+                  placeholder={t("provider.claudeOauthCallbackPlaceholder")}
+                  onChange={(event) => setOauthCallback(event.target.value)}
+                />
+              </Field>
+            </div>
+          ) : claudeAuthMode === "cookie" ? (
+            <div className="oauth-flow-box">
+              <Field label={t("provider.claudeSessionKey")} hint={t("provider.claudeSessionKeyHint")}>
+                <textarea
+                  className="input oauth-code-input"
+                  value={claudeSessionKey}
+                  placeholder={t("provider.claudeSessionKeyPlaceholder")}
+                  onChange={(event) => setClaudeSessionKey(event.target.value)}
+                />
+              </Field>
+              <ol className="oauth-help-list">
+                <li>{t("provider.claudeCookieStep1")}</li>
+                <li>{t("provider.claudeCookieStep2")}</li>
+                <li>{t("provider.claudeCookieStep3")}</li>
+              </ol>
+            </div>
+          ) : (
+            <Field label={t("provider.tokenJson")} hint={isEdit ? t("provider.tokenJsonEditHint") : t("provider.tokenJsonHint")}>
+              <textarea
+                className="input token-json-input"
+                value={tokenJson}
+                placeholder={'{\n  "access_token": "...",\n  "refresh_token": "...",\n  "expires_at": "2099-01-01T00:00:00Z"\n}'}
+                onChange={(event) => setTokenJson(event.target.value)}
+              />
+            </Field>
+          )}
+        </>
+      ) : officialAccount ? (
         <Field label={t("provider.tokenJson")} hint={isEdit ? t("provider.tokenJsonEditHint") : t("provider.tokenJsonHint")}>
           <textarea
             className="input token-json-input"
@@ -1595,10 +1750,6 @@ function ProviderModal({
           </Field>
         </>
       )}
-      <div className="modal-toggle-row">
-        <div className="mtr-title">{t("provider.enabled")}</div>
-        <Switch checked={enabled} onChange={setEnabled} />
-      </div>
       {!officialAccount ? (
         <div className="modal-toggle-row">
           <div className="mtr-title">{t("provider.useKey")}</div>
@@ -1789,7 +1940,7 @@ function KeyModal({
 /* ============================================================
    Keys page
    ============================================================ */
-function QuotaMini({ label, window }: { label: string; window?: OpenAiQuotaWindow | null }) {
+function QuotaMini({ label, window }: { label: string; window?: OfficialQuotaWindow | null }) {
   const percent = window?.used_percent;
   const width = percent == null || !Number.isFinite(percent) ? 0 : Math.max(0, Math.min(100, percent));
   const reset = quotaResetText(window);
@@ -1807,12 +1958,59 @@ function QuotaMini({ label, window }: { label: string; window?: OpenAiQuotaWindo
   );
 }
 
-function OpenAiAccountUsage({
+function subscriptionDisplay(value: string | null | undefined, providerKind: Provider["kind"]) {
+  const label = value?.trim();
+  if (!label) return { label: "--", tone: "unknown" };
+  const normalized = label.toLowerCase().replace(/[-_\s]+/g, " ");
+  const compact = normalized.replace(/\s+/g, "");
+  if (
+    providerKind === "official_anthropic_cli" ||
+    providerKind === "official_anthropic_desktop" ||
+    providerKind === "official_anthropic_account"
+  ) {
+    if (compact === "free") return { label: "FREE", tone: "free" };
+    if (compact === "pro") return { label: "PRO", tone: "pro" };
+    if (compact === "max" || compact === "max5x" || compact === "max20x") return { label: "MAX", tone: "max" };
+    return { label, tone: "unknown" };
+  }
+  if (compact === "free") return { label: "FREE", tone: "free" };
+  if (compact === "plus") return { label: "PLUS", tone: "plus" };
+  if (compact === "pro100x" || (compact.startsWith("pro") && compact.includes("100"))) return { label: "PRO 100X", tone: "pro" };
+  if (compact === "pro200x" || (compact.startsWith("pro") && compact.includes("200"))) return { label: "PRO 200X", tone: "pro" };
+  if (compact === "pro") return { label: "PRO", tone: "pro" };
+  return { label, tone: "unknown" };
+}
+
+function SubscriptionMini({
+  provider,
+  quota,
+  t,
+}: {
+  provider: Provider;
+  quota?: ProviderUsageStatus["quota"];
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const subscription = subscriptionDisplay(quota?.plan_label ?? quota?.plan_type, provider.kind);
+  const title = [
+    quota?.plan_type ? `plan_type: ${quota.plan_type}` : null,
+    quota?.subscription_expires_at ? `expires: ${new Date(quota.subscription_expires_at).toLocaleDateString()}` : null,
+  ].filter(Boolean).join(" · ") || undefined;
+  return (
+    <div className={`usage-mini subscription-mini ${provider.kind.replace(/_/g, "-")} ${subscription.tone}`} title={title}>
+      <span>{t("provider.accountPlan")}</span>
+      <strong>{subscription.label}</strong>
+    </div>
+  );
+}
+
+function OfficialAccountUsage({
+  provider,
   usage,
   onRefresh,
   loading,
   t,
 }: {
+  provider: Provider;
   usage?: ProviderUsageStatus;
   onRefresh: () => void;
   loading: boolean;
@@ -1824,6 +2022,7 @@ function OpenAiAccountUsage({
   const costTitle = unknown.length > 0 ? `Unknown price: ${unknown.join(", ")}` : undefined;
   return (
     <div className="account-usage-strip">
+      <SubscriptionMini provider={provider} quota={quota} t={t} />
       <QuotaMini label="5h" window={quota?.five_hour} />
       <QuotaMini label="7d" window={quota?.seven_day} />
       <div className="usage-mini" title={costTitle}>
@@ -1872,13 +2071,6 @@ export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw,
     setDeleteProvider(null);
   }
 
-  async function quickToggle(id: string, v: boolean) {
-    await commit((d) => {
-      const p = d.providers.find((x) => x.id === id);
-      if (p) p.enabled = v;
-    });
-  }
-
   async function refreshUsage(providerId: string) {
     setUsageRefreshing(providerId);
     try {
@@ -1902,8 +2094,13 @@ export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw,
     let tone: "ok" | "warn" | "bad";
     let label: string;
     if (provider.kind === "official_open_ai") {
-      tone = "warn";
-      label = t("key.notSignedIn");
+      if (status?.message === "key.expired" && status.available === false) {
+        tone = "bad";
+        label = t("key.expired");
+      } else {
+        tone = present ? "ok" : "warn";
+        label = present ? t("key.signedIn") : t("key.notSignedIn");
+      }
     } else if (
       provider.kind === "official_anthropic_cli" ||
       provider.kind === "official_anthropic_desktop" ||
@@ -1932,19 +2129,19 @@ export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw,
     const st = keyStatus(provider);
     const subtitle = provider.kind === "custom" ? t(protocolKey(provider.protocol)) : t(providerShortSourceKey(provider));
     const usage = snapshot.provider_usage.find((item) => item.provider_id === provider.id);
-    const isOpenAiUsageProvider = provider.kind === "official_open_ai" || provider.kind === "official_open_ai_account";
-    const hasUsageData = Boolean(
-      usage?.quota ||
-      usage?.local_usage?.total_tokens ||
-      usage?.updated_at ||
-      usage?.error
-    );
-    const showOpenAiUsage =
-      isOpenAiUsageProvider &&
-      (provider.kind === "official_open_ai" || hasUsageData || (st.present && st.available));
+    const isOfficialUsageProvider =
+      provider.kind === "official_open_ai" ||
+      provider.kind === "official_open_ai_account" ||
+      provider.kind === "official_anthropic_cli" ||
+      provider.kind === "official_anthropic_desktop" ||
+      provider.kind === "official_anthropic_account";
+    const showOfficialUsage =
+      isOfficialUsageProvider &&
+      st.present &&
+      st.available;
 
     return (
-      <div className={`entity-row provider-row fade-up ${provider.enabled ? "" : "off"}`} key={provider.id} style={{ animationDelay: `${index * 0.04}s` }}>
+      <div className="entity-row provider-row fade-up" key={provider.id} style={{ animationDelay: `${index * 0.04}s` }}>
         <div className="entity-main">
           <span className={`entity-avatar ${ident.cls}`}>{ident.icon}</span>
           <div className="entity-title">
@@ -1954,8 +2151,9 @@ export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw,
         </div>
 
         <div className="entity-meta">
-          {showOpenAiUsage ? (
-            <OpenAiAccountUsage
+          {showOfficialUsage ? (
+            <OfficialAccountUsage
+              provider={provider}
               usage={usage}
               loading={usageRefreshing === provider.id}
               onRefresh={() => refreshUsage(provider.id)}
@@ -1981,7 +2179,6 @@ export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw,
               <IconButton danger icon={<Trash2 size={15} />} title={t("common.delete")} onClick={() => setDeleteProvider(provider)} />
             </>
           ) : null}
-          <Switch checked={provider.enabled} onChange={(v) => quickToggle(provider.id, v)} />
         </div>
       </div>
     );
@@ -2146,7 +2343,7 @@ function modelAvailableForCodexMode(
   if (mode === "official_account") return model.enabled;
 
   const provider = config.providers.find((p) => p.id === model.provider_id);
-  if (!provider || !provider.enabled || !model.enabled) return false;
+  if (!provider || !model.enabled) return false;
   if (provider.kind === "official_open_ai") return false;
 
   const key = snapshot.keys.find((item) => item.provider_id === provider.id);
@@ -2156,12 +2353,17 @@ function modelAvailableForCodexMode(
   return Boolean(key?.present && key.available);
 }
 
+function validCodexSettingModel(current: string | null | undefined, selectable: ModelEntry[]) {
+  const selected = current?.trim() ?? "";
+  if (selected && selectable.some((model) => model.id === selected)) return selected;
+  return selectable[0]?.id ?? "";
+}
+
 export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyRaw, setBusy, busy }: PageProps) {
   const { t } = useI18n();
-  const enabled = config.models.filter((m) => m.enabled);
   const mode = config.settings.codex_injection_mode ?? "official_account";
-  const selectable = enabled.filter((model) => modelAvailableForCodexMode(model, config, snapshot, mode));
-  const defaultModel = config.settings.codex_default_model ?? selectable[0]?.id ?? enabled[0]?.id ?? "";
+  const selectable = config.models.filter((model) => modelAvailableForCodexMode(model, config, snapshot, mode));
+  const defaultModel = validCodexSettingModel(config.settings.codex_default_model, selectable);
   const autoInject = config.settings.auto_inject;
   const [importOpen, setImportOpen] = React.useState(false);
   const [importing, setImporting] = React.useState(false);
@@ -2200,20 +2402,17 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
   async function setAutoInject(v: boolean) {
     await commit((d) => {
       d.settings.auto_inject = v;
-      // Lock in the current default so backend auto-injection knows what to write.
-      if (v && !d.settings.codex_default_model) {
-        d.settings.codex_default_model = defaultModel || null;
-      }
+      if (v) d.settings.codex_default_model = defaultModel || null;
     }, v ? "toast.autoInjectOn" : "toast.autoInjectOff");
   }
   async function setMode(next: CodexInjectionMode) {
     const nextSelectable = config.models.filter((model) => modelAvailableForCodexMode(model, config, snapshot, next));
-    const nextFallback = nextSelectable.some((model) => model.id === config.settings.fallback_model)
-      ? config.settings.fallback_model
-      : nextSelectable[0]?.id ?? null;
+    const nextDefault = validCodexSettingModel(config.settings.codex_default_model, nextSelectable);
+    const nextFallback = validCodexSettingModel(config.settings.fallback_model, nextSelectable);
     await commit((d) => {
       d.settings.codex_injection_mode = next;
-      d.settings.fallback_model = nextFallback;
+      d.settings.codex_default_model = nextDefault || null;
+      d.settings.fallback_model = nextFallback || null;
     });
   }
 
@@ -2285,15 +2484,17 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
 
   const modelOptions = selectable.map((m) => ({ value: m.id, label: m.display_name, sub: m.id }));
   const fallbackOptions = selectable.map((m) => ({ value: m.id, label: m.display_name || m.id, sub: m.id }));
-  const fallback = fallbackOptions.some((option) => option.value === config.settings.fallback_model)
-    ? config.settings.fallback_model ?? ""
-    : fallbackOptions[0]?.value ?? "";
+  const fallback = validCodexSettingModel(config.settings.fallback_model, selectable);
   React.useEffect(() => {
-    if (!fallback || config.settings.fallback_model === fallback) return;
+    if (!defaultModel && !fallback) return;
+    const shouldFixDefault = Boolean(defaultModel) && config.settings.codex_default_model !== defaultModel;
+    const shouldFixFallback = Boolean(fallback) && config.settings.fallback_model !== fallback;
+    if (!shouldFixDefault && !shouldFixFallback) return;
     void commit((d) => {
-      d.settings.fallback_model = fallback;
+      if (defaultModel) d.settings.codex_default_model = defaultModel;
+      if (fallback) d.settings.fallback_model = fallback;
     });
-  }, [commit, config.settings.fallback_model, fallback]);
+  }, [commit, config.settings.codex_default_model, config.settings.fallback_model, defaultModel, fallback]);
 
   return (
     <div className="stack page-enter">

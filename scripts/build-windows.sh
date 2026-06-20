@@ -118,6 +118,10 @@ fi
 mkdir -p "$RELEASE_DIR"
 DEST="$RELEASE_DIR/$(basename "$ARTIFACT")"
 cp "$ARTIFACT" "$DEST"
+if [[ -f "${ARTIFACT}.sig" ]]; then
+  cp "${ARTIFACT}.sig" "${DEST}.sig"
+  echo "Signature: ${DEST}.sig"
+fi
 
 echo "Installer: $DEST"
 UPDATER_ARTIFACT="$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*setup.exe.zip' -print -quit)"

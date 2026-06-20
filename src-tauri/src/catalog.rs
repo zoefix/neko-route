@@ -138,7 +138,7 @@ fn model_to_codex_json(model: &ModelEntry, slug: &str) -> Value {
         "supports_image_detail_original": true,
         "context_window": model.context_window,
         "max_context_window": model.context_window,
-        "effective_context_window_percent": 95,
+        "effective_context_window_percent": 100,
         "experimental_supported_tools": [],
         "input_modalities": ["text", "image"],
         "supports_search_tool": false,
@@ -200,6 +200,25 @@ mod tests {
     }
 
     #[test]
+    fn catalog_keeps_effective_context_window_at_full_size() {
+        let mut config = default_config();
+        config.models[0].context_window = 1_000_000;
+        config.models[1].context_window = 258_000;
+
+        let catalog = catalog_json(&config);
+        let models = catalog["models"].as_array().unwrap();
+
+        for expected in [1_000_000, 258_000] {
+            let model = models
+                .iter()
+                .find(|model| model["context_window"] == expected)
+                .unwrap();
+            assert_eq!(model["max_context_window"], expected);
+            assert_eq!(model["effective_context_window_percent"], 100);
+        }
+    }
+
+    #[test]
     fn catalog_marks_claude_reasoning_supported_with_max() {
         let config = default_config();
         let catalog = catalog_json(&config);
@@ -230,7 +249,6 @@ mod tests {
             kind: ProviderKind::Custom,
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url: "https://deepseek.example/v1".into(),
-            enabled: true,
             key_ref: Some("provider:deepseek".into()),
         });
         let mut model = config.models[0].clone();

@@ -40,7 +40,6 @@ pub struct Provider {
     pub kind: ProviderKind,
     pub protocol: ProviderProtocol,
     pub base_url: String,
-    pub enabled: bool,
     pub key_ref: Option<String>,
 }
 
@@ -226,7 +225,7 @@ pub struct ProviderLocalUsage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAiQuotaWindow {
+pub struct OfficialQuotaWindow {
     pub used_percent: f64,
     pub limit_window_seconds: u64,
     pub reset_after_seconds: u64,
@@ -234,20 +233,22 @@ pub struct OpenAiQuotaWindow {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct OpenAiAccountQuota {
+pub struct OfficialAccountQuota {
     pub account_id: Option<String>,
     pub user_id: Option<String>,
     pub email: Option<String>,
     pub plan_type: Option<String>,
-    pub five_hour: Option<OpenAiQuotaWindow>,
-    pub seven_day: Option<OpenAiQuotaWindow>,
+    pub plan_label: Option<String>,
+    pub subscription_expires_at: Option<DateTime<Utc>>,
+    pub five_hour: Option<OfficialQuotaWindow>,
+    pub seven_day: Option<OfficialQuotaWindow>,
     pub reset_credits: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderUsageStatus {
     pub provider_id: String,
-    pub quota: Option<OpenAiAccountQuota>,
+    pub quota: Option<OfficialAccountQuota>,
     pub local_usage: ProviderLocalUsage,
     pub updated_at: Option<DateTime<Utc>>,
     pub source: String,
@@ -276,7 +277,6 @@ pub fn default_config() -> AppConfig {
                 kind: ProviderKind::OfficialOpenAi,
                 protocol: ProviderProtocol::OpenAiResponses,
                 base_url: "https://api.openai.com/v1".into(),
-                enabled: true,
                 key_ref: None,
             },
             Provider {
@@ -285,7 +285,6 @@ pub fn default_config() -> AppConfig {
                 kind: ProviderKind::OfficialAnthropicCli,
                 protocol: ProviderProtocol::AnthropicMessages,
                 base_url: "local://claude-code".into(),
-                enabled: true,
                 key_ref: None,
             },
             Provider {
@@ -294,7 +293,6 @@ pub fn default_config() -> AppConfig {
                 kind: ProviderKind::OfficialAnthropicDesktop,
                 protocol: ProviderProtocol::AnthropicMessages,
                 base_url: "local://claude-desktop".into(),
-                enabled: true,
                 key_ref: None,
             },
         ],
