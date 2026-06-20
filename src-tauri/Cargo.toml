@@ -1,0 +1,50 @@
+[package]
+name = "neko-route"
+version = "0.1.0"
+description = "Local AI model router for Codex"
+authors = ["Neko Route"]
+edition = "2021"
+rust-version = "1.80"
+
+[lib]
+name = "neko_route_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "neko-route"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+async-stream = "0.3"
+aes = "0.8"
+axum = { version = "0.7", features = ["json"] }
+base64 = "0.22"
+bytes = "1"
+cbc = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+futures-util = "0.3"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+pbkdf2 = "0.12"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = "0.1"
+toml_edit = { version = "0.22", features = ["serde"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2.3.1"
+tauri-plugin-opener = "2.5.4"
+
+[dev-dependencies]
+tempfile = "3"

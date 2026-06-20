@@ -1,0 +1,202 @@
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  AppConfig,
+  AppSnapshot,
+  CodexConfigContent,
+  CodexConfigSaveResult,
+  ImportResult,
+  ProviderCredential,
+  RequestLogPage,
+  TestModelResult,
+  UpstreamModelList,
+} from "./types";
+import { isTauri, mockSnapshot, mockTestModel, mockUpstreamModels } from "./mock";
+
+// In-memory snapshot used only when running in a plain browser (web:dev preview).
+let demo: AppSnapshot | null = null;
+function demoSnap(): AppSnapshot {
+  if (!demo) demo = mockSnapshot();
+  return demo;
+}
+
+export const api = {
+  getSnapshot: () =>
+    isTauri ? invoke<AppSnapshot>("get_snapshot") : Promise.resolve(demoSnap()),
+
+  saveConfig: (config: AppConfig) => {
+    if (!isTauri) {
+      const prev = demoSnap();
+      // mirror backend: keep key statuses, drop removed providers, default new ones
+      const keys = config.providers.map((p) => {
+        const existing = prev.keys.find((k) => k.provider_id === p.id);
+        return existing ?? { provider_id: p.id, present: false, available: true, message: null };
+      });
+      demo = { ...prev, config, keys };
+      return Promise.resolve(demo);
+    }
+    return invoke<AppSnapshot>("save_config", { config });
+  },
+
+  setProviderKey: (providerId: string, secret: string) => {
+    if (!isTauri) {
+      const prev = demoSnap();
+      demo = {
+        ...prev,
+        keys: prev.keys.map((k) =>
+          k.provider_id === providerId ? { ...k, present: secret.length > 0, available: true, message: null } : k,
+        ),
+      };
+      return Promise.resolve(demo);
+    }
+    return invoke<AppSnapshot>("set_provider_key", { providerId, secret });
+  },
+
+  setOfficialProviderToken: (providerId: string, tokenJson: string) => {
+    if (!isTauri) {
+      const prev = demoSnap();
+      demo = {
+        ...prev,
+        keys: prev.keys.map((k) =>
+          k.provider_id === providerId ? { ...k, present: tokenJson.trim().length > 0, available: true, message: null } : k,
+        ),
+      };
+      return Promise.resolve(demo);
+    }
+    return invoke<AppSnapshot>("set_official_provider_token", { providerId, tokenJson });
+  },
+
+  deleteOfficialProviderToken: (providerId: string) => {
+    if (!isTauri) {
+      const prev = demoSnap();
+      demo = {
+        ...prev,
+        keys: prev.keys.map((k) => (k.provider_id === providerId ? { ...k, present: false, available: false } : k)),
+      };
+      return Promise.resolve(demo);
+    }
+    return invoke<AppSnapshot>("delete_official_provider_token", { providerId });
+  },
+
+  refreshOfficialProviderToken: (providerId: string) =>
+    isTauri ? invoke<AppSnapshot>("refresh_official_provider_token", { providerId }) : Promise.resolve(demoSnap()),
+
+  readProviderCredential: (providerId: string) => {
+    if (!isTauri) {
+      const provider = demoSnap().config.providers.find((p) => p.id === providerId);
+      return Promise.resolve({
+        value: provider?.kind === "custom" ? "sk-demo-secret" : '{\n  "access_token": "demo-token"\n}',
+        source: provider?.kind === "custom" ? "Neko Route local storage" : "Demo credential source",
+        editable: provider?.kind === "custom" || provider?.kind === "official_open_ai_account" || provider?.kind === "official_anthropic_account",
+        deletable: provider?.kind === "custom" || provider?.kind === "official_open_ai_account" || provider?.kind === "official_anthropic_account",
+      } as ProviderCredential);
+    }
+    return invoke<ProviderCredential>("read_provider_credential", { providerId });
+  },
+
+  deleteProviderKey: (providerId: string) => {
+    if (!isTauri) {
+      const prev = demoSnap();
+      demo = {
+        ...prev,
+        keys: prev.keys.map((k) => (k.provider_id === providerId ? { ...k, present: false } : k)),
+      };
+      return Promise.resolve(demo);
+    }
+    return invoke<AppSnapshot>("delete_provider_key", { providerId });
+  },
+
+  testRoute: (model: string) =>
+    isTauri
+      ? invoke<Record<string, unknown>>("test_route", { model })
+      : Promise.resolve({
+          model,
+          note: "browser demo — connect via Tauri for live routing",
+        } as Record<string, unknown>),
+
+  testModel: (model: string, providerId?: string) =>
+    isTauri
+      ? invoke<TestModelResult>("test_model", { model, providerId })
+      : Promise.resolve(mockTestModel(model)),
+
+  listUpstreamModels: (providerId: string) =>
+    isTauri
+      ? invoke<UpstreamModelList>("list_upstream_models", { providerId })
+      : Promise.resolve({ models: mockUpstreamModels(providerId), error: null }),
+
+  refreshProviderUsage: (providerId: string) =>
+    isTauri
+      ? invoke<AppSnapshot>("refresh_provider_usage", { providerId })
+      : Promise.resolve(demoSnap()),
+
+  exportCatalog: () =>
+    isTauri ? invoke<string>("export_catalog") : Promise.resolve("/demo/.codex/model-catalogs/neko-route.json"),
+
+  installCodexConfig: (defaultModel: string) =>
+    isTauri
+      ? invoke<Record<string, string>>("install_codex_config", { defaultModel })
+      : Promise.resolve({ config_path: "/demo/.codex/config.toml" }),
+
+  restoreCodexConfig: (deleteCatalog: boolean) =>
+    isTauri
+      ? invoke<Record<string, string>>("restore_codex_config", { deleteCatalog })
+      : Promise.resolve({ config_path: "/demo/.codex/config.toml" }),
+
+  readCodexConfig: () =>
+    isTauri
+      ? invoke<CodexConfigContent>("read_codex_config")
+      : Promise.resolve({
+          codex_home: "/demo/.codex",
+          config_path: "/demo/.codex/config.toml",
+          content:
+            'model_provider = "neko-route"\nmodel_catalog_json = "/demo/.codex/model-catalogs/neko-route.json"\n\n[model_providers.neko-route]\nname = "neko-route"\nbase_url = "http://127.0.0.1:8787/v1"\nwire_api = "responses"\nrequires_openai_auth = true\n',
+          exists: true,
+        } as CodexConfigContent),
+
+  saveCodexConfig: (content: string) =>
+    isTauri
+      ? invoke<CodexConfigSaveResult>("save_codex_config", { content })
+      : Promise.resolve({
+          codex_home: "/demo/.codex",
+          config_path: "/demo/.codex/config.toml",
+          backup_path: "/demo/.codex/config-backups/neko-route-manual-demo.toml",
+        } as CodexConfigSaveResult),
+
+  importSessions: () =>
+    isTauri
+      ? invoke<ImportResult>("import_sessions")
+      : Promise.resolve({
+          scanned: 128,
+          imported: 115,
+          already: 13,
+          skipped: 0,
+          by_previous: { custom: 102, capture: 13 },
+          sqlite_scanned: 128,
+          sqlite_updated: 115,
+          sqlite_already: 13,
+          sqlite_mismatched: 115,
+          backup_path: "/demo/.codex/config-backups/neko-route-session-import-demo",
+          codex_home: "/demo/.codex",
+        } as ImportResult),
+
+  getRequestLogs: (page: number, pageSize: number) => {
+    if (!isTauri) {
+      const requests = demoSnap().requests;
+      const offset = (Math.max(1, page) - 1) * pageSize;
+      return Promise.resolve({
+        records: requests.slice(offset, offset + pageSize),
+        total: requests.length,
+        page,
+        page_size: pageSize,
+      } as RequestLogPage);
+    }
+    return invoke<RequestLogPage>("get_request_logs", { page, pageSize });
+  },
+
+  clearRequestLogs: () => {
+    if (!isTauri) {
+      demo = { ...demoSnap(), requests: [], request_log_count: 0 };
+      return Promise.resolve(undefined);
+    }
+    return invoke("clear_request_logs");
+  },
+};
