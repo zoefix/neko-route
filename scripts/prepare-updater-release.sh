@@ -60,11 +60,11 @@ add_platform() {
 }
 
 add_platform "windows-x86_64-nsis" "windows-x86_64" \
-  "release/windows-x64/*.zip" \
-  "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.zip"
+  "release/windows-x64/*setup.exe" \
+  "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*setup.exe"
 add_platform "windows-aarch64-nsis" "windows-aarch64" \
-  "release/windows-arm64/*.zip" \
-  "src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*.zip"
+  "release/windows-arm64/*setup.exe" \
+  "src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*setup.exe"
 if [[ "$HOST_UNAME" == "arm64" || "$HOST_UNAME" == "aarch64" ]]; then
   add_platform "darwin-aarch64-app" "darwin-aarch64" \
     "release/macos-arm64/*.app.tar.gz" \

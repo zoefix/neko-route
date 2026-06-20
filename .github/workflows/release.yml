@@ -165,12 +165,9 @@ jobs:
           BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/nsis"
           mkdir -p "$OUT_DIR"
           EXE_PATH="$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*setup.exe' -print -quit)"
-          ZIP_PATH="$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*setup.exe.zip' -print -quit)"
           EXE_NAME="Neko-Route_${VERSION}_${{ matrix.asset_os }}_${{ matrix.asset_arch }}-setup.exe"
-          ZIP_NAME="${EXE_NAME}.zip"
           cp "$EXE_PATH" "$OUT_DIR/$EXE_NAME"
-          cp "$ZIP_PATH" "$OUT_DIR/$ZIP_NAME"
-          cp "${ZIP_PATH}.sig" "$OUT_DIR/${ZIP_NAME}.sig"
+          cp "${EXE_PATH}.sig" "$OUT_DIR/${EXE_NAME}.sig"
 
       - name: Stage Linux assets
         if: matrix.platform == 'linux'
