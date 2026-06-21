@@ -6,7 +6,7 @@ Local AI Router for Codex. A desktop control plane for model routing, official a
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [Changelog](CHANGELOG.md)
 
-![Version](https://img.shields.io/badge/version-v0.1.3-7c3aed?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-v0.1.6-7c3aed?style=for-the-badge)
 ![Windows](https://img.shields.io/badge/Windows-supported-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 ![macOS](https://img.shields.io/badge/macOS-supported-000000?style=for-the-badge&logo=apple&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-supported-FCC624?style=for-the-badge&logo=linux&logoColor=111111)

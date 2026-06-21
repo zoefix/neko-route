@@ -12,6 +12,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - Added Homebrew Cask installation and release automation for macOS.
 
+## [0.1.6] - 2026-06-22
+
+### Fixed
+
+- Fixed OpenAI Responses forwarding after switching from DeepSeek by removing Neko Route local reasoning markers before upstream verification.
+
 ## [0.1.3] - 2026-06-21
 
 ### Added

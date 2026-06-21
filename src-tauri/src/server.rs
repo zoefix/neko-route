@@ -765,11 +765,16 @@ fn responses_proxy_body(
     requested_model: &str,
     matched: &RouteMatch,
 ) -> Result<Bytes, RouteError> {
-    if matched.upstream_model == requested_model {
+    let mut changed = strip_local_encrypted_reasoning_from_responses_body(&mut body);
+    if matched.upstream_model != requested_model {
+        body["model"] = Value::String(matched.upstream_model.clone());
+        changed = true;
+    }
+
+    if !changed {
         return Ok(original_bytes);
     }
 
-    body["model"] = Value::String(matched.upstream_model.clone());
     serde_json::to_vec(&body).map(Bytes::from).map_err(|error| {
         RouteError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -777,6 +782,35 @@ fn responses_proxy_body(
             error.to_string(),
         )
     })
+}
+
+fn strip_local_encrypted_reasoning_from_responses_body(body: &mut Value) -> bool {
+    let mut changed = false;
+    for key in ["input", "messages"] {
+        if let Some(items) = body.get_mut(key).and_then(Value::as_array_mut) {
+            changed |= strip_local_encrypted_reasoning_items(items);
+        }
+    }
+    changed
+}
+
+fn strip_local_encrypted_reasoning_items(items: &mut Vec<Value>) -> bool {
+    let original_len = items.len();
+    items.retain(|item| !is_local_encrypted_reasoning_item(item));
+    items.len() != original_len
+}
+
+fn is_local_encrypted_reasoning_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("reasoning")
+        && item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .map(is_local_encrypted_reasoning_content)
+            .unwrap_or(false)
+}
+
+fn is_local_encrypted_reasoning_content(value: &str) -> bool {
+    value.starts_with(CHAT_REASONING_PREFIX) || value.starts_with(ANTHROPIC_THINKING_PREFIX)
 }
 
 fn official_responses_endpoint(
@@ -6302,15 +6336,16 @@ mod tests {
         claude_code_mirror_headers, collect_anthropic_tool_result_positions,
         context_bridge_diagnostics, context_full_error_message, converted_anthropic_sse,
         converted_chat_sse, endpoint, event_data_lines, extract_stream_delta, find_sse_boundary,
-        forward_chat_completions, is_public_openai_api_key, json_size, lan_proxy_request_headers,
-        map_openai_chat_reasoning_effort, map_reasoning_effort, official_responses_endpoint,
-        post_bytes_with_retries, proxy_lan_models, proxy_raw, proxy_request_headers,
-        response_stream_done_events, response_stream_start_events, responses_proxy_body,
-        responses_proxy_url, route_response, should_precompress_from_pressure_sample,
-        should_retry_chat_without_response_format, should_skip_proxy_request_header,
-        summarize_tool_result, validate_lan_authorization, ChatCompletionsCompatibilityProfile,
-        RawProxyContext, RawSseObserver, ResponsesAuthMode, RouteError, ServerState,
-        CLAUDE_DESKTOP_COUNT_TOKENS_BETA, CLAUDE_DESKTOP_MESSAGES_BETA, RESPONSES_BODY_LIMIT_BYTES,
+        forward_chat_completions, forward_responses_proxy, is_public_openai_api_key, json_size,
+        lan_proxy_request_headers, map_openai_chat_reasoning_effort, map_reasoning_effort,
+        official_responses_endpoint, post_bytes_with_retries, proxy_lan_models, proxy_raw,
+        proxy_request_headers, response_stream_done_events, response_stream_start_events,
+        responses_proxy_body, responses_proxy_url, route_response,
+        should_precompress_from_pressure_sample, should_retry_chat_without_response_format,
+        should_skip_proxy_request_header, summarize_tool_result, validate_lan_authorization,
+        ChatCompletionsCompatibilityProfile, RawProxyContext, RawSseObserver, ResponsesAuthMode,
+        RouteError, ServerState, CLAUDE_DESKTOP_COUNT_TOKENS_BETA, CLAUDE_DESKTOP_MESSAGES_BETA,
+        RESPONSES_BODY_LIMIT_BYTES,
     };
     use crate::{
         router::{match_route, RouteMatch},
@@ -9470,6 +9505,204 @@ mod tests {
         let proxied = responses_proxy_body(body, raw.clone(), "gpt-5.5", &matched).unwrap();
 
         assert_eq!(proxied, raw);
+    }
+
+    #[test]
+    fn responses_proxy_strips_local_chat_reasoning_before_openai_responses() {
+        let config = default_config();
+        let matched = match_route(&config, "gpt-5.5").unwrap();
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                {
+                    "id": "rsn_local",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "neko-route-chat-reasoning:v1:cHJpdmF0ZQ=="
+                },
+                {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "OK" }]
+                }
+            ],
+            "stream": false
+        });
+        let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
+
+        let proxied = responses_proxy_body(body, raw.clone(), "gpt-5.5", &matched).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&proxied).unwrap();
+
+        assert_ne!(proxied, raw);
+        assert_eq!(value["model"], "gpt-5.5");
+        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+        assert_eq!(value["input"][0]["type"], "message");
+        assert!(!value.to_string().contains("neko-route-chat-reasoning"));
+    }
+
+    #[test]
+    fn responses_proxy_strips_local_anthropic_thinking_from_messages() {
+        let config = default_config();
+        let matched = match_route(&config, "gpt-5.5").unwrap();
+        let body = json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {
+                    "id": "rsn_claude",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "neko-route-anthropic-thinking:v1:eyJ0aGlua2luZyI6InQiLCJzaWduYXR1cmUiOiJzIn0="
+                },
+                {
+                    "role": "user",
+                    "content": "continue"
+                }
+            ],
+            "stream": false
+        });
+        let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
+
+        let proxied = responses_proxy_body(body, raw, "gpt-5.5", &matched).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&proxied).unwrap();
+
+        assert_eq!(value["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert!(!value.to_string().contains("neko-route-anthropic-thinking"));
+    }
+
+    #[test]
+    fn responses_proxy_preserves_unknown_encrypted_reasoning() {
+        let config = default_config();
+        let matched = match_route(&config, "gpt-5.5").unwrap();
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [
+                {
+                    "id": "rsn_official",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "gAAAA-official-or-upstream-token"
+                },
+                {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "OK" }]
+                }
+            ],
+            "stream": false
+        });
+        let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
+
+        let proxied = responses_proxy_body(body, raw.clone(), "gpt-5.5", &matched).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&proxied).unwrap();
+
+        assert_eq!(proxied, raw);
+        assert_eq!(value["input"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            value["input"][0]["encrypted_content"],
+            "gAAAA-official-or-upstream-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_forward_strips_deepseek_local_reasoning_before_mock_openai() {
+        let captured_body = Arc::new(Mutex::new(None::<Value>));
+        let app = axum::Router::new().route(
+            "/responses",
+            axum::routing::post({
+                let captured_body = captured_body.clone();
+                move |axum::Json(body): axum::Json<Value>| {
+                    let captured_body = captured_body.clone();
+                    async move {
+                        *captured_body.lock().unwrap() = Some(body);
+                        axum::Json(json!({
+                            "id": "resp_mock",
+                            "object": "response",
+                            "status": "completed",
+                            "output": []
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = AppStore::load(temp.path().to_path_buf()).unwrap();
+        let state = ServerState {
+            store,
+            client: Client::new(),
+        };
+        let provider = Provider {
+            id: "mock-openai-responses".into(),
+            name: "Mock OpenAI Responses".into(),
+            kind: ProviderKind::Custom,
+            protocol: ProviderProtocol::OpenAiResponses,
+            base_url,
+            key_ref: None,
+            http_proxy: Default::default(),
+        };
+        let mut model = default_config().models[0].clone();
+        model.id = "gpt-5.5".into();
+        model.provider_id = provider.id.clone();
+        model.upstream_model = None;
+        let matched = RouteMatch {
+            model,
+            provider,
+            upstream_model: "gpt-5.5".into(),
+            timeout_ms: 0,
+            retry_count: 0,
+            requested_model: "gpt-5.5".into(),
+            route_reason: "configured".into(),
+            locked_from_model: None,
+        };
+        let deepseek_response = chat_completion_response_json(
+            "abc",
+            "deepseek-v4-pro",
+            &json!({
+                "choices": [{
+                    "message": {
+                        "content": "OK",
+                        "reasoning_content": "private thinking"
+                    }
+                }]
+            }),
+            None,
+        );
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": deepseek_response["output"].clone(),
+            "stream": false
+        });
+        let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
+
+        let response = forward_responses_proxy(
+            &state,
+            &HeaderMap::new(),
+            &matched,
+            body,
+            raw,
+            "gpt-5.5",
+            ResponsesAuthMode::ProviderKey,
+            "req_mock".into(),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = captured_body.lock().unwrap().clone().unwrap();
+        assert!(!captured.to_string().contains("neko-route-chat-reasoning"));
+        assert_eq!(captured["input"].as_array().unwrap().len(), 1);
+        assert_eq!(captured["input"][0]["type"], "message");
+        server.abort();
     }
 
     #[test]
