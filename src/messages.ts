@@ -37,8 +37,6 @@ const en = {
   // app / topbar
   "app.tagline": "Local AI Router",
   "topbar.endpoint": "Local endpoint",
-  "topbar.serverOnline": "Server online",
-  "topbar.serverIssue": "Server issue",
   "codexRestart.button": "Restart Codex",
   "codexRestart.confirmTitle": "Restart Codex?",
   "codexRestart.confirmBody": "Restarting will close Codex if it is running, then open it again. Confirm before continuing.",
@@ -424,8 +422,6 @@ const zhCN: Catalog = {
 
   "app.tagline": "本地 AI 路由",
   "topbar.endpoint": "本地端点",
-  "topbar.serverOnline": "服务在线",
-  "topbar.serverIssue": "服务异常",
   "codexRestart.button": "重启 Codex",
   "codexRestart.confirmTitle": "重新启动 Codex？",
   "codexRestart.confirmBody": "重启会在 Codex 运行时先关闭它，再重新打开。继续前需要确认。",
@@ -795,8 +791,6 @@ const ja: Catalog = {
 
   "app.tagline": "ローカル AI ルーター",
   "topbar.endpoint": "ローカルエンドポイント",
-  "topbar.serverOnline": "サーバー稼働中",
-  "topbar.serverIssue": "サーバー異常",
   "codexRestart.button": "Codex を再起動",
   "codexRestart.confirmTitle": "Codex を再起動しますか？",
   "codexRestart.confirmBody": "再起動すると、実行中の Codex を閉じてから再度開きます。続行する前に確認してください。",
@@ -1166,8 +1160,6 @@ const zhTW: Catalog = {
 
   "app.tagline": "本地 AI 路由",
   "topbar.endpoint": "本地端點",
-  "topbar.serverOnline": "服務在線",
-  "topbar.serverIssue": "服務異常",
   "codexRestart.button": "重啟 Codex",
   "codexRestart.confirmTitle": "重新啟動 Codex？",
   "codexRestart.confirmBody": "重啟會在 Codex 執行時先關閉它，再重新開啟。繼續前需要確認。",

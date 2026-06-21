@@ -28,7 +28,7 @@ import type { MsgKey } from "./messages";
 import { I18nProvider, useI18n } from "./i18n";
 import { ThemeProvider } from "./theme";
 import { Petals } from "./Petals";
-import { ConfirmDialog, IconButton, LangSwitch, ThemeSwitch, Pill } from "./ui";
+import { ConfirmDialog, IconButton, LangSwitch, ThemeSwitch } from "./ui";
 import { Button } from "./ui";
 import {
   CodexWizard,
@@ -519,7 +519,6 @@ function App() {
               </div>
             </div>
             <div className="top-actions">
-              <Pill tone={snapshot.server.running ? "ok" : "bad"} label={snapshot.server.running ? t("topbar.serverOnline") : t("topbar.serverIssue")} />
               <IconButton icon={<Settings2 size={18} />} title={t("dash.editSettings")} onClick={() => setSettingsOpen(true)} />
               <IconButton icon={<RotateCcw size={18} />} title={t("codexRestart.button")} onClick={triggerCodexRestart} disabled={codexRestarting} />
               <ThemeSwitch />

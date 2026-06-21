@@ -108,12 +108,18 @@ fn token_record_value(token: &TokenRecord) -> Value {
 }
 
 pub fn desktop_status() -> (bool, bool, Option<String>) {
-    match token_from_desktop_config(false) {
+    desktop_status_from_lookup(token_from_desktop_config(false))
+}
+
+fn desktop_status_from_lookup(
+    lookup: Result<DesktopTokenLookup, String>,
+) -> (bool, bool, Option<String>) {
+    match lookup {
         Ok(DesktopTokenLookup::Usable(token)) => {
             (true, true, Some(format!("Using {}", token.source)))
         }
         Ok(DesktopTokenLookup::Encrypted) => {
-            (false, true, Some("key.claudeDesktopKeychainOnUse".into()))
+            (true, true, Some("key.claudeDesktopKeychainOnUse".into()))
         }
         Ok(DesktopTokenLookup::Missing) => (
             false,
@@ -449,7 +455,7 @@ fn read_json(path: &PathBuf) -> Result<Option<Value>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        find_access_token, looks_like_chromium_encrypted_value,
+        desktop_status_from_lookup, find_access_token, looks_like_chromium_encrypted_value,
         token_from_desktop_cache_with_decrypter, token_record_from_secret, token_record_value,
         DesktopTokenLookup,
     };
@@ -520,6 +526,16 @@ mod tests {
 
         assert!(matches!(lookup, DesktopTokenLookup::Encrypted));
         assert_eq!(decrypt_calls, 0);
+    }
+
+    #[test]
+    fn encrypted_desktop_cache_counts_as_present_status() {
+        let (present, available, message) =
+            desktop_status_from_lookup(Ok(DesktopTokenLookup::Encrypted));
+
+        assert!(present);
+        assert!(available);
+        assert_eq!(message.as_deref(), Some("key.claudeDesktopKeychainOnUse"));
     }
 
     #[test]
