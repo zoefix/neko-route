@@ -12,7 +12,7 @@ export type ProviderProtocol =
   | "anthropic_messages";
 
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max";
-export type CodexInjectionMode = "official_account" | "third_party_api";
+export type CodexInjectionMode = "official_account" | "third_party_api" | "lan_share";
 export type StreamState =
   | "pending"
   | "completed"
@@ -51,6 +51,10 @@ export type SettingsState = {
   bind_host: string;
   port: number;
   allow_lan: boolean;
+  lan_api_key: string;
+  lan_remote_host: string;
+  lan_remote_port: number;
+  lan_remote_api_key: string;
   request_log_limit: number;
   fallback_model: string | null;
   auto_inject: boolean;
@@ -81,6 +85,44 @@ export type TokenUsage = {
   total_tokens: number;
 };
 
+export type ContextBridgeDiagnostics = {
+  strategy: string;
+  original_body_bytes: number;
+  final_body_bytes: number;
+  original_tool_result_bytes: number;
+  tool_result_count: number;
+  kept_tool_results: number;
+  archived_tool_results: number;
+  archived_bytes: number;
+  recalled_artifacts: number;
+  recalled_bytes: number;
+  count_tokens_input_tokens: number | null;
+  count_tokens_error: string | null;
+  context_management: boolean;
+  raw_precheck_input_tokens: number | null;
+  final_input_tokens: number | null;
+  estimated_input_tokens: number | null;
+  estimate_source: string | null;
+  estimate_confidence: string | null;
+  protection_triggered: boolean;
+  target_input_tokens: number | null;
+  previous_success_input_tokens: number | null;
+  previous_success_body_bytes: number | null;
+  compression_stage: string | null;
+  protection_failure_reason: string | null;
+  compression_reason: string | null;
+  last_message_role: string | null;
+  last_message_content_type: string | null;
+  last_message_text_length: number;
+  last_message_preview_head: string | null;
+  last_message_preview_tail: string | null;
+  last_message_from_function_call_output: boolean;
+  single_dot_user_message: boolean;
+  latest_tool_result_count: number;
+  latest_tool_result_text_length: number;
+  latest_tool_result_single_dot: boolean;
+};
+
 export type RequestRecord = {
   id: string;
   started_at: string;
@@ -99,6 +141,7 @@ export type RequestRecord = {
   stream_error: string | null;
   last_event: string | null;
   stream_bytes: number;
+  context_bridge: ContextBridgeDiagnostics | null;
   usage: TokenUsage;
 };
 
@@ -168,6 +211,34 @@ export type TestModelResult = {
   provider_name: string;
 };
 
+export type ModelTestMode = "connectivity" | "context_400k" | "context_1m";
+
+export type StartModelTestResult = {
+  test_id: string;
+};
+
+export type ModelTestStatus = {
+  test_id: string;
+  mode: ModelTestMode;
+  state: "running" | "completed" | "failed" | "cancelled";
+  model: string;
+  provider_name: string;
+  stage: "queued" | "connectivity" | "probe" | "done" | "cancelled" | string;
+  target_tokens: number;
+  pass_threshold_tokens: number;
+  current_tokens: number;
+  current_estimated: boolean;
+  confirmed_tokens: number;
+  confirmed_estimated: boolean;
+  last_status: number;
+  latency_ms: number;
+  last_error: string | null;
+  summary: string | null;
+  supported: boolean | null;
+  inconclusive: boolean;
+  result: TestModelResult | null;
+};
+
 export type ProviderCredential = {
   value: string;
   source: string;
@@ -199,6 +270,17 @@ export type UpstreamModel = {
 export type UpstreamModelList = {
   models: UpstreamModel[];
   error: string | null;
+};
+
+export type LanModelInfo = {
+  id: string;
+  display_name: string;
+  description: string;
+  context_window: number;
+};
+
+export type LanModelList = {
+  models: LanModelInfo[];
 };
 
 export type OfficialQuotaWindow = {

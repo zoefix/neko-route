@@ -1,6 +1,7 @@
 use crate::{
     catalog,
-    types::{AppConfig, CodexInjectionMode},
+    catalog::CatalogModel,
+    types::{AppConfig, CodexInjectionMode, ProviderProtocol},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -74,6 +75,98 @@ pub fn inject_with_model_filter(
         default_model,
         allowed_model_ids,
     )
+}
+
+pub fn inject_lan_share_config(
+    default_model: Option<&str>,
+    models: &[CatalogModel],
+) -> Result<InjectionResult, String> {
+    inject_lan_share_config_into(&resolve_codex_home(), default_model, models)
+}
+
+pub fn inject_lan_share_config_into(
+    codex_home: &Path,
+    default_model: Option<&str>,
+    models: &[CatalogModel],
+) -> Result<InjectionResult, String> {
+    if models.is_empty() {
+        return Err("No LAN shared models are available for Codex injection".into());
+    }
+    fs::create_dir_all(codex_home).map_err(|error| error.to_string())?;
+    let config_path = codex_home.join("config.toml");
+    let backup_dir = codex_home.join("config-backups");
+    fs::create_dir_all(&backup_dir).map_err(|error| error.to_string())?;
+
+    let config_existed = config_path.exists();
+    let original = if config_existed {
+        fs::read_to_string(&config_path).map_err(|error| error.to_string())?
+    } else {
+        String::new()
+    };
+
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let backup_path = backup_dir.join(format!("neko-route-{timestamp}.toml"));
+    fs::write(&backup_path, &original).map_err(|error| error.to_string())?;
+
+    let mut document = original
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("Failed to parse Codex config TOML: {error}"))?;
+    let requested_default = default_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let selected = match requested_default {
+        Some(model) => models
+            .iter()
+            .find(|entry| entry.slug == model)
+            .ok_or_else(|| format!("LAN shared default model '{model}' is not available"))?,
+        None => models
+            .first()
+            .ok_or_else(|| "No LAN shared models are available for Codex injection".to_string())?,
+    };
+    let catalog_path = catalog::write_catalog_models(codex_home, models)?;
+
+    document["model_provider"] = value("neko-route");
+    document["model_catalog_json"] = value(catalog_path.display().to_string());
+    document["model"] = value(selected.slug.clone());
+    document["model_reasoning_summary"] = value("none");
+    if selected.reasoning_enabled {
+        document["model_reasoning_effort"] = value(selected.default_reasoning_level.clone());
+    } else {
+        document.as_table_mut().remove("model_reasoning_effort");
+    }
+    let context_window_value = i64::try_from(selected.context_window)
+        .map_err(|_| "Codex model context window is too large".to_string())?;
+    let auto_compact_value = i64::try_from(catalog::auto_compact_token_limit_for_protocol(
+        selected.context_window,
+        selected.provider_protocol.as_ref(),
+    ))
+    .map_err(|_| "Codex auto compact token limit is too large".to_string())?;
+    document["model_context_window"] = value(context_window_value);
+    document["model_auto_compact_token_limit"] = value(auto_compact_value);
+
+    ensure_neko_route_provider(&mut document, false)?;
+
+    fs::write(&config_path, document.to_string()).map_err(|error| error.to_string())?;
+
+    let manifest = RestoreManifest {
+        config_path: config_path.clone(),
+        backup_path: backup_path.clone(),
+        catalog_path: catalog_path.clone(),
+        config_existed,
+        created_at: Utc::now().to_rfc3339(),
+    };
+    fs::write(
+        restore_manifest_path(codex_home),
+        serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+
+    Ok(InjectionResult {
+        codex_home: codex_home.display().to_string(),
+        config_path: config_path.display().to_string(),
+        catalog_path: catalog_path.display().to_string(),
+        backup_path: backup_path.display().to_string(),
+    })
 }
 
 pub fn restore(delete_catalog: bool) -> Result<RestoreResult, String> {
@@ -223,26 +316,24 @@ pub fn inject_into_with_model_filter(
     } else {
         document.as_table_mut().remove("model_reasoning_effort");
     }
-
-    ensure_table(&mut document, "model_providers");
-    let providers = document["model_providers"]
-        .as_table_mut()
-        .ok_or_else(|| "Failed to create model_providers table".to_string())?;
-    let provider_is_table = providers
-        .get("neko-route")
-        .map(Item::is_table)
-        .unwrap_or(false);
-    if !provider_is_table {
-        providers.insert("neko-route", Item::Table(Table::new()));
+    if let Some((context_window, protocol)) = selected_model_context(config, selected_model) {
+        let context_window_value = i64::try_from(context_window)
+            .map_err(|_| "Codex model context window is too large".to_string())?;
+        let auto_compact_value = i64::try_from(catalog::auto_compact_token_limit_for_protocol(
+            context_window,
+            protocol.as_ref(),
+        ))
+        .map_err(|_| "Codex auto compact token limit is too large".to_string())?;
+        document["model_context_window"] = value(context_window_value);
+        document["model_auto_compact_token_limit"] = value(auto_compact_value);
+    } else {
+        document.as_table_mut().remove("model_context_window");
+        document
+            .as_table_mut()
+            .remove("model_auto_compact_token_limit");
     }
-    let provider = providers
-        .get_mut("neko-route")
-        .and_then(Item::as_table_mut)
-        .ok_or_else(|| "Failed to create neko-route provider table".to_string())?;
-    provider["name"] = value("neko-route");
-    provider["base_url"] = value("http://127.0.0.1:8787/v1");
-    provider["wire_api"] = value("responses");
-    provider["requires_openai_auth"] = value(!third_party);
+
+    ensure_neko_route_provider(&mut document, !third_party)?;
 
     fs::write(&config_path, document.to_string()).map_err(|error| error.to_string())?;
 
@@ -265,6 +356,32 @@ pub fn inject_into_with_model_filter(
         catalog_path: catalog_path.display().to_string(),
         backup_path: backup_path.display().to_string(),
     })
+}
+
+fn ensure_neko_route_provider(
+    document: &mut DocumentMut,
+    requires_openai_auth: bool,
+) -> Result<(), String> {
+    ensure_table(document, "model_providers");
+    let providers = document["model_providers"]
+        .as_table_mut()
+        .ok_or_else(|| "Failed to create model_providers table".to_string())?;
+    let provider_is_table = providers
+        .get("neko-route")
+        .map(Item::is_table)
+        .unwrap_or(false);
+    if !provider_is_table {
+        providers.insert("neko-route", Item::Table(Table::new()));
+    }
+    let provider = providers
+        .get_mut("neko-route")
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| "Failed to create neko-route provider table".to_string())?;
+    provider["name"] = value("neko-route");
+    provider["base_url"] = value("http://127.0.0.1:8787/v1");
+    provider["wire_api"] = value("responses");
+    provider["requires_openai_auth"] = value(requires_openai_auth);
+    Ok(())
 }
 
 fn validate_model_injectable(
@@ -375,13 +492,31 @@ fn default_reasoning_effort(config: &AppConfig, default_model: Option<&str>) -> 
     }
 }
 
+fn selected_model_context(
+    config: &AppConfig,
+    selected_model: Option<&str>,
+) -> Option<(u64, Option<ProviderProtocol>)> {
+    let selected_model = selected_model?;
+    let model = config
+        .models
+        .iter()
+        .find(|entry| entry.enabled && entry.id == selected_model)?;
+    let protocol = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == model.provider_id)
+        .map(|provider| provider.protocol.clone());
+    Some((model.context_window, protocol))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        inject_into, inject_into_with_model_filter, read_codex_config_file_from, restore_from,
-        save_codex_config_file_to,
+        inject_into, inject_into_with_model_filter, inject_lan_share_config_into,
+        read_codex_config_file_from, restore_from, save_codex_config_file_to,
     };
     use crate::{
+        catalog::CatalogModel,
         store::normalize_config,
         types::{default_config, CodexInjectionMode, Provider, ProviderKind, ProviderProtocol},
     };
@@ -401,6 +536,8 @@ mod tests {
         assert!(config.contains("requires_openai_auth = true"));
         assert!(config.contains("model_reasoning_effort = \"xhigh\""));
         assert!(config.contains("model_reasoning_summary = \"none\""));
+        assert!(config.contains("model_context_window = 1000000"));
+        assert!(config.contains("model_auto_compact_token_limit = 900000"));
         assert_eq!(
             fs::read_to_string(codex_home.join("auth.json")).unwrap(),
             "{\"token\":\"keep\"}"
@@ -426,6 +563,50 @@ mod tests {
         assert!(config.contains("model = \"claude-opus-4-8\""));
         assert!(config.contains("model_reasoning_effort = \"max\""));
         assert!(config.contains("model_reasoning_summary = \"none\""));
+        assert!(config.contains("model_context_window = 200000"));
+        assert!(config.contains("model_auto_compact_token_limit = 180000"));
+    }
+
+    #[test]
+    fn inject_overwrites_context_and_auto_compact_for_new_default_model() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "model = \"gpt-5.5\"\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 900000\n",
+        )
+        .unwrap();
+        let mut config = default_config();
+        config
+            .models
+            .iter_mut()
+            .find(|model| model.id == "claude-opus-4-8")
+            .unwrap()
+            .context_window = 258_000;
+
+        let result = inject_into(&config, dir.path(), Some("claude-opus-4-8")).unwrap();
+        let config_toml = fs::read_to_string(&result.config_path).unwrap();
+
+        assert!(config_toml.contains("model = \"claude-opus-4-8\""));
+        assert!(config_toml.contains("model_context_window = 258000"));
+        assert!(config_toml.contains("model_auto_compact_token_limit = 232200"));
+        assert!(!config_toml.contains("model_context_window = 1000000"));
+        assert!(!config_toml.contains("model_auto_compact_token_limit = 900000"));
+    }
+
+    #[test]
+    fn inject_removes_stale_context_when_no_default_model_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "model_context_window = 1000000\nmodel_auto_compact_token_limit = 900000\n",
+        )
+        .unwrap();
+
+        let result = inject_into(&default_config(), dir.path(), None).unwrap();
+        let config_toml = fs::read_to_string(&result.config_path).unwrap();
+
+        assert!(!config_toml.contains("model_context_window"));
+        assert!(!config_toml.contains("model_auto_compact_token_limit"));
     }
 
     #[test]
@@ -491,8 +672,36 @@ mod tests {
 
         assert!(config_toml.contains("requires_openai_auth = false"));
         assert!(config_toml.contains("model = \"gpt-5.4-mini\""));
+        assert!(config_toml.contains("model_context_window = 200000"));
+        assert!(config_toml.contains("model_auto_compact_token_limit = 180000"));
         assert!(catalog.contains("\"slug\": \"gpt-5.4-mini\""));
         assert!(catalog.contains("\"display_name\": \"Claude Opus 4.8\""));
+        assert!(!catalog.contains("gpt-5.5"));
+    }
+
+    #[test]
+    fn lan_share_injection_writes_remote_models_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = vec![CatalogModel {
+            slug: "remote-gpt".into(),
+            display_name: "Remote GPT".into(),
+            description: "LAN model".into(),
+            context_window: 258_000,
+            reasoning_enabled: true,
+            default_reasoning_level: "high".into(),
+            supported_reasoning_levels: vec!["low".into(), "high".into()],
+            provider_protocol: None,
+        }];
+
+        let result = inject_lan_share_config_into(dir.path(), Some("remote-gpt"), &models).unwrap();
+        let config_toml = fs::read_to_string(&result.config_path).unwrap();
+        let catalog = fs::read_to_string(&result.catalog_path).unwrap();
+
+        assert!(config_toml.contains("requires_openai_auth = false"));
+        assert!(config_toml.contains("model = \"remote-gpt\""));
+        assert!(config_toml.contains("model_context_window = 258000"));
+        assert!(config_toml.contains("model_auto_compact_token_limit = 232200"));
+        assert!(catalog.contains("\"slug\": \"remote-gpt\""));
         assert!(!catalog.contains("gpt-5.5"));
     }
 
@@ -503,6 +712,12 @@ mod tests {
         let mut config = normalize_config(default_config());
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
         config.settings.fallback_model = Some("claude-opus-4-8".into());
+        config
+            .models
+            .iter_mut()
+            .find(|model| model.id == "claude-opus-4-8")
+            .unwrap()
+            .context_window = 258_000;
         let allowed = HashSet::from(["claude-opus-4-8".to_string()]);
 
         let result =
@@ -511,6 +726,8 @@ mod tests {
 
         assert!(config_toml.contains("model = \"gpt-5.4-mini\""));
         assert!(config_toml.contains("model_reasoning_effort = \"max\""));
+        assert!(config_toml.contains("model_context_window = 258000"));
+        assert!(config_toml.contains("model_auto_compact_token_limit = 232200"));
     }
 
     #[test]

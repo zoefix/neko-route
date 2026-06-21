@@ -1,4 +1,12 @@
-import type { AppSnapshot, TestModelResult, TokenStats, UpstreamModel } from "./types";
+import type {
+  AppSnapshot,
+  ModelTestMode,
+  ModelTestStatus,
+  StartModelTestResult,
+  TestModelResult,
+  TokenStats,
+  UpstreamModel,
+} from "./types";
 
 export function mockUpstreamModels(providerId: string): UpstreamModel[] {
   if (providerId.includes("anthropic") || providerId.includes("claude")) {
@@ -70,10 +78,81 @@ export function mockTestModel(model: string): TestModelResult {
   };
 }
 
+const mockModelTests = new Map<string, ModelTestStatus>();
+
+export function mockStartModelTest(model: string, mode: ModelTestMode): StartModelTestResult {
+  const testId = `mock-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const target = mode === "context_1m" ? 1_000_000 : mode === "context_400k" ? 400_000 : 0;
+  mockModelTests.set(testId, {
+    test_id: testId,
+    mode,
+    state: "running",
+    model,
+    provider_name: model.startsWith("claude") ? "Claude Code CLI Official" : "OpenAI Official Account",
+    stage: mode === "connectivity" ? "connectivity" : "probe",
+    target_tokens: target,
+    pass_threshold_tokens: Math.floor(target * 0.95),
+    current_tokens: mode === "context_1m" ? 400_000 : mode === "context_400k" ? 128_000 : 0,
+    current_estimated: mode !== "connectivity",
+    confirmed_tokens: 0,
+    confirmed_estimated: true,
+    last_status: 0,
+    latency_ms: 0,
+    last_error: null,
+    summary: null,
+    supported: null,
+    inconclusive: false,
+    result: null,
+  });
+  return { test_id: testId };
+}
+
+export function mockGetModelTestStatus(testId: string): ModelTestStatus {
+  const current = mockModelTests.get(testId);
+  if (!current) throw new Error("Model test not found");
+  if (current.state !== "running") return current;
+  const nextCurrent =
+    current.mode === "context_1m"
+      ? Math.min(950_000, current.current_tokens + 275_000)
+      : current.mode === "context_400k"
+        ? Math.min(380_000, current.current_tokens + 126_000)
+        : 0;
+  const done = current.mode === "connectivity" || nextCurrent >= current.pass_threshold_tokens;
+  const next: ModelTestStatus = {
+    ...current,
+    state: done ? "completed" : "running",
+    stage: done ? "done" : "probe",
+    current_tokens: nextCurrent,
+    current_estimated: false,
+    confirmed_tokens: nextCurrent,
+    confirmed_estimated: false,
+    last_status: 200,
+    latency_ms: 900,
+    supported: done ? true : null,
+    summary: done ? "Model supports target context" : null,
+    result: done ? mockTestModel(current.model) : null,
+  };
+  mockModelTests.set(testId, next);
+  return next;
+}
+
+export function mockCancelModelTest(testId: string): ModelTestStatus {
+  const current = mockModelTests.get(testId);
+  if (!current) throw new Error("Model test not found");
+  const next: ModelTestStatus = {
+    ...current,
+    state: "cancelled",
+    stage: "cancelled",
+    summary: "Test cancelled",
+  };
+  mockModelTests.set(testId, next);
+  return next;
+}
+
 export function mockSnapshot(): AppSnapshot {
   return {
     config: {
-      version: 10,
+      version: 11,
       providers: [
         {
           id: "openai-official",
@@ -104,7 +183,7 @@ export function mockSnapshot(): AppSnapshot {
           name: "My Proxy",
           kind: "custom",
           protocol: "open_ai_chat_completions",
-          base_url: "https://api.example.com/v1",
+          base_url: "",
           key_ref: "provider:custom-demo1234",
         },
         {
@@ -175,6 +254,10 @@ export function mockSnapshot(): AppSnapshot {
         bind_host: "127.0.0.1",
         port: 8787,
         allow_lan: false,
+        lan_api_key: "nr_demo_lan_key",
+        lan_remote_host: "",
+        lan_remote_port: 8787,
+        lan_remote_api_key: "",
         request_log_limit: 300,
         fallback_model: "gpt-5.5",
         auto_inject: false,
@@ -216,6 +299,7 @@ export function mockSnapshot(): AppSnapshot {
         stream_error: null,
         last_event: "response.completed",
         stream_bytes: 0,
+        context_bridge: null,
         usage: { input_tokens: 1240, output_tokens: 380, cache_read_tokens: 512, cache_write_tokens: 0, total_tokens: 1620 },
       },
       {
@@ -236,6 +320,43 @@ export function mockSnapshot(): AppSnapshot {
         stream_error: "network error: error decoding response body",
         last_event: "response.output_text.delta",
         stream_bytes: 42840,
+        context_bridge: {
+          strategy: "artifact_bridge_keep8",
+          original_body_bytes: 1267480,
+          final_body_bytes: 410320,
+          original_tool_result_bytes: 1178417,
+          tool_result_count: 42,
+          kept_tool_results: 8,
+          archived_tool_results: 34,
+          archived_bytes: 820000,
+          recalled_artifacts: 1,
+          recalled_bytes: 1800,
+          count_tokens_input_tokens: null,
+          count_tokens_error: "count_tokens 404",
+          context_management: true,
+          raw_precheck_input_tokens: null,
+          final_input_tokens: null,
+          estimated_input_tokens: 969000,
+          estimate_source: "previous_success_ratio",
+          estimate_confidence: "medium",
+          protection_triggered: true,
+          target_input_tokens: 880000,
+          previous_success_input_tokens: 969000,
+          previous_success_body_bytes: 1267480,
+          compression_stage: "preserve_12",
+          protection_failure_reason: null,
+          compression_reason: "body_size_fallback:1267480>704000",
+          last_message_role: "user",
+          last_message_content_type: "tool_result",
+          last_message_text_length: 1,
+          last_message_preview_head: ".",
+          last_message_preview_tail: ".",
+          last_message_from_function_call_output: true,
+          single_dot_user_message: false,
+          latest_tool_result_count: 1,
+          latest_tool_result_text_length: 1,
+          latest_tool_result_single_dot: true,
+        },
         usage: { input_tokens: 860, output_tokens: 540, cache_read_tokens: 3200, cache_write_tokens: 1100, total_tokens: 5700 },
       },
       {
@@ -256,6 +377,7 @@ export function mockSnapshot(): AppSnapshot {
         stream_error: null,
         last_event: null,
         stream_bytes: 0,
+        context_bridge: null,
         usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 0 },
       },
     ],

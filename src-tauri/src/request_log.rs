@@ -1,6 +1,7 @@
 use crate::types::{
-    DayTokens, ModelTokens, OfficialAccountQuota, ProviderLocalUsage, ProviderProtocol,
-    ProviderUsageStatus, RequestLogPage, RequestRecord, TokenStats, TokenTotals, TokenUsage,
+    ClaudeContextPressureSample, ContextArtifact, ContextBridgeDiagnostics, DayTokens, ModelTokens,
+    OfficialAccountQuota, ProviderLocalUsage, ProviderProtocol, ProviderUsageStatus,
+    RequestLogPage, RequestRecord, TokenStats, TokenTotals, TokenUsage,
 };
 use chrono::{DateTime, Local, Utc};
 use rusqlite::{params, Connection};
@@ -41,6 +42,7 @@ impl RequestLog {
                 stream_error TEXT,
                 last_event TEXT,
                 stream_bytes INTEGER NOT NULL DEFAULT 0,
+                context_bridge_json TEXT,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -56,6 +58,29 @@ impl RequestLog {
                 source TEXT NOT NULL,
                 error TEXT,
                 quota_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS context_artifacts (
+                hash TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                tool_name TEXT,
+                tool_args TEXT,
+                content_bytes INTEGER NOT NULL DEFAULT 0,
+                content_text TEXT NOT NULL,
+                summary TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS claude_context_pressure (
+                provider_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                context_key TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                body_bytes INTEGER NOT NULL DEFAULT 0,
+                requires_precompression INTEGER NOT NULL DEFAULT 0,
+                context_full_body_bytes INTEGER NOT NULL DEFAULT 0,
+                compression_stage TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(provider_id, model, context_key)
             );",
         )
         .map_err(|e| e.to_string())?;
@@ -67,6 +92,30 @@ impl RequestLog {
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN last_event TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE requests ADD COLUMN stream_bytes INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE requests ADD COLUMN context_bridge_json TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE claude_context_pressure ADD COLUMN requires_precompression INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE claude_context_pressure ADD COLUMN context_full_body_bytes INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE claude_context_pressure ADD COLUMN compression_stage TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_context_artifacts_created_at ON context_artifacts(created_at DESC)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claude_context_pressure_updated_at ON claude_context_pressure(updated_at DESC)",
             [],
         );
         Ok(Self {
@@ -81,13 +130,17 @@ impl RequestLog {
             .as_ref()
             .map(protocol_to_str)
             .map(|s| s.to_string());
+        let context_bridge_json = record
+            .context_bridge
+            .as_ref()
+            .and_then(|diagnostics| serde_json::to_string(diagnostics).ok());
         let _ = conn.execute(
             "INSERT OR REPLACE INTO requests
               (id, started_at, model, requested_model, route_reason, provider_id, provider_name, provider_protocol,
                status, latency_ms, streaming, error, reasoning_effort,
                stream_state, stream_error, last_event,
-               stream_bytes, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+               stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
             params![
                 record.id,
                 record.started_at.to_rfc3339(),
@@ -106,6 +159,7 @@ impl RequestLog {
                 record.stream_error,
                 record.last_event,
                 record.stream_bytes as i64,
+                context_bridge_json,
                 record.usage.input_tokens as i64,
                 record.usage.output_tokens as i64,
                 record.usage.cache_read_tokens as i64,
@@ -163,7 +217,7 @@ impl RequestLog {
             "SELECT id, started_at, model, provider_id, provider_name, provider_protocol,
                     requested_model, route_reason, status, latency_ms, streaming, error, reasoning_effort,
                     stream_state, stream_error, last_event,
-                    stream_bytes, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens
+                    stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens
              FROM requests ORDER BY started_at DESC LIMIT ?1",
         ) {
             Ok(stmt) => stmt,
@@ -204,7 +258,7 @@ impl RequestLog {
             "SELECT id, started_at, model, provider_id, provider_name, provider_protocol,
                     requested_model, route_reason, status, latency_ms, streaming, error, reasoning_effort,
                     stream_state, stream_error, last_event,
-                    stream_bytes, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens
+                    stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens
              FROM requests ORDER BY started_at DESC LIMIT ?1 OFFSET ?2",
         ) {
             Ok(stmt) => stmt,
@@ -233,6 +287,163 @@ impl RequestLog {
     pub fn clear(&self) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute("DELETE FROM requests", []);
+    }
+
+    pub fn upsert_context_artifacts(&self, artifacts: &[ContextArtifact]) {
+        if artifacts.is_empty() {
+            return;
+        }
+        let conn = self.conn.lock().unwrap();
+        for artifact in artifacts {
+            let _ = conn.execute(
+                "INSERT INTO context_artifacts
+                 (hash, created_at, request_id, model, tool_name, tool_args, content_bytes, content_text, summary)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                 ON CONFLICT(hash) DO UPDATE SET
+                    request_id=excluded.request_id,
+                    model=excluded.model,
+                    tool_name=COALESCE(excluded.tool_name, context_artifacts.tool_name),
+                    tool_args=COALESCE(excluded.tool_args, context_artifacts.tool_args),
+                    summary=excluded.summary",
+                params![
+                    artifact.hash,
+                    artifact.created_at.to_rfc3339(),
+                    artifact.request_id,
+                    artifact.model,
+                    artifact.tool_name,
+                    artifact.tool_args,
+                    artifact.content_bytes as i64,
+                    artifact.content_text,
+                    artifact.summary,
+                ],
+            );
+        }
+    }
+
+    pub fn search_context_artifacts(&self, query: &str, limit: usize) -> Vec<ContextArtifact> {
+        let tokens = search_tokens(query);
+        if tokens.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT hash, created_at, request_id, model, tool_name, tool_args, content_bytes, content_text, summary
+             FROM context_artifacts ORDER BY created_at DESC LIMIT 200",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let mut artifacts = stmt
+            .query_map([], row_to_context_artifact)
+            .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
+            .unwrap_or_default();
+        artifacts.sort_by_key(|artifact| {
+            let haystack = format!("{} {}", artifact.summary, artifact.content_text).to_lowercase();
+            std::cmp::Reverse(
+                tokens
+                    .iter()
+                    .filter(|token| haystack.contains(token.as_str()))
+                    .count(),
+            )
+        });
+        artifacts
+            .into_iter()
+            .filter(|artifact| {
+                let haystack =
+                    format!("{} {}", artifact.summary, artifact.content_text).to_lowercase();
+                tokens.iter().any(|token| haystack.contains(token.as_str()))
+            })
+            .take(limit)
+            .collect()
+    }
+
+    pub fn upsert_claude_context_pressure(
+        &self,
+        provider_id: &str,
+        model: &str,
+        context_key: &str,
+        input_tokens: u64,
+        body_bytes: u64,
+    ) {
+        if provider_id.trim().is_empty()
+            || model.trim().is_empty()
+            || context_key.trim().is_empty()
+            || input_tokens == 0
+            || body_bytes == 0
+        {
+            return;
+        }
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO claude_context_pressure
+                (provider_id, model, context_key, input_tokens, body_bytes, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(provider_id, model, context_key) DO UPDATE SET
+                input_tokens=excluded.input_tokens,
+                body_bytes=excluded.body_bytes,
+                updated_at=excluded.updated_at",
+            params![
+                provider_id,
+                model,
+                context_key,
+                input_tokens as i64,
+                body_bytes as i64,
+                Utc::now().to_rfc3339(),
+            ],
+        );
+    }
+
+    pub fn mark_claude_context_precompression(
+        &self,
+        provider_id: &str,
+        model: &str,
+        context_key: &str,
+        context_full_body_bytes: u64,
+        compression_stage: Option<&str>,
+    ) {
+        if provider_id.trim().is_empty()
+            || model.trim().is_empty()
+            || context_key.trim().is_empty()
+            || context_full_body_bytes == 0
+        {
+            return;
+        }
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO claude_context_pressure
+                (provider_id, model, context_key, input_tokens, body_bytes, requires_precompression, context_full_body_bytes, compression_stage, updated_at)
+             VALUES (?1, ?2, ?3, 0, 0, 1, ?4, ?5, ?6)
+             ON CONFLICT(provider_id, model, context_key) DO UPDATE SET
+                requires_precompression=1,
+                context_full_body_bytes=excluded.context_full_body_bytes,
+                compression_stage=excluded.compression_stage,
+                updated_at=excluded.updated_at",
+            params![
+                provider_id,
+                model,
+                context_key,
+                context_full_body_bytes as i64,
+                compression_stage,
+                Utc::now().to_rfc3339(),
+            ],
+        );
+    }
+
+    pub fn claude_context_pressure(
+        &self,
+        provider_id: &str,
+        model: &str,
+        context_key: &str,
+    ) -> Option<ClaudeContextPressureSample> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT input_tokens, body_bytes, requires_precompression, context_full_body_bytes, compression_stage
+             FROM claude_context_pressure
+             WHERE provider_id=?1 AND model=?2 AND context_key=?3",
+            params![provider_id, model, context_key],
+            row_to_claude_context_pressure,
+        )
+        .ok()
     }
 
     pub fn stats(&self) -> TokenStats {
@@ -506,6 +717,7 @@ fn model_totals(conn: &Connection) -> Vec<ModelTokens> {
 fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
     let started: String = row.get(1)?;
     let protocol: Option<String> = row.get(5)?;
+    let context_bridge_json: Option<String> = row.get(17)?;
     Ok(RequestRecord {
         id: row.get(0)?,
         started_at: DateTime::parse_from_rfc3339(&started)
@@ -526,14 +738,57 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
         stream_error: row.get(14)?,
         last_event: row.get(15)?,
         stream_bytes: row.get::<_, i64>(16)? as u64,
+        context_bridge: context_bridge_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<ContextBridgeDiagnostics>(value).ok()),
         usage: TokenUsage {
-            input_tokens: row.get::<_, i64>(17)? as u64,
-            output_tokens: row.get::<_, i64>(18)? as u64,
-            cache_read_tokens: row.get::<_, i64>(19)? as u64,
-            cache_write_tokens: row.get::<_, i64>(20)? as u64,
-            total_tokens: row.get::<_, i64>(21)? as u64,
+            input_tokens: row.get::<_, i64>(18)? as u64,
+            output_tokens: row.get::<_, i64>(19)? as u64,
+            cache_read_tokens: row.get::<_, i64>(20)? as u64,
+            cache_write_tokens: row.get::<_, i64>(21)? as u64,
+            total_tokens: row.get::<_, i64>(22)? as u64,
         },
     })
+}
+
+fn row_to_claude_context_pressure(
+    row: &rusqlite::Row,
+) -> rusqlite::Result<ClaudeContextPressureSample> {
+    Ok(ClaudeContextPressureSample {
+        input_tokens: row.get::<_, i64>(0)?.max(0) as u64,
+        body_bytes: row.get::<_, i64>(1)?.max(0) as u64,
+        requires_precompression: row.get::<_, i64>(2).unwrap_or_default() != 0,
+        context_full_body_bytes: row.get::<_, i64>(3).unwrap_or_default().max(0) as u64,
+        compression_stage: row.get::<_, Option<String>>(4).unwrap_or_default(),
+    })
+}
+
+fn row_to_context_artifact(row: &rusqlite::Row) -> rusqlite::Result<ContextArtifact> {
+    let created_at: String = row.get(1)?;
+    Ok(ContextArtifact {
+        hash: row.get(0)?,
+        created_at: DateTime::parse_from_rfc3339(&created_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        request_id: row.get(2)?,
+        model: row.get(3)?,
+        tool_name: row.get(4)?,
+        tool_args: row.get(5)?,
+        content_bytes: row.get::<_, i64>(6)? as u64,
+        content_text: row.get(7)?,
+        summary: row.get(8)?,
+    })
+}
+
+fn search_tokens(query: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    query
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-' && ch != '.')
+        .map(|token| token.trim().to_lowercase())
+        .filter(|token| token.len() >= 4)
+        .filter(|token| seen.insert(token.clone()))
+        .take(24)
+        .collect()
 }
 
 fn day_start_rfc3339(date: chrono::NaiveDate) -> String {
@@ -584,6 +839,7 @@ mod tests {
             stream_error: None,
             last_event: None,
             stream_bytes: 0,
+            context_bridge: None,
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -839,5 +1095,125 @@ mod tests {
         assert_eq!(snapshot.source, "unavailable");
         assert_eq!(snapshot.error.as_deref(), Some("network error"));
         assert_eq!(snapshot.quota.unwrap().account_id.as_deref(), Some("acct"));
+    }
+
+    #[test]
+    fn context_artifacts_are_deduped_and_searchable() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = RequestLog::open(&temp.path().join("requests.db")).unwrap();
+        let artifact = ContextArtifact {
+            hash: "same-hash".into(),
+            created_at: Utc::now(),
+            request_id: "req-old".into(),
+            model: "gpt-5.4".into(),
+            tool_name: Some("exec_command".into()),
+            tool_args: Some("{\"cmd\":\"run pressure\"}".into()),
+            content_bytes: 64,
+            content_text: "unique-needle full original tool output".into(),
+            summary: "first unique-needle summary".into(),
+        };
+        let mut updated = artifact.clone();
+        updated.request_id = "req-new".into();
+        updated.summary = "updated unique-needle summary".into();
+
+        log.upsert_context_artifacts(&[artifact]);
+        log.upsert_context_artifacts(&[updated]);
+
+        let results = log.search_context_artifacts("where is unique-needle?", 5);
+        let count: i64 = log
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM context_artifacts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].hash, "same-hash");
+        assert_eq!(results[0].request_id, "req-new");
+        assert_eq!(
+            results[0].content_text,
+            "unique-needle full original tool output"
+        );
+        assert_eq!(results[0].summary, "updated unique-needle summary");
+    }
+
+    #[test]
+    fn claude_context_pressure_samples_are_upserted() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = RequestLog::open(&temp.path().join("requests.db")).unwrap();
+
+        log.upsert_claude_context_pressure("provider", "claude", "context", 969_000, 1_240_000);
+        log.upsert_claude_context_pressure("provider", "claude", "context", 970_000, 1_250_000);
+        log.mark_claude_context_precompression(
+            "provider",
+            "claude",
+            "context",
+            1_500_000,
+            Some("context_full_retry_preserve_6"),
+        );
+
+        let sample = log
+            .claude_context_pressure("provider", "claude", "context")
+            .unwrap();
+        assert_eq!(sample.input_tokens, 970_000);
+        assert_eq!(sample.body_bytes, 1_250_000);
+        assert!(sample.requires_precompression);
+        assert_eq!(sample.context_full_body_bytes, 1_500_000);
+        assert_eq!(
+            sample.compression_stage.as_deref(),
+            Some("context_full_retry_preserve_6")
+        );
+        assert!(log
+            .claude_context_pressure("provider", "claude", "missing")
+            .is_none());
+    }
+
+    #[test]
+    fn old_claude_context_pressure_table_migrates_with_precompression_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("requests.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE claude_context_pressure (
+                    provider_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    context_key TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    body_bytes INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(provider_id, model, context_key)
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO claude_context_pressure
+                    (provider_id, model, context_key, input_tokens, body_bytes, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "provider",
+                    "claude",
+                    "context",
+                    969_000_i64,
+                    1_240_000_i64,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+        }
+
+        let log = RequestLog::open(&db_path).unwrap();
+        let sample = log
+            .claude_context_pressure("provider", "claude", "context")
+            .unwrap();
+
+        assert_eq!(sample.input_tokens, 969_000);
+        assert_eq!(sample.body_bytes, 1_240_000);
+        assert!(!sample.requires_precompression);
+        assert_eq!(sample.context_full_body_bytes, 0);
+        assert!(sample.compression_stage.is_none());
     }
 }

@@ -3,6 +3,7 @@ mod claude_auth;
 mod codex_alias;
 mod codex_config;
 mod key_store;
+mod lan_share;
 mod official_auth;
 mod official_usage;
 mod pricing;
@@ -19,7 +20,7 @@ use crate::{
     router::{match_route, match_route_for_provider, RouteMatch},
     store::AppStore,
     types::{
-        AppConfig, AppSnapshot, Provider, ProviderKind, ProviderProtocol, RequestLogPage,
+        AppConfig, AppSnapshot, Provider, ProviderKind, ProviderProtocol, RequestLogPage, Settings,
         TokenUsage,
     },
     usage::parse_usage,
@@ -29,6 +30,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(any(test, target_os = "windows"))]
+use std::path::PathBuf;
 use std::{
     collections::HashMap,
     fs,
@@ -40,13 +43,103 @@ use std::{
     time::{Duration, Instant},
 };
 #[cfg(target_os = "windows")]
-use std::{env, ffi::OsStr, path::PathBuf};
+use std::{env, ffi::OsStr, path::Path};
 use tauri::{
     menu::MenuBuilder,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
+use uuid::Uuid;
+
+#[derive(Clone)]
+struct ServerRuntime {
+    inner: Arc<ServerRuntimeInner>,
+}
+
+struct ServerRuntimeInner {
+    store: AppStore,
+    task: Mutex<Option<ServerTask>>,
+}
+
+struct ServerTask {
+    shutdown: Option<oneshot::Sender<()>>,
+    handle: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl ServerRuntime {
+    fn new(store: AppStore) -> Self {
+        Self {
+            inner: Arc::new(ServerRuntimeInner {
+                store,
+                task: Mutex::new(None),
+            }),
+        }
+    }
+
+    async fn start(&self) {
+        let mut task = self.inner.task.lock().await;
+        if task.is_some() {
+            return;
+        }
+        *task = Some(spawn_managed_server(self.inner.store.clone()));
+    }
+
+    async fn restart(&self) {
+        self.stop().await;
+        self.start().await;
+    }
+
+    async fn stop(&self) {
+        let task = {
+            let mut guard = self.inner.task.lock().await;
+            guard.take()
+        };
+        let Some(mut task) = task else {
+            return;
+        };
+        if let Some(shutdown) = task.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if tokio::time::timeout(Duration::from_secs(2), &mut task.handle)
+            .await
+            .is_err()
+        {
+            task.handle.abort();
+            let _ = task.handle.await;
+        }
+    }
+}
+
+fn spawn_managed_server(store: AppStore) -> ServerTask {
+    let (shutdown, shutdown_rx) = oneshot::channel::<()>();
+    let store_for_task = store.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        if let Err(error) = server::run_with_shutdown(store_for_task.clone(), async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        {
+            let config = store_for_task.config().await;
+            store_for_task
+                .set_server_error(server_bind_url(&config.settings), error)
+                .await;
+        }
+    });
+
+    ServerTask {
+        shutdown: Some(shutdown),
+        handle,
+    }
+}
+
+fn server_bind_url(settings: &Settings) -> String {
+    format!("http://{}:{}/v1", settings.bind_host, settings.port)
+}
+
+fn server_bind_settings_changed(previous: &Settings, next: &Settings) -> bool {
+    previous.bind_host != next.bind_host || previous.port != next.port
+}
 
 #[tauri::command]
 async fn get_snapshot(store: tauri::State<'_, AppStore>) -> Result<AppSnapshot, String> {
@@ -56,10 +149,38 @@ async fn get_snapshot(store: tauri::State<'_, AppStore>) -> Result<AppSnapshot, 
 #[tauri::command]
 async fn save_config(
     store: tauri::State<'_, AppStore>,
+    server_runtime: tauri::State<'_, ServerRuntime>,
     config: AppConfig,
 ) -> Result<AppSnapshot, String> {
+    let previous = store.config().await;
     store.replace_config(config).await?;
+    let next = store.config().await;
+    if server_bind_settings_changed(&previous.settings, &next.settings) {
+        server_runtime.restart().await;
+    }
     Ok(store.snapshot().await)
+}
+
+#[tauri::command]
+async fn regenerate_lan_api_key(store: tauri::State<'_, AppStore>) -> Result<AppSnapshot, String> {
+    store.regenerate_lan_api_key().await?;
+    Ok(store.snapshot().await)
+}
+
+#[tauri::command]
+async fn list_lan_models(store: tauri::State<'_, AppStore>) -> Result<LanModelList, String> {
+    let models = store
+        .lan_catalog_models()
+        .await?
+        .into_iter()
+        .map(|model| LanModelInfo {
+            id: model.slug,
+            display_name: model.display_name,
+            description: model.description,
+            context_window: model.context_window,
+        })
+        .collect();
+    Ok(LanModelList { models })
 }
 
 #[tauri::command]
@@ -151,6 +272,19 @@ struct CodexAppStatus {
 #[derive(Serialize)]
 struct CodexAppRestartResult {
     action: &'static str,
+}
+
+#[derive(Serialize)]
+struct LanModelInfo {
+    id: String,
+    display_name: String,
+    description: String,
+    context_window: u64,
+}
+
+#[derive(Serialize)]
+struct LanModelList {
+    models: Vec<LanModelInfo>,
 }
 
 #[tauri::command]
@@ -333,14 +467,21 @@ async fn codex_app_status() -> Result<CodexAppStatus, String> {
 #[tauri::command]
 async fn restart_codex_app() -> Result<CodexAppRestartResult, String> {
     tokio::task::spawn_blocking(|| {
-        let running = codex_desktop_running();
-        if running {
-            stop_codex_desktop()?;
+        #[cfg(target_os = "windows")]
+        {
+            return restart_or_start_codex_desktop();
         }
-        start_codex_desktop()?;
-        Ok(CodexAppRestartResult {
-            action: codex_restart_action(running),
-        })
+        #[cfg(not(target_os = "windows"))]
+        {
+            let running = codex_desktop_running();
+            if running {
+                stop_codex_desktop()?;
+            }
+            start_codex_desktop()?;
+            Ok(CodexAppRestartResult {
+                action: codex_restart_action(running),
+            })
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -361,7 +502,7 @@ async fn test_route(store: tauri::State<'_, AppStore>, model: String) -> Result<
     }))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct TestModelResult {
     ok: bool,
     status: u16,
@@ -370,6 +511,99 @@ struct TestModelResult {
     error: Option<String>,
     usage: TokenUsage,
     provider_name: String,
+}
+
+#[derive(Default, Clone)]
+struct ModelTestSessions {
+    sessions: Arc<Mutex<HashMap<String, ModelTestSession>>>,
+}
+
+struct ModelTestSession {
+    status: Arc<Mutex<ModelTestStatus>>,
+    cancelled: Arc<AtomicBool>,
+    handle: tauri::async_runtime::JoinHandle<()>,
+}
+
+#[derive(Serialize)]
+struct StartModelTestResult {
+    test_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelTestMode {
+    Connectivity,
+    Context400K,
+    Context1M,
+}
+
+impl ModelTestMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "connectivity" => Ok(Self::Connectivity),
+            "context_400k" => Ok(Self::Context400K),
+            "context_1m" => Ok(Self::Context1M),
+            _ => Err("Unknown model test mode".into()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connectivity => "connectivity",
+            Self::Context400K => "context_400k",
+            Self::Context1M => "context_1m",
+        }
+    }
+
+    fn target_tokens(self) -> u64 {
+        match self {
+            Self::Connectivity => 0,
+            Self::Context400K => 400_000,
+            Self::Context1M => 1_000_000,
+        }
+    }
+
+    fn pass_threshold_tokens(self) -> u64 {
+        self.target_tokens() * 95 / 100
+    }
+
+    fn probe_steps(self) -> &'static [u64] {
+        match self {
+            Self::Connectivity => &[],
+            Self::Context400K => &[128_000, 258_000, 380_000, 420_000],
+            Self::Context1M => &[128_000, 258_000, 400_000, 700_000, 950_000, 1_050_000],
+        }
+    }
+
+    fn target_label(self) -> &'static str {
+        match self {
+            Self::Connectivity => "connectivity",
+            Self::Context400K => "400K",
+            Self::Context1M => "1M",
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct ModelTestStatus {
+    test_id: String,
+    mode: String,
+    state: String,
+    model: String,
+    provider_name: String,
+    stage: String,
+    target_tokens: u64,
+    pass_threshold_tokens: u64,
+    current_tokens: u64,
+    current_estimated: bool,
+    confirmed_tokens: u64,
+    confirmed_estimated: bool,
+    last_status: u16,
+    latency_ms: u128,
+    last_error: Option<String>,
+    summary: Option<String>,
+    supported: Option<bool>,
+    inconclusive: bool,
+    result: Option<TestModelResult>,
 }
 
 #[derive(Serialize)]
@@ -461,6 +695,680 @@ async fn test_model(
         .unwrap_or_else(|| match_route(&config, &model))?;
 
     test_matched_model(store.inner(), matched).await
+}
+
+#[tauri::command]
+async fn start_model_test(
+    store: tauri::State<'_, AppStore>,
+    sessions: tauri::State<'_, ModelTestSessions>,
+    model: String,
+    provider_id: Option<String>,
+    mode: String,
+) -> Result<StartModelTestResult, String> {
+    let mode = ModelTestMode::parse(&mode)?;
+    let config = store.config().await;
+    let matched = provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|provider| match_route_for_provider(&config, &model, provider))
+        .unwrap_or_else(|| match_route(&config, &model))?;
+    let test_id = Uuid::new_v4().to_string();
+    let status = Arc::new(Mutex::new(ModelTestStatus {
+        test_id: test_id.clone(),
+        mode: mode.as_str().into(),
+        state: "running".into(),
+        model: model.clone(),
+        provider_name: matched.provider.name.clone(),
+        stage: "queued".into(),
+        target_tokens: mode.target_tokens(),
+        pass_threshold_tokens: mode.pass_threshold_tokens(),
+        current_tokens: 0,
+        current_estimated: true,
+        confirmed_tokens: 0,
+        confirmed_estimated: true,
+        last_status: 0,
+        latency_ms: 0,
+        last_error: None,
+        summary: None,
+        supported: None,
+        inconclusive: false,
+        result: None,
+    }));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let handle = tauri::async_runtime::spawn(run_model_test_task(
+        store.inner().clone(),
+        matched,
+        mode,
+        status.clone(),
+        cancelled.clone(),
+    ));
+    sessions.sessions.lock().await.insert(
+        test_id.clone(),
+        ModelTestSession {
+            status,
+            cancelled,
+            handle,
+        },
+    );
+
+    Ok(StartModelTestResult { test_id })
+}
+
+#[tauri::command]
+async fn get_model_test_status(
+    sessions: tauri::State<'_, ModelTestSessions>,
+    test_id: String,
+) -> Result<ModelTestStatus, String> {
+    let status = {
+        let sessions = sessions.sessions.lock().await;
+        sessions
+            .get(&test_id)
+            .map(|session| session.status.clone())
+            .ok_or_else(|| "Model test not found".to_string())?
+    };
+    let snapshot = status.lock().await.clone();
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn cancel_model_test(
+    sessions: tauri::State<'_, ModelTestSessions>,
+    test_id: String,
+) -> Result<ModelTestStatus, String> {
+    let session = sessions
+        .sessions
+        .lock()
+        .await
+        .remove(&test_id)
+        .ok_or_else(|| "Model test not found".to_string())?;
+    session.cancelled.store(true, Ordering::SeqCst);
+    session.handle.abort();
+    {
+        let mut status = session.status.lock().await;
+        status.state = "cancelled".into();
+        status.stage = "cancelled".into();
+        status.summary = Some("Test cancelled".into());
+    }
+    let snapshot = session.status.lock().await.clone();
+    Ok(snapshot)
+}
+
+async fn run_model_test_task(
+    store: AppStore,
+    matched: RouteMatch,
+    mode: ModelTestMode,
+    status: Arc<Mutex<ModelTestStatus>>,
+    cancelled: Arc<AtomicBool>,
+) {
+    if mode == ModelTestMode::Connectivity {
+        run_connectivity_test_task(&store, matched, &status).await;
+        return;
+    }
+    run_context_pressure_test_task(&store, matched, mode, &status, &cancelled).await;
+}
+
+async fn update_model_test_status(
+    status: &Arc<Mutex<ModelTestStatus>>,
+    update: impl FnOnce(&mut ModelTestStatus),
+) {
+    let mut status = status.lock().await;
+    update(&mut status);
+}
+
+async fn run_connectivity_test_task(
+    store: &AppStore,
+    matched: RouteMatch,
+    status: &Arc<Mutex<ModelTestStatus>>,
+) {
+    update_model_test_status(status, |status| {
+        status.stage = "connectivity".into();
+    })
+    .await;
+
+    match test_matched_model(store, matched).await {
+        Ok(result) => {
+            update_model_test_status(status, |status| {
+                status.state = "completed".into();
+                status.stage = "done".into();
+                status.last_status = result.status;
+                status.latency_ms = result.latency_ms;
+                status.last_error = result.error.clone();
+                status.supported = Some(result.ok);
+                status.inconclusive = false;
+                status.summary = Some(if result.ok {
+                    "Connectivity test passed".into()
+                } else {
+                    "Connectivity test failed".into()
+                });
+                status.result = Some(result);
+            })
+            .await;
+        }
+        Err(error) => {
+            update_model_test_status(status, |status| {
+                status.state = "completed".into();
+                status.stage = "done".into();
+                status.last_error = Some(error.clone());
+                status.supported = None;
+                status.inconclusive = true;
+                status.summary = Some(format!("Connectivity test inconclusive: {error}"));
+                status.result = Some(TestModelResult {
+                    ok: false,
+                    status: 0,
+                    latency_ms: 0,
+                    reply: String::new(),
+                    error: Some(error),
+                    usage: TokenUsage::default(),
+                    provider_name: status.provider_name.clone(),
+                });
+            })
+            .await;
+        }
+    }
+}
+
+async fn run_context_pressure_test_task(
+    store: &AppStore,
+    matched: RouteMatch,
+    mode: ModelTestMode,
+    status: &Arc<Mutex<ModelTestStatus>>,
+    cancelled: &Arc<AtomicBool>,
+) {
+    update_model_test_status(status, |status| {
+        status.stage = "connectivity".into();
+    })
+    .await;
+
+    let connectivity = match test_matched_model(store, matched.clone()).await {
+        Ok(result) => result,
+        Err(error) => {
+            update_model_test_status(status, |status| {
+                status.state = "completed".into();
+                status.stage = "done".into();
+                status.inconclusive = true;
+                status.supported = None;
+                status.last_error = Some(error.clone());
+                status.summary = Some(format!("Test inconclusive: {error}"));
+                status.result = Some(TestModelResult {
+                    ok: false,
+                    status: 0,
+                    latency_ms: 0,
+                    reply: String::new(),
+                    error: Some(error),
+                    usage: TokenUsage::default(),
+                    provider_name: status.provider_name.clone(),
+                });
+            })
+            .await;
+            return;
+        }
+    };
+
+    if !connectivity.ok {
+        update_model_test_status(status, |status| {
+            status.state = "completed".into();
+            status.stage = "done".into();
+            status.last_status = connectivity.status;
+            status.latency_ms = connectivity.latency_ms;
+            status.last_error = connectivity.error.clone();
+            status.inconclusive = true;
+            status.supported = None;
+            status.summary = Some("Test inconclusive: connectivity check failed".into());
+            status.result = Some(connectivity);
+        })
+        .await;
+        return;
+    }
+
+    update_model_test_status(status, |status| {
+        status.result = Some(connectivity);
+    })
+    .await;
+
+    let pass_threshold = mode.pass_threshold_tokens();
+    let mut confirmed_tokens = 0_u64;
+    let mut confirmed_estimated = true;
+
+    for probe_tokens in mode.probe_steps() {
+        if cancelled.load(Ordering::SeqCst) {
+            mark_model_test_cancelled(status).await;
+            return;
+        }
+
+        update_model_test_status(status, |status| {
+            status.stage = "probe".into();
+            status.current_tokens = *probe_tokens;
+            status.current_estimated = true;
+            status.last_error = None;
+        })
+        .await;
+
+        let attempt = run_context_pressure_attempt(store, &matched, mode, *probe_tokens).await;
+        let confirmation =
+            context_confirmation(&attempt.usage, *probe_tokens, attempt.proof_verified);
+
+        if attempt.ok {
+            if !confirmation.verified {
+                let supported = confirmed_tokens >= pass_threshold;
+                update_model_test_status(status, |status| {
+                    status.state = "completed".into();
+                    status.stage = "done".into();
+                    status.current_tokens = confirmation.tokens;
+                    status.current_estimated = confirmation.estimated;
+                    status.confirmed_tokens = confirmed_tokens;
+                    status.confirmed_estimated = confirmed_estimated;
+                    status.last_status = attempt.status;
+                    status.latency_ms = attempt.latency_ms;
+                    status.last_error =
+                        Some("Response did not include the required context proof markers".into());
+                    status.inconclusive = false;
+                    status.supported = Some(supported);
+                    status.summary = Some(pressure_test_summary(
+                        mode,
+                        supported,
+                        false,
+                        confirmed_tokens,
+                        Some("context proof markers were missing"),
+                    ));
+                })
+                .await;
+                return;
+            }
+
+            if confirmation.tokens > confirmed_tokens {
+                confirmed_tokens = confirmation.tokens;
+                confirmed_estimated = confirmation.estimated;
+            }
+            update_model_test_status(status, |status| {
+                status.current_tokens = confirmation.tokens;
+                status.current_estimated = confirmation.estimated;
+                status.confirmed_tokens = confirmed_tokens;
+                status.confirmed_estimated = confirmed_estimated;
+                status.last_status = attempt.status;
+                status.latency_ms = attempt.latency_ms;
+                status.last_error = None;
+            })
+            .await;
+            continue;
+        }
+
+        let supported = confirmed_tokens >= pass_threshold;
+        let inconclusive = !attempt.context_limit && !supported;
+        update_model_test_status(status, |status| {
+            status.state = "completed".into();
+            status.stage = "done".into();
+            status.current_tokens = confirmation.tokens;
+            status.current_estimated = confirmation.estimated;
+            status.confirmed_tokens = confirmed_tokens;
+            status.confirmed_estimated = confirmed_estimated;
+            status.last_status = attempt.status;
+            status.latency_ms = attempt.latency_ms;
+            status.last_error = attempt.error.clone();
+            status.inconclusive = inconclusive;
+            status.supported = if inconclusive { None } else { Some(supported) };
+            status.summary = Some(pressure_test_summary(
+                mode,
+                supported,
+                inconclusive,
+                confirmed_tokens,
+                attempt.error.as_deref(),
+            ));
+        })
+        .await;
+        return;
+    }
+
+    let supported = confirmed_tokens >= pass_threshold;
+    update_model_test_status(status, |status| {
+        status.state = "completed".into();
+        status.stage = "done".into();
+        status.confirmed_tokens = confirmed_tokens;
+        status.confirmed_estimated = confirmed_estimated;
+        status.inconclusive = false;
+        status.supported = Some(supported);
+        status.summary = Some(pressure_test_summary(
+            mode,
+            supported,
+            false,
+            confirmed_tokens,
+            None,
+        ));
+    })
+    .await;
+}
+
+async fn mark_model_test_cancelled(status: &Arc<Mutex<ModelTestStatus>>) {
+    update_model_test_status(status, |status| {
+        status.state = "cancelled".into();
+        status.stage = "cancelled".into();
+        status.summary = Some("Test cancelled".into());
+    })
+    .await;
+}
+
+struct PressureAttemptResult {
+    ok: bool,
+    status: u16,
+    latency_ms: u128,
+    usage: TokenUsage,
+    proof_verified: bool,
+    error: Option<String>,
+    context_limit: bool,
+}
+
+struct ContextPressurePrompt {
+    text: String,
+    proof_markers: Vec<String>,
+}
+
+struct ContextConfirmation {
+    tokens: u64,
+    estimated: bool,
+    verified: bool,
+}
+
+async fn run_context_pressure_attempt(
+    store: &AppStore,
+    matched: &RouteMatch,
+    mode: ModelTestMode,
+    probe_tokens: u64,
+) -> PressureAttemptResult {
+    let client = reqwest::Client::new();
+    let prompt = context_pressure_prompt(probe_tokens);
+    let (url, headers, payload) =
+        match pressure_test_request_parts(store, &client, matched, mode, prompt.text.clone()).await
+        {
+            Ok(parts) => parts,
+            Err(error) => {
+                return PressureAttemptResult {
+                    ok: false,
+                    status: 0,
+                    latency_ms: 0,
+                    usage: TokenUsage::default(),
+                    proof_verified: false,
+                    error: Some(error),
+                    context_limit: false,
+                };
+            }
+        };
+
+    let started = Instant::now();
+    let mut request = client.post(&url).timeout(Duration::from_secs(180));
+    for (name, value) in &headers {
+        request = request.header(name, value);
+    }
+    let response = match request.json(&payload).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return PressureAttemptResult {
+                ok: false,
+                status: 0,
+                latency_ms: started.elapsed().as_millis(),
+                usage: TokenUsage::default(),
+                proof_verified: false,
+                error: Some(format!("Could not reach provider: {error}")),
+                context_limit: false,
+            };
+        }
+    };
+    let status = response.status().as_u16();
+    let latency_ms = started.elapsed().as_millis();
+    let text = match response.text().await {
+        Ok(text) => text,
+        Err(error) => {
+            return PressureAttemptResult {
+                ok: false,
+                status,
+                latency_ms,
+                usage: TokenUsage::default(),
+                proof_verified: false,
+                error: Some(format!("Could not read provider response: {error}")),
+                context_limit: false,
+            };
+        }
+    };
+    let value = test_response_value(&text);
+    let usage = value
+        .get("usage")
+        .filter(|u| u.is_object())
+        .map(|u| parse_usage(matched.provider.protocol.clone(), u))
+        .unwrap_or_default();
+    let reply = test_reply_from_value(&matched.provider.protocol, &value);
+    let proof_verified = context_pressure_reply_verified(&reply, &prompt.proof_markers);
+
+    if (200..300).contains(&status) {
+        return PressureAttemptResult {
+            ok: true,
+            status,
+            latency_ms,
+            usage,
+            proof_verified,
+            error: None,
+            context_limit: false,
+        };
+    }
+
+    let error = provider_error_message(&value, &text);
+    PressureAttemptResult {
+        ok: false,
+        status,
+        latency_ms,
+        usage,
+        proof_verified,
+        context_limit: is_explicit_context_limit_error(status, &error),
+        error: Some(error),
+    }
+}
+
+async fn pressure_test_request_parts(
+    store: &AppStore,
+    client: &reqwest::Client,
+    matched: &RouteMatch,
+    mode: ModelTestMode,
+    prompt: String,
+) -> Result<(String, Vec<(String, String)>, Value), String> {
+    let (base_url, headers) = test_provider_upstream(store, client, matched).await?;
+    Ok(pressure_test_request_shape(
+        &matched.provider.protocol,
+        &matched.provider.kind,
+        &base_url,
+        headers,
+        &matched.upstream_model,
+        matched.model.context_window,
+        mode == ModelTestMode::Context1M,
+        prompt,
+    ))
+}
+
+fn pressure_test_request_shape(
+    protocol: &ProviderProtocol,
+    provider_kind: &ProviderKind,
+    base_url: &str,
+    headers: Vec<(String, String)>,
+    upstream_model: &str,
+    context_window: u64,
+    force_one_million_context: bool,
+    prompt: String,
+) -> (String, Vec<(String, String)>, Value) {
+    match protocol {
+        ProviderProtocol::OpenAiResponses => {
+            let official_openai = matches!(
+                provider_kind,
+                ProviderKind::OfficialOpenAi | ProviderKind::OfficialOpenAiAccount
+            );
+            let headers = if official_openai {
+                openai_official_test_headers(headers)
+            } else {
+                headers
+            };
+            let payload = if official_openai {
+                json!({
+                    "model": upstream_model,
+                    "input": [{
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": prompt
+                        }]
+                    }],
+                    "instructions": "You are a context window test assistant. Read the full input and reply only with the FINAL_MARKER line if present.",
+                    "store": false,
+                    "stream": true
+                })
+            } else {
+                json!({
+                    "model": upstream_model,
+                    "input": prompt,
+                    "stream": false,
+                    "max_output_tokens": 128
+                })
+            };
+            (endpoint(base_url, "responses"), headers, payload)
+        }
+        ProviderProtocol::OpenAiChatCompletions => (
+            endpoint(base_url, "chat/completions"),
+            headers,
+            json!({
+                "model": upstream_model,
+                "messages": [{ "role": "user", "content": prompt }],
+                "stream": false,
+                "max_tokens": 128
+            }),
+        ),
+        ProviderProtocol::AnthropicMessages => {
+            let context_window = if force_one_million_context {
+                context_window.max(1_000_000)
+            } else {
+                context_window
+            };
+            let (upstream_model, one_million_context) =
+                server::anthropic_model_for_request(upstream_model, context_window);
+            let request = json!({
+                "model": upstream_model,
+                "input": prompt,
+                "stream": false,
+                "max_output_tokens": 128
+            });
+            (
+                server::anthropic_messages_url(base_url, one_million_context),
+                server::claude_code_mirror_headers(headers, &request),
+                server::build_anthropic_body(&request, &upstream_model, false),
+            )
+        }
+    }
+}
+
+fn context_pressure_prompt(estimated_tokens: u64) -> ContextPressurePrompt {
+    const MARKER_COUNT: usize = 5;
+    let seed = estimated_tokens
+        .wrapping_mul(1_103_515_245)
+        .wrapping_add(12_345);
+    let proof_markers = (0..MARKER_COUNT)
+        .map(|index| format!("NRCTX{:X}{index}", seed))
+        .collect::<Vec<_>>();
+    let repeat = estimated_tokens.saturating_sub(256) as usize;
+    let segment_repeat = repeat / MARKER_COUNT;
+    let mut remaining = repeat;
+    let mut text = String::with_capacity(repeat.saturating_mul(2).saturating_add(1024));
+    text.push_str("Neko Route context window probe.\n");
+    text.push_str(
+        "Read the whole input. Reply with NR_CONTEXT_OK followed by every CHECKPOINT value in order.\n",
+    );
+    text.push_str("Do not summarize. Do not invent missing checkpoints.\nBEGIN\n");
+    for (index, marker) in proof_markers.iter().enumerate() {
+        text.push_str(&format!("CHECKPOINT_{index}: {marker}\n"));
+        let take = if index + 1 == MARKER_COUNT {
+            remaining
+        } else {
+            segment_repeat.min(remaining)
+        };
+        for _ in 0..take {
+            text.push_str(" a");
+        }
+        remaining = remaining.saturating_sub(take);
+        text.push('\n');
+    }
+    text.push_str("END\n");
+    text.push_str(
+        "Reply now with NR_CONTEXT_OK and the CHECKPOINT values in order. The values are only in the input above.\n",
+    );
+    ContextPressurePrompt {
+        text,
+        proof_markers,
+    }
+}
+
+fn context_confirmation(
+    usage: &TokenUsage,
+    fallback: u64,
+    proof_verified: bool,
+) -> ContextConfirmation {
+    let prompt_tokens = usage
+        .input_tokens
+        .max(usage.total_tokens.saturating_sub(usage.output_tokens));
+    if prompt_tokens > 0 {
+        ContextConfirmation {
+            tokens: prompt_tokens,
+            estimated: false,
+            verified: true,
+        }
+    } else {
+        ContextConfirmation {
+            tokens: fallback,
+            estimated: true,
+            verified: proof_verified,
+        }
+    }
+}
+
+fn context_pressure_reply_verified(reply: &str, proof_markers: &[String]) -> bool {
+    if proof_markers.is_empty() {
+        return false;
+    }
+    let normalized = reply.to_ascii_uppercase();
+    normalized.contains("NR_CONTEXT_OK")
+        && proof_markers
+            .iter()
+            .all(|marker| normalized.contains(&marker.to_ascii_uppercase()))
+}
+
+fn is_explicit_context_limit_error(status: u16, error: &str) -> bool {
+    if status == 401 || status == 403 || status == 408 || status == 429 || status >= 500 {
+        return false;
+    }
+    let lower = error.to_ascii_lowercase();
+    lower.contains("context_length_exceeded")
+        || lower.contains("context window is full")
+        || lower.contains("maximum context length")
+        || lower.contains("too many tokens")
+        || (lower.contains("context") && (lower.contains("exceed") || lower.contains("full")))
+        || (lower.contains("prompt") && lower.contains("too long"))
+        || (lower.contains("input") && lower.contains("tokens") && lower.contains("exceed"))
+}
+
+fn pressure_test_summary(
+    mode: ModelTestMode,
+    supported: bool,
+    inconclusive: bool,
+    confirmed_tokens: u64,
+    error: Option<&str>,
+) -> String {
+    if inconclusive {
+        return format!(
+            "Test inconclusive: {}",
+            error.unwrap_or("upstream returned a non-context error")
+        );
+    }
+    if supported {
+        format!("Model supports {} context", mode.target_label())
+    } else {
+        format!(
+            "Model did not reach {} context; last confirmed about {} tokens",
+            mode.target_label(),
+            confirmed_tokens
+        )
+    }
 }
 
 async fn test_matched_model(
@@ -561,16 +1469,21 @@ async fn test_request_parts(
                 "max_tokens": 16
             }),
         )),
-        ProviderProtocol::AnthropicMessages => Ok((
-            endpoint(&base_url, "messages"),
-            with_anthropic_version(headers),
-            json!({
-                "model": upstream,
-                "messages": [{ "role": "user", "content": "hi" }],
+        ProviderProtocol::AnthropicMessages => {
+            let (upstream_model, one_million_context) =
+                server::anthropic_model_for_request(upstream, matched.model.context_window);
+            let request = json!({
+                "model": upstream_model,
+                "input": "hi",
                 "stream": false,
-                "max_tokens": 16
-            }),
-        )),
+                "max_output_tokens": 16
+            });
+            Ok((
+                server::anthropic_messages_url(&base_url, one_million_context),
+                server::claude_code_mirror_headers(headers, &request),
+                server::build_anthropic_body(&request, &upstream_model, false),
+            ))
+        }
     }
 }
 
@@ -607,12 +1520,7 @@ async fn test_provider_upstream(
                         matched.provider.name
                     )
                 })?;
-                match &matched.provider.protocol {
-                    ProviderProtocol::AnthropicMessages => {
-                        headers.push(("x-api-key".into(), secret))
-                    }
-                    _ => headers.push(("authorization".into(), format!("Bearer {secret}"))),
-                }
+                headers.push(("authorization".into(), format!("Bearer {secret}")));
             }
             Ok((matched.provider.base_url.clone(), headers))
         }
@@ -679,16 +1587,6 @@ fn endpoint(base_url: &str, path: &str) -> String {
     format!("{}/{}", base_url.trim_end_matches('/'), path)
 }
 
-fn with_anthropic_version(mut headers: Vec<(String, String)>) -> Vec<(String, String)> {
-    if !headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("anthropic-version"))
-    {
-        headers.push(("anthropic-version".into(), "2023-06-01".into()));
-    }
-    headers
-}
-
 fn test_response_value(text: &str) -> Value {
     serde_json::from_str::<Value>(text)
         .ok()
@@ -700,6 +1598,10 @@ fn sse_test_response_value(text: &str) -> Option<Value> {
     let mut last = None;
     let mut delta_text = String::new();
     let mut final_text = None;
+    let mut chat_seen = false;
+    let mut chat_content = String::new();
+    let mut chat_reasoning = String::new();
+    let mut chat_usage = None;
     for block in text.split("\n\n") {
         let event_name = block.lines().find_map(|line| {
             line.trim_start()
@@ -719,6 +1621,20 @@ fn sse_test_response_value(text: &str) -> Option<Value> {
             continue;
         }
         let value = serde_json::from_str::<Value>(&data).ok()?;
+        if value.get("choices").and_then(Value::as_array).is_some() {
+            chat_seen = true;
+            if let Some(content) = chat_delta_text(&value) {
+                chat_content.push_str(&content);
+            }
+            if let Some(reasoning) = chat_delta_reasoning_text(&value) {
+                chat_reasoning.push_str(&reasoning);
+            }
+            if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+                chat_usage = Some(usage.clone());
+            }
+            last = Some(value);
+            continue;
+        }
         let event_type = value
             .get("type")
             .and_then(Value::as_str)
@@ -742,12 +1658,50 @@ fn sse_test_response_value(text: &str) -> Option<Value> {
         }
         last = Some(value.get("response").cloned().unwrap_or(value));
     }
+    if chat_seen {
+        return Some(chat_test_response_value(
+            fallback_output_text(Some(&chat_content), &chat_reasoning),
+            chat_usage,
+        ));
+    }
     let mut value = last?;
     fill_output_text(
         &mut value,
         fallback_output_text(final_text.as_deref(), &delta_text),
     );
     Some(value)
+}
+
+fn chat_delta_text(value: &Value) -> Option<String> {
+    value
+        .pointer("/choices/0/delta/content")
+        .or_else(|| value.pointer("/choices/0/message/content"))
+        .map(text_from_model_test_content)
+        .filter(|text| !text.is_empty())
+}
+
+fn chat_delta_reasoning_text(value: &Value) -> Option<String> {
+    value
+        .pointer("/choices/0/delta/reasoning_content")
+        .or_else(|| value.pointer("/choices/0/message/reasoning_content"))
+        .or_else(|| value.pointer("/choices/0/delta/reasoning"))
+        .or_else(|| value.pointer("/choices/0/message/reasoning"))
+        .map(text_from_model_test_content)
+        .filter(|text| !text.is_empty())
+}
+
+fn chat_test_response_value(content: &str, usage: Option<Value>) -> Value {
+    let mut value = json!({
+        "choices": [{
+            "message": {
+                "content": content
+            }
+        }]
+    });
+    if let Some(usage) = usage {
+        value["usage"] = usage;
+    }
+    value
 }
 
 fn sse_delta_text(value: &Value, event_type: Option<&str>) -> Option<String> {
@@ -844,11 +1798,7 @@ fn test_reply_from_value(protocol: &ProviderProtocol, value: &Value) -> String {
             .map(ToOwned::to_owned)
             .filter(|text| !text.is_empty())
             .unwrap_or_else(|| reply_from_output(value)),
-        ProviderProtocol::OpenAiChatCompletions => value
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        ProviderProtocol::OpenAiChatCompletions => chat_reply_from_value(value),
         ProviderProtocol::AnthropicMessages => value
             .get("content")
             .and_then(Value::as_array)
@@ -861,6 +1811,51 @@ fn test_reply_from_value(protocol: &ProviderProtocol, value: &Value) -> String {
                     .join("")
             })
             .unwrap_or_default(),
+    }
+}
+
+fn chat_reply_from_value(value: &Value) -> String {
+    let message = value.pointer("/choices/0/message");
+    message
+        .and_then(|message| message.get("content"))
+        .map(text_from_model_test_content)
+        .filter(|text| !text.is_empty())
+        .or_else(|| {
+            message
+                .and_then(|message| {
+                    message
+                        .get("reasoning_content")
+                        .or_else(|| message.get("reasoning"))
+                })
+                .map(text_from_model_test_content)
+                .filter(|text| !text.is_empty())
+        })
+        .or_else(|| {
+            value
+                .pointer("/choices/0/text")
+                .map(text_from_model_test_content)
+                .filter(|text| !text.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn text_from_model_test_content(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(text_from_model_test_content)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(""),
+        Value::Object(object) => object
+            .get("text")
+            .or_else(|| object.get("content"))
+            .or_else(|| object.get("reasoning_content"))
+            .or_else(|| object.get("reasoning"))
+            .map(text_from_model_test_content)
+            .unwrap_or_default(),
+        _ => String::new(),
     }
 }
 
@@ -944,11 +1939,7 @@ async fn list_upstream_models(
                     .get_secret(key_ref)
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| "This provider needs an API key first".to_string())?;
-                if anthropic {
-                    headers.push(("x-api-key".into(), secret));
-                } else {
-                    headers.push(("authorization".into(), format!("Bearer {secret}")));
-                }
+                headers.push(("authorization".into(), format!("Bearer {secret}")));
             }
             (provider.base_url.clone(), headers, anthropic)
         }
@@ -1114,6 +2105,49 @@ fn start_codex_desktop() -> Result<(), String> {
 #[cfg(target_os = "windows")]
 const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
 
+#[cfg(any(test, target_os = "windows"))]
+fn dedupe_paths_case_insensitive(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped = Vec::new();
+    for path in paths {
+        let key = path.to_string_lossy().to_ascii_lowercase();
+        if seen.insert(key) {
+            deduped.push(path);
+        }
+    }
+    deduped
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn merge_windows_codex_launch_paths(
+    running_paths: Vec<PathBuf>,
+    registry_paths: Vec<PathBuf>,
+    path_paths: Vec<PathBuf>,
+    common_paths: Vec<PathBuf>,
+    shortcut_paths: Vec<PathBuf>,
+    scanned_paths: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    dedupe_paths_case_insensitive(
+        running_paths
+            .into_iter()
+            .chain(registry_paths)
+            .chain(path_paths)
+            .chain(common_paths)
+            .chain(shortcut_paths)
+            .chain(scanned_paths)
+            .collect(),
+    )
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_restart_preflight_error(was_running: bool, concrete_targets: usize) -> Option<String> {
+    if was_running && concrete_targets == 0 {
+        Some("Codex is running, but Neko Route could not find its executable path before restarting. Codex was left running.".into())
+    } else {
+        None
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn windows_command(program: &str) -> Command {
     let mut command = Command::new(program);
@@ -1132,20 +2166,94 @@ fn windows_codex_executable_names() -> [&'static str; 2] {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Debug, Clone)]
+struct WindowsCodexProcess {
+    executable_path: Option<PathBuf>,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsHandle {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_wide_to_string(value: &[u16]) -> String {
+    let end = value
+        .iter()
+        .position(|char| *char == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..end])
+}
+
+#[cfg(target_os = "windows")]
+fn windows_process_image_path(process_id: u32) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if handle.is_null() {
+        return None;
+    }
+    let _handle = WindowsHandle(handle);
+    let mut buffer = vec![0u16; 32768];
+    let mut size = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
+    if ok == 0 || size == 0 {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_wide(
+        &buffer[..size as usize],
+    )))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_codex_running_processes() -> Vec<WindowsCodexProcess> {
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let _snapshot = WindowsHandle(snapshot);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut processes = Vec::new();
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        let exe_name = windows_wide_to_string(&entry.szExeFile);
+        if windows_codex_process_names()
+            .iter()
+            .any(|name| exe_name.eq_ignore_ascii_case(name))
+        {
+            processes.push(WindowsCodexProcess {
+                executable_path: windows_process_image_path(entry.th32ProcessID),
+            });
+        }
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    processes
+}
+
+#[cfg(target_os = "windows")]
 fn codex_desktop_running() -> bool {
-    windows_codex_process_names().iter().any(|process_name| {
-        let filter = format!("IMAGENAME eq {process_name}");
-        windows_command("tasklist")
-            .args(["/FI", &filter, "/NH"])
-            .output()
-            .ok()
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .is_some_and(|output| {
-                output
-                    .to_ascii_lowercase()
-                    .contains(&process_name.to_ascii_lowercase())
-            })
-    })
+    !windows_codex_running_processes().is_empty()
 }
 
 #[cfg(target_os = "windows")]
@@ -1253,6 +2361,50 @@ fn windows_codex_common_paths() -> Vec<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
+fn collect_windows_codex_executables(root: &Path, depth: usize, paths: &mut Vec<PathBuf>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let lower = file_name.to_ascii_lowercase();
+        if path.is_file() {
+            if windows_codex_executable_names()
+                .iter()
+                .any(|name| file_name.eq_ignore_ascii_case(name))
+                || (lower.ends_with(".exe") && lower.contains("codex"))
+            {
+                paths.push(path);
+            }
+            continue;
+        }
+        if path.is_dir() {
+            collect_windows_codex_executables(&path, depth - 1, paths);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_codex_shallow_search_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        collect_windows_codex_executables(&local_app_data.join("Programs"), 3, &mut paths);
+    }
+    for var in ["PROGRAMFILES", "PROGRAMFILES(X86)"] {
+        if let Some(base) = env::var_os(var).map(PathBuf::from) {
+            collect_windows_codex_executables(&base, 2, &mut paths);
+        }
+    }
+    paths
+}
+
+#[cfg(target_os = "windows")]
 fn collect_windows_shortcuts(root: &PathBuf, depth: usize, paths: &mut Vec<PathBuf>) {
     if depth == 0 {
         return;
@@ -1314,19 +2466,6 @@ fn windows_codex_shortcut_paths() -> Vec<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn dedupe_windows_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut seen = std::collections::HashSet::new();
-    let mut deduped = Vec::new();
-    for path in paths {
-        let key = path.to_string_lossy().to_ascii_lowercase();
-        if seen.insert(key) {
-            deduped.push(path);
-        }
-    }
-    deduped
-}
-
-#[cfg(target_os = "windows")]
 fn shell_execute_windows(target: &OsStr) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::{UI::Shell::ShellExecuteW, UI::WindowsAndMessaging::SW_SHOWNORMAL};
@@ -1357,39 +2496,84 @@ fn shell_execute_windows(target: &OsStr) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn start_codex_desktop() -> Result<(), String> {
-    let candidates = dedupe_windows_paths(
-        windows_codex_app_path_from_registry()
-            .into_iter()
-            .chain(windows_codex_paths_from_path())
-            .chain(windows_codex_common_paths())
-            .chain(windows_codex_shortcut_paths())
-            .collect(),
-    );
+fn windows_codex_launch_candidates(running_paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    merge_windows_codex_launch_paths(
+        running_paths,
+        windows_codex_app_path_from_registry(),
+        windows_codex_paths_from_path(),
+        windows_codex_common_paths(),
+        windows_codex_shortcut_paths(),
+        windows_codex_shallow_search_paths(),
+    )
+}
 
+#[cfg(target_os = "windows")]
+fn existing_windows_codex_launch_candidates(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    candidates
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn start_codex_desktop_from_candidates(
+    candidates: Vec<PathBuf>,
+    allow_shell_fallback: bool,
+) -> Result<(), String> {
+    let had_concrete_candidates = !candidates.is_empty();
     let mut errors = Vec::new();
-    for path in candidates.iter().filter(|path| path.exists()) {
+    for path in candidates {
         match shell_execute_windows(path.as_os_str()) {
             Ok(()) => return Ok(()),
             Err(error) => errors.push(format!("{}: {error}", path.display())),
         }
     }
 
-    for target in ["Codex.exe", "Codex"] {
-        match shell_execute_windows(OsStr::new(target)) {
-            Ok(()) => return Ok(()),
-            Err(error) => errors.push(format!("{target}: {error}")),
+    if allow_shell_fallback {
+        for target in ["Codex.exe", "Codex"] {
+            match shell_execute_windows(OsStr::new(target)) {
+                Ok(()) => return Ok(()),
+                Err(error) => errors.push(format!("{target}: {error}")),
+            }
         }
     }
 
     if errors.is_empty() {
-        Err("Could not start Codex desktop app".into())
+        Err("Could not find Codex desktop executable. Checked the running process path, App Paths registry, PATH, common install folders, and Start Menu shortcuts.".into())
+    } else if !had_concrete_candidates {
+        Err(format!(
+            "Could not find a concrete Codex desktop executable path. Fallback launches failed: {}",
+            errors.join("; ")
+        ))
     } else {
         Err(format!(
             "Could not start Codex desktop app. Tried: {}",
             errors.join("; ")
         ))
     }
+}
+
+#[cfg(target_os = "windows")]
+fn restart_or_start_codex_desktop() -> Result<CodexAppRestartResult, String> {
+    let running_processes = windows_codex_running_processes();
+    let running = !running_processes.is_empty();
+    let running_paths = running_processes
+        .iter()
+        .filter_map(|process| process.executable_path.clone())
+        .collect::<Vec<_>>();
+    let candidates =
+        existing_windows_codex_launch_candidates(windows_codex_launch_candidates(running_paths));
+
+    if let Some(error) = windows_restart_preflight_error(running, candidates.len()) {
+        return Err(error);
+    }
+    if running {
+        stop_codex_desktop()?;
+    }
+    start_codex_desktop_from_candidates(candidates, !running)?;
+    Ok(CodexAppRestartResult {
+        action: codex_restart_action(running),
+    })
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -1531,7 +2715,9 @@ async fn install_codex_config(
     default_model: Option<String>,
 ) -> Result<codex_config::InjectionResult, String> {
     let config = store.config().await;
-    store.inject_codex_config_for(&config, default_model.as_deref())
+    store
+        .inject_codex_config_for(&config, default_model.as_deref())
+        .await
 }
 
 #[tauri::command]
@@ -1574,11 +2760,15 @@ async fn get_request_logs(
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_responses_test_payload, codex_restart_action, openai_official_test_headers,
-        openai_official_upstream_models, provider_error_message, provider_status_error,
-        test_reply_from_value, test_response_value,
+        codex_responses_test_payload, codex_restart_action, context_confirmation,
+        context_pressure_prompt, context_pressure_reply_verified, dedupe_paths_case_insensitive,
+        is_explicit_context_limit_error, merge_windows_codex_launch_paths,
+        openai_official_test_headers, openai_official_upstream_models, pressure_test_request_shape,
+        provider_error_message, provider_status_error, server_bind_settings_changed,
+        test_reply_from_value, test_response_value, windows_restart_preflight_error, ModelTestMode,
     };
-    use crate::types::{Provider, ProviderKind, ProviderProtocol};
+    use crate::types::{default_config, Provider, ProviderKind, ProviderProtocol, TokenUsage};
+    use std::path::PathBuf;
 
     #[test]
     fn official_openai_test_payload_uses_minimal_codex_responses_shape() {
@@ -1605,9 +2795,243 @@ mod tests {
     }
 
     #[test]
+    fn pressure_payload_limits_output_for_each_protocol() {
+        let (_, _, responses) = pressure_test_request_shape(
+            &ProviderProtocol::OpenAiResponses,
+            &ProviderKind::Custom,
+            "https://relay.example/v1",
+            vec![],
+            "gpt-test",
+            400_000,
+            false,
+            "large prompt".into(),
+        );
+        assert_eq!(responses["max_output_tokens"], 128);
+        assert_eq!(responses["input"], "large prompt");
+
+        let (_, _, official_responses) = pressure_test_request_shape(
+            &ProviderProtocol::OpenAiResponses,
+            &ProviderKind::OfficialOpenAiAccount,
+            "https://chatgpt.com/backend-api/codex",
+            vec![],
+            "gpt-5.4-pro",
+            400_000,
+            false,
+            "large prompt".into(),
+        );
+        assert_eq!(official_responses["model"], "gpt-5.4-pro");
+        assert_eq!(
+            official_responses["input"][0]["content"][0]["type"],
+            "input_text"
+        );
+        assert_eq!(
+            official_responses["input"][0]["content"][0]["text"],
+            "large prompt"
+        );
+        assert_eq!(official_responses["store"], false);
+        assert_eq!(official_responses["stream"], true);
+        assert!(official_responses.get("max_output_tokens").is_none());
+
+        let (_, _, chat) = pressure_test_request_shape(
+            &ProviderProtocol::OpenAiChatCompletions,
+            &ProviderKind::Custom,
+            "https://relay.example/v1",
+            vec![],
+            "chat-test",
+            400_000,
+            false,
+            "large prompt".into(),
+        );
+        assert_eq!(chat["max_tokens"], 128);
+        assert_eq!(chat["messages"][0]["content"], "large prompt");
+
+        let (_, _, anthropic) = pressure_test_request_shape(
+            &ProviderProtocol::AnthropicMessages,
+            &ProviderKind::Custom,
+            "https://relay.example/v1",
+            vec![],
+            "claude-test",
+            400_000,
+            false,
+            "large prompt".into(),
+        );
+        assert_eq!(anthropic["max_tokens"], 128);
+        assert_eq!(anthropic["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(
+            anthropic["messages"][0]["content"][0]["text"],
+            "large prompt"
+        );
+        assert_eq!(
+            anthropic["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn pressure_confirmation_requires_usage_or_context_proof() {
+        let no_usage = TokenUsage::default();
+        let unverified = context_confirmation(&no_usage, 380_000, false);
+        assert_eq!(unverified.tokens, 380_000);
+        assert!(unverified.estimated);
+        assert!(!unverified.verified);
+
+        let verified_by_proof = context_confirmation(&no_usage, 380_000, true);
+        assert_eq!(verified_by_proof.tokens, 380_000);
+        assert!(verified_by_proof.estimated);
+        assert!(verified_by_proof.verified);
+
+        let verified_by_usage = context_confirmation(
+            &TokenUsage {
+                input_tokens: 391_000,
+                output_tokens: 12,
+                total_tokens: 391_012,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            380_000,
+            false,
+        );
+        assert_eq!(verified_by_usage.tokens, 391_000);
+        assert!(!verified_by_usage.estimated);
+        assert!(verified_by_usage.verified);
+    }
+
+    #[test]
+    fn pressure_prompt_requires_all_distributed_markers() {
+        let prompt = context_pressure_prompt(380_000);
+        assert_eq!(prompt.proof_markers.len(), 5);
+        for marker in &prompt.proof_markers {
+            assert!(prompt.text.contains(marker));
+        }
+        let complete_reply = format!("NR_CONTEXT_OK {}", prompt.proof_markers.join(" "));
+        assert!(context_pressure_reply_verified(
+            &complete_reply,
+            &prompt.proof_markers
+        ));
+        let partial_reply = format!("NR_CONTEXT_OK {}", prompt.proof_markers[0]);
+        assert!(!context_pressure_reply_verified(
+            &partial_reply,
+            &prompt.proof_markers
+        ));
+    }
+
+    #[test]
+    fn pressure_anthropic_one_million_uses_beta_without_suffix() {
+        let (url, headers, body) = pressure_test_request_shape(
+            &ProviderProtocol::AnthropicMessages,
+            &ProviderKind::Custom,
+            "https://relay.example/v1",
+            vec![("anthropic-beta".into(), "oauth-2025-04-20".into())],
+            "claude-opus-4-8[1m]",
+            258_000,
+            true,
+            "large prompt".into(),
+        );
+
+        assert_eq!(body["model"], "claude-opus-4-8");
+        assert!(url.ends_with("/messages?beta=true"));
+        let beta = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+            .map(|(_, value)| value.as_str())
+            .unwrap();
+        assert!(!beta.contains("oauth-2025-04-20"));
+        assert!(beta.contains("context-1m-2025-08-07"));
+        assert!(beta.contains("mid-conversation-system-2026-04-07"));
+        assert!(beta.contains("effort-2025-11-24"));
+        assert!(!beta.contains("fallback-credit-2026-06-01"));
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "max");
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("context_management").is_none());
+    }
+
+    #[test]
+    fn context_error_classifier_avoids_infrastructure_errors() {
+        assert!(is_explicit_context_limit_error(
+            400,
+            "context_length_exceeded: maximum context length"
+        ));
+        assert!(is_explicit_context_limit_error(
+            400,
+            "Context window is full. Reduce conversation history."
+        ));
+        assert!(!is_explicit_context_limit_error(
+            502,
+            "upstream request failed"
+        ));
+        assert!(!is_explicit_context_limit_error(429, "rate limit exceeded"));
+        assert!(!is_explicit_context_limit_error(
+            400,
+            "Input content length exceeds threshold"
+        ));
+    }
+
+    #[test]
+    fn pressure_test_threshold_uses_ninety_five_percent() {
+        assert_eq!(ModelTestMode::Context400K.pass_threshold_tokens(), 380_000);
+        assert_eq!(ModelTestMode::Context1M.pass_threshold_tokens(), 950_000);
+    }
+
+    #[test]
     fn codex_restart_action_reflects_previous_running_state() {
         assert_eq!(codex_restart_action(false), "started");
         assert_eq!(codex_restart_action(true), "restarted");
+    }
+
+    #[test]
+    fn server_restart_is_required_only_for_bind_address_changes() {
+        let mut previous = default_config().settings;
+        let mut next = previous.clone();
+
+        next.allow_lan = !previous.allow_lan;
+        assert!(!server_bind_settings_changed(&previous, &next));
+
+        next.bind_host = "0.0.0.0".into();
+        assert!(server_bind_settings_changed(&previous, &next));
+
+        previous.bind_host = next.bind_host.clone();
+        next.port += 1;
+        assert!(server_bind_settings_changed(&previous, &next));
+    }
+
+    #[test]
+    fn windows_codex_launch_paths_are_deduped_case_insensitively() {
+        let paths = dedupe_paths_case_insensitive(vec![
+            PathBuf::from(r"C:\Users\zoe\AppData\Local\Programs\Codex\Codex.exe"),
+            PathBuf::from(r"c:\users\zoe\appdata\local\programs\codex\codex.exe"),
+            PathBuf::from(r"C:\Users\zoe\AppData\Local\Programs\Codex\OpenAI Codex.exe"),
+        ]);
+
+        assert_eq!(paths.len(), 2);
+        assert_eq!(
+            paths[0],
+            PathBuf::from(r"C:\Users\zoe\AppData\Local\Programs\Codex\Codex.exe")
+        );
+    }
+
+    #[test]
+    fn windows_codex_launch_paths_prefer_running_process_path() {
+        let paths = merge_windows_codex_launch_paths(
+            vec![PathBuf::from(r"D:\Apps\Codex\Codex.exe")],
+            vec![PathBuf::from(r"C:\Registry\Codex.exe")],
+            vec![PathBuf::from(r"C:\Path\Codex.exe")],
+            vec![PathBuf::from(r"C:\Common\Codex.exe")],
+            vec![PathBuf::from(r"C:\Start Menu\Codex.lnk")],
+            vec![PathBuf::from(r"C:\Scanned\Codex.exe")],
+        );
+
+        assert_eq!(paths[0], PathBuf::from(r"D:\Apps\Codex\Codex.exe"));
+        assert_eq!(paths[1], PathBuf::from(r"C:\Registry\Codex.exe"));
+    }
+
+    #[test]
+    fn windows_codex_restart_refuses_to_stop_without_start_target() {
+        let error = windows_restart_preflight_error(true, 0).unwrap();
+
+        assert!(error.contains("left running"));
+        assert!(windows_restart_preflight_error(true, 1).is_none());
+        assert!(windows_restart_preflight_error(false, 0).is_none());
     }
 
     #[test]
@@ -1811,6 +3235,68 @@ mod tests {
             "from output"
         );
     }
+
+    #[test]
+    fn json_test_response_reads_chat_completions_content_shapes() {
+        let string_content = test_response_value(
+            r#"{"choices":[{"message":{"content":"OK"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        );
+        assert_eq!(
+            test_reply_from_value(&ProviderProtocol::OpenAiChatCompletions, &string_content),
+            "OK"
+        );
+
+        let array_content = test_response_value(
+            r#"{"choices":[{"message":{"content":[{"type":"text","text":"O"},{"type":"text","text":"K"}]}}]}"#,
+        );
+        assert_eq!(
+            test_reply_from_value(&ProviderProtocol::OpenAiChatCompletions, &array_content),
+            "OK"
+        );
+    }
+
+    #[test]
+    fn json_test_response_uses_chat_reasoning_when_content_is_empty() {
+        let value = test_response_value(
+            r#"{"choices":[{"message":{"content":null,"reasoning_content":"NR_CONTEXT_OK marker"}}]}"#,
+        );
+
+        assert_eq!(
+            test_reply_from_value(&ProviderProtocol::OpenAiChatCompletions, &value),
+            "NR_CONTEXT_OK marker"
+        );
+    }
+
+    #[test]
+    fn sse_test_response_reads_chat_completions_delta_content() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"O\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"K\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let value = test_response_value(raw);
+
+        assert_eq!(
+            test_reply_from_value(&ProviderProtocol::OpenAiChatCompletions, &value),
+            "OK"
+        );
+        assert_eq!(value["usage"]["total_tokens"], 3);
+    }
+
+    #[test]
+    fn sse_test_response_reads_chat_reasoning_when_content_is_empty() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"NR_CONTEXT_\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"OK\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let value = test_response_value(raw);
+
+        assert_eq!(
+            test_reply_from_value(&ProviderProtocol::OpenAiChatCompletions, &value),
+            "NR_CONTEXT_OK"
+        );
+    }
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -1946,24 +3432,19 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|error| format!("Failed to resolve app data dir: {error}"))?;
             let store = AppStore::load(app_data_dir)?;
-            let server_store = store.clone();
             let catalog_store = store.clone();
+            let server_runtime = ServerRuntime::new(store.clone());
             app.manage(store);
+            app.manage(server_runtime.clone());
             app.manage(OpenAiOAuthSessions::default());
             app.manage(ClaudeOAuthSessions::default());
+            app.manage(ModelTestSessions::default());
             tauri::async_runtime::spawn(async move {
                 let codex_home = codex_config::resolve_codex_home();
                 let _ = catalog_store.export_catalog_to(&codex_home).await;
             });
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = server::run(server_store.clone()).await {
-                    let config = server_store.config().await;
-                    let bind_url = format!(
-                        "http://{}:{}/v1",
-                        config.settings.bind_host, config.settings.port
-                    );
-                    server_store.set_server_error(bind_url, error).await;
-                }
+                server_runtime.start().await;
             });
             Ok(())
         })
@@ -1978,6 +3459,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             save_config,
+            regenerate_lan_api_key,
+            list_lan_models,
             set_provider_key,
             delete_provider_key,
             set_official_provider_token,
@@ -1993,6 +3476,9 @@ pub fn run() {
             restart_codex_app,
             test_route,
             test_model,
+            start_model_test,
+            get_model_test_status,
+            cancel_model_test,
             list_upstream_models,
             refresh_provider_usage,
             export_catalog,

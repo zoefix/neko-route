@@ -7,13 +7,17 @@ import type {
   CodexConfigContent,
   CodexConfigSaveResult,
   ImportResult,
+  LanModelList,
+  ModelTestMode,
+  ModelTestStatus,
   OAuthStart,
   ProviderCredential,
   RequestLogPage,
+  StartModelTestResult,
   TestModelResult,
   UpstreamModelList,
 } from "./types";
-import { isTauri, mockSnapshot, mockTestModel, mockUpstreamModels } from "./mock";
+import { isTauri, mockCancelModelTest, mockGetModelTestStatus, mockSnapshot, mockStartModelTest, mockTestModel, mockUpstreamModels } from "./mock";
 
 // In-memory snapshot used only when running in a plain browser (web:dev preview).
 let demo: AppSnapshot | null = null;
@@ -39,6 +43,38 @@ export const api = {
     }
     return invoke<AppSnapshot>("save_config", { config });
   },
+
+  regenerateLanApiKey: () => {
+    if (!isTauri) {
+      const prev = demoSnap();
+      demo = {
+        ...prev,
+        config: {
+          ...prev.config,
+          settings: {
+            ...prev.config.settings,
+            lan_api_key: `nr_demo_${Math.random().toString(36).slice(2)}`,
+          },
+        },
+      };
+      return Promise.resolve(demo);
+    }
+    return invoke<AppSnapshot>("regenerate_lan_api_key");
+  },
+
+  listLanModels: () =>
+    isTauri
+      ? invoke<LanModelList>("list_lan_models")
+      : Promise.resolve({
+          models: [
+            {
+              id: "gpt-5.5",
+              display_name: "GPT-5.5",
+              description: "LAN shared model",
+              context_window: 1_000_000,
+            },
+          ],
+        } as LanModelList),
 
   setProviderKey: (providerId: string, secret: string) => {
     if (!isTauri) {
@@ -180,6 +216,21 @@ export const api = {
     isTauri
       ? invoke<TestModelResult>("test_model", { model, providerId })
       : Promise.resolve(mockTestModel(model)),
+
+  startModelTest: (model: string, providerId: string | undefined, mode: ModelTestMode) =>
+    isTauri
+      ? invoke<StartModelTestResult>("start_model_test", { model, providerId, mode })
+      : Promise.resolve(mockStartModelTest(model, mode)),
+
+  getModelTestStatus: (testId: string) =>
+    isTauri
+      ? invoke<ModelTestStatus>("get_model_test_status", { testId })
+      : Promise.resolve(mockGetModelTestStatus(testId)),
+
+  cancelModelTest: (testId: string) =>
+    isTauri
+      ? invoke<ModelTestStatus>("cancel_model_test", { testId })
+      : Promise.resolve(mockCancelModelTest(testId)),
 
   listUpstreamModels: (providerId: string) =>
     isTauri

@@ -1,25 +1,63 @@
 use crate::{
     codex_alias,
-    types::{AppConfig, ModelEntry},
+    types::{AppConfig, ModelEntry, ProviderProtocol},
 };
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
 pub const CATALOG_FILE_NAME: &str = "neko-route.json";
+pub const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogModel {
+    pub slug: String,
+    pub display_name: String,
+    pub description: String,
+    pub context_window: u64,
+    pub reasoning_enabled: bool,
+    pub default_reasoning_level: String,
+    pub supported_reasoning_levels: Vec<String>,
+    pub provider_protocol: Option<ProviderProtocol>,
+}
+
+pub fn auto_compact_token_limit(context_window: u64) -> u64 {
+    context_window.saturating_mul(AUTO_COMPACT_THRESHOLD_PERCENT) / 100
+}
+
+pub fn auto_compact_token_limit_for_protocol(
+    context_window: u64,
+    _protocol: Option<&ProviderProtocol>,
+) -> u64 {
+    auto_compact_token_limit(context_window)
+}
 
 #[cfg(test)]
 pub fn catalog_json(config: &AppConfig) -> Value {
     catalog_json_for_models(config, None).unwrap()
 }
 
+#[cfg(test)]
 pub fn catalog_json_for_models(
     config: &AppConfig,
     allowed_model_ids: Option<&HashSet<String>>,
 ) -> Result<Value, String> {
+    let models = catalog_models_for_config(config, allowed_model_ids)?;
+    catalog_json_for_catalog_models(&models)
+}
+
+pub fn catalog_models_for_config(
+    config: &AppConfig,
+    allowed_model_ids: Option<&HashSet<String>>,
+) -> Result<Vec<CatalogModel>, String> {
+    let protocols = config
+        .providers
+        .iter()
+        .map(|provider| (provider.id.as_str(), provider.protocol.clone()))
+        .collect::<HashMap<_, _>>();
     let models = config
         .models
         .iter()
@@ -31,17 +69,26 @@ pub fn catalog_json_for_models(
         })
         .collect::<Vec<_>>();
     let slug_map = codex_alias::export_slug_map(config, &models)?;
-    let models = models
+    models
         .into_iter()
         .map(|model| {
             let slug = slug_map
                 .get(&model.id)
                 .ok_or_else(|| format!("Missing Codex catalog slug for model '{}'", model.id))?;
-            Ok(model_to_codex_json(model, slug))
+            Ok(catalog_model_from_entry(
+                model,
+                slug,
+                protocols.get(model.provider_id.as_str()).cloned(),
+            ))
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, String>>()
+}
 
-    Ok(json!({ "models": models }))
+pub fn catalog_json_for_catalog_models(models: &[CatalogModel]) -> Result<Value, String> {
+    validate_catalog_models(models)?;
+    Ok(json!({
+        "models": models.iter().map(catalog_model_to_codex_json).collect::<Vec<_>>()
+    }))
 }
 
 pub fn export_slug_for_model(
@@ -75,17 +122,52 @@ pub fn write_catalog_for_models(
     config: &AppConfig,
     allowed_model_ids: Option<&HashSet<String>>,
 ) -> Result<PathBuf, String> {
+    let models = catalog_models_for_config(config, allowed_model_ids)?;
+    write_catalog_models(codex_home, &models)
+}
+
+pub fn write_catalog_models(codex_home: &Path, models: &[CatalogModel]) -> Result<PathBuf, String> {
     let dir = codex_home.join("model-catalogs");
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let path = dir.join(CATALOG_FILE_NAME);
-    let content =
-        serde_json::to_string_pretty(&catalog_json_for_models(config, allowed_model_ids)?)
-            .map_err(|error| error.to_string())?;
+    let content = serde_json::to_string_pretty(&catalog_json_for_catalog_models(models)?)
+        .map_err(|error| error.to_string())?;
     fs::write(&path, content).map_err(|error| error.to_string())?;
     Ok(path)
 }
 
-fn model_to_codex_json(model: &ModelEntry, slug: &str) -> Value {
+fn validate_catalog_models(models: &[CatalogModel]) -> Result<(), String> {
+    let mut slugs = HashSet::new();
+    for model in models {
+        let slug = model.slug.trim();
+        if slug.is_empty() {
+            return Err("Codex catalog model slug cannot be empty".into());
+        }
+        if !slugs.insert(slug.to_string()) {
+            return Err(format!("Duplicate Codex catalog model slug '{slug}'"));
+        }
+    }
+    Ok(())
+}
+
+fn catalog_model_from_entry(
+    model: &ModelEntry,
+    slug: &str,
+    provider_protocol: Option<ProviderProtocol>,
+) -> CatalogModel {
+    CatalogModel {
+        slug: slug.to_string(),
+        display_name: model.display_name.clone(),
+        description: model.description.clone(),
+        context_window: model.context_window,
+        reasoning_enabled: model.reasoning_enabled,
+        default_reasoning_level: model.default_reasoning_level.clone(),
+        supported_reasoning_levels: model.supported_reasoning_levels.clone(),
+        provider_protocol,
+    }
+}
+
+fn catalog_model_to_codex_json(model: &CatalogModel) -> Value {
     let supported_reasoning_levels = model
         .supported_reasoning_levels
         .iter()
@@ -103,7 +185,7 @@ fn model_to_codex_json(model: &ModelEntry, slug: &str) -> Value {
     };
 
     json!({
-        "slug": slug,
+        "slug": model.slug,
         "display_name": model.display_name,
         "description": model.description,
         "default_reasoning_level": default_reasoning_level,
@@ -143,7 +225,10 @@ fn model_to_codex_json(model: &ModelEntry, slug: &str) -> Value {
         "input_modalities": ["text", "image"],
         "supports_search_tool": false,
         "use_responses_lite": false,
-        "auto_compact_token_limit": null
+        "auto_compact_token_limit": auto_compact_token_limit_for_protocol(
+            model.context_window,
+            model.provider_protocol.as_ref(),
+        )
     })
 }
 
@@ -216,6 +301,28 @@ mod tests {
             assert_eq!(model["max_context_window"], expected);
             assert_eq!(model["effective_context_window_percent"], 100);
         }
+    }
+
+    #[test]
+    fn catalog_exports_uniform_auto_compact_limit() {
+        let mut config = default_config();
+        config.models[0].context_window = 1_000_000;
+        config.models[1].context_window = 258_000;
+
+        let catalog = catalog_json(&config);
+        let models = catalog["models"].as_array().unwrap();
+
+        let gpt = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.5")
+            .unwrap();
+        let claude = models
+            .iter()
+            .find(|model| model["slug"] == "claude-opus-4-8")
+            .unwrap();
+
+        assert_eq!(gpt["auto_compact_token_limit"], 900_000);
+        assert_eq!(claude["auto_compact_token_limit"], 232_200);
     }
 
     #[test]

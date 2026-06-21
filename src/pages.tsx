@@ -40,13 +40,15 @@ import type {
   AppAction,
   AppSnapshot,
   CodexInjectionMode,
+  LanModelInfo,
+  ModelTestMode,
+  ModelTestStatus,
   ModelEntry,
   OfficialQuotaWindow,
   Provider,
   ProviderUsageStatus,
   ProviderProtocol,
   ReasoningEffort,
-  TestModelResult,
   TokenTotals,
 } from "./types";
 import {
@@ -100,6 +102,7 @@ export type PageProps = {
   appAction: AppAction | null;
   appVersion: string;
   updateStatus: UpdateStatus;
+  availableUpdateVersion: string | null;
   currentRelease: ReleaseNotes | null;
   currentReleaseLoading: boolean;
   currentReleaseError: string;
@@ -183,14 +186,154 @@ function latencyTone(ms: number) {
   return "bad";
 }
 
-const CODEX_RESERVED_MODEL_IDS = new Set([
-  "gpt-5.4-mini",
-  "gpt-5.4",
-  "gpt-5.3-codex",
-  "gpt-5.2-codex",
-  "gpt-5.2",
-  "gpt-4.1-mini",
-]);
+type RequestRecordView = AppSnapshot["requests"][number];
+
+function streamStateLabel(t: (key: MsgKey, vars?: Record<string, string | number>) => string, state: RequestRecordView["stream_state"]) {
+  switch (state) {
+    case "pending":
+      return t("stream.pending");
+    case "completed":
+      return t("stream.completed");
+    case "failed":
+      return t("stream.failed");
+    case "interrupted":
+      return t("stream.interrupted");
+    case "incomplete":
+      return t("stream.incomplete");
+    case "client_disconnected":
+      return t("stream.clientDisconnected");
+    default:
+      return "";
+  }
+}
+
+function streamStatusDisplay(
+  record: RequestRecordView,
+  t: (key: MsgKey, vars?: Record<string, string | number>) => string,
+) {
+  const streamLabel = streamStateLabel(t, record.stream_state);
+  const streamSize = formatBytes(record.stream_bytes);
+  const latency = formatLatency(record.latency_ms);
+  const title = [
+    `${record.latency_ms}ms`,
+    streamLabel || record.stream_state,
+    `${t("tokens.streamBytes")}: ${streamSize}`,
+    record.last_event,
+    record.stream_error,
+  ].filter(Boolean).join(" · ");
+
+  if (record.stream_state === "pending") {
+    return { label: streamSize, tone: "good", title };
+  }
+  if (record.stream_state === "failed") {
+    return { label: streamLabel, tone: "bad", title };
+  }
+  if (
+    record.stream_state === "interrupted" ||
+    record.stream_state === "incomplete" ||
+    record.stream_state === "client_disconnected"
+  ) {
+    return { label: streamLabel, tone: "bad", title };
+  }
+  return { label: latency, tone: latencyTone(record.latency_ms), title };
+}
+
+function requestDisplayModel(record: RequestRecordView) {
+  return record.model || record.requested_model || "—";
+}
+
+function requestErrorDetail(
+  record: RequestRecordView,
+  t: (key: MsgKey, vars?: Record<string, string | number>) => string,
+) {
+  const lines = [
+    `${t("table.status")}: ${record.status}`,
+    `${t("table.model")}: ${requestDisplayModel(record)}`,
+  ];
+  if (record.requested_model && record.requested_model !== record.model) {
+    lines.push(t("table.requestedModel", { model: record.requested_model }));
+  }
+  if (record.provider_name) {
+    lines.push(`${t("table.provider")}: ${record.provider_name}`);
+  }
+  if (record.provider_protocol) {
+    lines.push(`${t("table.protocol")}: ${t(protocolKey(record.provider_protocol))}`);
+  }
+  if (record.stream_state) {
+    lines.push(`${t("table.stream")}: ${streamStatusDisplay(record, t).label}`);
+  }
+  if (record.last_event) {
+    lines.push(`Last event: ${record.last_event}`);
+  }
+  if (record.stream_bytes > 0) {
+    lines.push(`${t("tokens.streamBytes")}: ${formatBytes(record.stream_bytes)}`);
+  }
+  if (record.context_bridge) {
+    const bridge = record.context_bridge;
+    lines.push(
+      "",
+      `${t("logs.contextBridge")}: ${bridge.strategy}`,
+      `${t("logs.contextBridgeOriginal")}: ${formatBytes(bridge.original_body_bytes)}`,
+      `${t("logs.contextBridgeFinal")}: ${formatBytes(bridge.final_body_bytes)}`,
+      `${t("logs.contextBridgeToolResults")}: ${bridge.archived_tool_results}/${bridge.tool_result_count} · ${formatBytes(bridge.archived_bytes)} / ${formatBytes(bridge.original_tool_result_bytes)}`,
+      `${t("logs.contextBridgeRecall")}: ${bridge.recalled_artifacts} · ${formatBytes(bridge.recalled_bytes)}`,
+      `${t("logs.contextBridgeCountTokens")}: ${
+        bridge.count_tokens_input_tokens
+          ? formatTokens(bridge.count_tokens_input_tokens)
+          : bridge.count_tokens_error || "—"
+      }`,
+      `${t("logs.contextBridgeRawPrecheck")}: ${
+        bridge.raw_precheck_input_tokens != null ? formatTokens(bridge.raw_precheck_input_tokens) : "—"
+      }`,
+      `${t("logs.contextBridgeFinalTokens")}: ${
+        bridge.final_input_tokens != null ? formatTokens(bridge.final_input_tokens) : "—"
+      }`,
+      `${t("logs.contextBridgeEstimatedTokens")}: ${
+        bridge.estimated_input_tokens != null ? formatTokens(bridge.estimated_input_tokens) : "—"
+      }`,
+      `${t("logs.contextBridgeEstimateSource")}: ${bridge.estimate_source || "—"} · ${
+        bridge.estimate_confidence || "—"
+      }`,
+      `${t("logs.contextBridgeProtection")}: ${bridge.protection_triggered ? "on" : "off"} · ${
+        bridge.compression_stage || "—"
+      }`,
+      `${t("logs.contextBridgeTarget")}: ${
+        bridge.target_input_tokens != null ? formatTokens(bridge.target_input_tokens) : "—"
+      }`,
+      `${t("logs.contextBridgePreviousPressure")}: ${
+        bridge.previous_success_input_tokens != null
+          ? `${formatTokens(bridge.previous_success_input_tokens)} · ${
+              bridge.previous_success_body_bytes != null ? formatBytes(bridge.previous_success_body_bytes) : "—"
+            }`
+          : "—"
+      }`,
+      `${t("logs.contextBridgeCompressionReason")}: ${bridge.compression_reason || "—"}`,
+      `${t("logs.contextBridgeProtectionFailure")}: ${bridge.protection_failure_reason || "—"}`,
+      `${t("logs.contextBridgeLastMessage")}: ${bridge.last_message_role || "—"} · ${
+        bridge.last_message_content_type || "—"
+      } · ${formatTokens(bridge.last_message_text_length)}`,
+      `${t("logs.contextBridgeLastPreview")}: ${
+        bridge.last_message_preview_head || "—"
+      }${bridge.last_message_preview_tail && bridge.last_message_preview_tail !== bridge.last_message_preview_head ? ` ... ${bridge.last_message_preview_tail}` : ""}`,
+      `${t("logs.contextBridgeSingleDot")}: user=${
+        bridge.single_dot_user_message ? "yes" : "no"
+      } · tool=${bridge.latest_tool_result_single_dot ? "yes" : "no"} · function_call_output=${
+        bridge.last_message_from_function_call_output ? "yes" : "no"
+      }`,
+      `${t("logs.contextBridgeLatestTool")}: ${bridge.latest_tool_result_count} · ${formatTokens(
+        bridge.latest_tool_result_text_length,
+      )}`,
+      `${t("logs.contextBridgeManagement")}: ${bridge.context_management ? "on" : "off"}`,
+    );
+  }
+  if (record.error) {
+    lines.push("", record.error);
+  }
+  if (record.stream_error && record.stream_error !== record.error) {
+    lines.push("", record.stream_error);
+  }
+  return lines.join("\n");
+}
 
 /* ============================================================
    About
@@ -200,6 +343,7 @@ export function About({
   notifyRaw,
   appVersion,
   updateStatus,
+  availableUpdateVersion,
   currentRelease,
   currentReleaseLoading,
   currentReleaseError,
@@ -266,6 +410,15 @@ export function About({
       url: "https://www.youtube.com/@zoefyx",
     },
   ];
+  const showUpdateBadge =
+    Boolean(availableUpdateVersion) &&
+    (updateStatus === "available" ||
+      updateStatus === "downloading" ||
+      updateStatus === "installing" ||
+      updateStatus === "restarting");
+  const versionBadgeLabel = showUpdateBadge
+    ? t("about.versionUpdateAvailable", { version: availableUpdateVersion ?? "" })
+    : t("about.versionLatest");
 
   return (
     <div className="about-page page-enter">
@@ -277,7 +430,10 @@ export function About({
             <div className="about-version">
               <span>{t("about.currentVersion")}</span>
               <strong>{appVersion}</strong>
-              <Pill tone="ok" label="Stable" />
+              <span className={`about-version-badge ${showUpdateBadge ? "available" : "latest"}`}>
+                <span />
+                {versionBadgeLabel}
+              </span>
             </div>
           </div>
         </div>
@@ -355,82 +511,116 @@ export function RequestTable({
   emptyHint?: MsgKey;
 }) {
   const { t } = useI18n();
+  const [errorRecord, setErrorRecord] = React.useState<RequestRecordView | null>(null);
+  const errorDetail = errorRecord ? requestErrorDetail(errorRecord, t) : "";
+  async function copyErrorDetail() {
+    if (!errorDetail) return;
+    try {
+      await navigator.clipboard.writeText(errorDetail);
+    } catch {
+      // Clipboard can be unavailable in some WebView contexts.
+    }
+  }
   if (requests.length === 0) {
     return <Empty icon={<Inbox size={26} />} title={t(emptyTitle)} hint={t(emptyHint)} />;
   }
   return (
-    <div className="table-scroll">
-      <div className="table">
-        <div className="thead cols-req">
-          <span>{t("table.time")}</span>
-          <span>{t("table.model")}</span>
-          <span>{t("table.providerProtocol")}</span>
-          <span>{t("table.reasoning")}</span>
-          <span>{t("table.tokens")}</span>
-          <span>{t("table.status")}</span>
-          <span className="req-stream-cell">{t("table.stream")}</span>
-        </div>
-        {requests.map((r) => {
-          const u = r.usage;
-          return (
-            <div className="trow cols-req" key={r.id}>
-              <span className="mono">{new Date(r.started_at).toLocaleTimeString()}</span>
-              <span className="model-cell">
-                <strong>{r.model || "—"}</strong>
-                {r.requested_model && r.requested_model !== r.model ? (
-                  <span className="model-alias mono">{t("table.requestedModel", { model: r.requested_model })}</span>
-                ) : null}
-              </span>
-              <span className="provider-protocol-cell">
-                <strong>{r.provider_name ?? "—"}</strong>
-                <span>{r.provider_protocol ? t(protocolKey(r.provider_protocol)) : "—"}</span>
-              </span>
-              <span>
-                {r.reasoning_effort ? (
-                  <span className="reasoning-cell">{REASONING_LABELS[r.reasoning_effort]}</span>
-                ) : (
-                  <span style={{ color: "var(--faint)" }}>—</span>
-                )}
-              </span>
-              <span>
-                {u.total_tokens > 0 ? (
-                  <span className="tok-cell">
-                    <strong>{formatTokens(u.total_tokens)}</strong>
-                    <span className="tok-mini">
-                      ↑{formatTokens(u.input_tokens)} ↓{formatTokens(u.output_tokens)}
-                      {u.cache_read_tokens + u.cache_write_tokens > 0
-                        ? ` ⚡${formatTokens(u.cache_read_tokens + u.cache_write_tokens)}`
-                        : ""}
-                    </span>
-                  </span>
-                ) : (
-                  <span style={{ color: "var(--faint)" }}>—</span>
-                )}
-              </span>
-              <span>
-                <span className={`status-chip ${r.status < 400 ? "good" : "bad"}`}>{r.status}</span>
-              </span>
-              <span className="req-stream-cell">
-                <span
-                  className={`latency-chip ${latencyTone(r.latency_ms)}`}
-                  title={[
-                    `${r.latency_ms}ms`,
-                    r.stream_state,
-                    r.stream_state === "pending" && r.stream_bytes > 0
-                      ? `${t("tokens.streamBytes")}: ${formatBytes(r.stream_bytes)}`
-                      : null,
-                    r.last_event,
-                    r.stream_error,
-                  ].filter(Boolean).join(" · ")}
-                >
-                  {formatLatency(r.latency_ms)}
+    <>
+      <div className="table-scroll">
+        <div className="table">
+          <div className="thead cols-req">
+            <span>{t("table.time")}</span>
+            <span>{t("table.model")}</span>
+            <span>{t("table.providerProtocol")}</span>
+            <span>{t("table.reasoning")}</span>
+            <span>{t("table.tokens")}</span>
+            <span>{t("table.status")}</span>
+            <span className="req-stream-cell">{t("table.stream")}</span>
+          </div>
+          {requests.map((r) => {
+            const u = r.usage;
+            const streamDisplay = streamStatusDisplay(r, t);
+            const hasErrorDetail = Boolean(r.error || r.stream_error);
+            return (
+              <div className="trow cols-req" key={r.id}>
+                <span className="mono">{new Date(r.started_at).toLocaleTimeString()}</span>
+                <span className="model-cell">
+                  <strong>{requestDisplayModel(r)}</strong>
+                  {r.requested_model && r.requested_model !== r.model ? (
+                    <span className="model-alias mono">{t("table.requestedModel", { model: r.requested_model })}</span>
+                  ) : null}
                 </span>
-              </span>
-            </div>
-          );
-        })}
+                <span className="provider-protocol-cell">
+                  <strong>{r.provider_name ?? "—"}</strong>
+                  <span>{r.provider_protocol ? t(protocolKey(r.provider_protocol)) : "—"}</span>
+                </span>
+                <span>
+                  {r.reasoning_effort ? (
+                    <span className="reasoning-cell">{REASONING_LABELS[r.reasoning_effort]}</span>
+                  ) : (
+                    <span style={{ color: "var(--faint)" }}>—</span>
+                  )}
+                </span>
+                <span>
+                  {u.total_tokens > 0 ? (
+                    <span className="tok-cell">
+                      <strong>{formatTokens(u.total_tokens)}</strong>
+                      <span className="tok-mini">
+                        ↑{formatTokens(u.input_tokens)} ↓{formatTokens(u.output_tokens)}
+                        {u.cache_read_tokens + u.cache_write_tokens > 0
+                          ? ` ⚡${formatTokens(u.cache_read_tokens + u.cache_write_tokens)}`
+                          : ""}
+                      </span>
+                    </span>
+                  ) : (
+                    <span style={{ color: "var(--faint)" }}>—</span>
+                  )}
+                </span>
+                <span>
+                  {hasErrorDetail ? (
+                    <button
+                      type="button"
+                      className="status-chip bad status-chip-button"
+                      onClick={() => setErrorRecord(r)}
+                      title={t("logs.errorDetail")}
+                    >
+                      {r.status}
+                    </button>
+                  ) : (
+                    <span className={`status-chip ${r.status < 400 ? "good" : "bad"}`}>{r.status}</span>
+                  )}
+                </span>
+                <span className="req-stream-cell">
+                  <span
+                    className={`latency-chip ${streamDisplay.tone}`}
+                    title={streamDisplay.title}
+                  >
+                    {streamDisplay.label}
+                  </span>
+                </span>
+              </div>
+            );
+          })}
+        </div>
       </div>
-    </div>
+      <Modal
+        open={Boolean(errorRecord)}
+        onClose={() => setErrorRecord(null)}
+        title={t("logs.errorDetail")}
+        sub={errorRecord ? `${errorRecord.status} · ${requestDisplayModel(errorRecord)}` : ""}
+        icon={<ListTree size={18} />}
+        color="sakura"
+        width={680}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setErrorRecord(null)}>{t("common.close")}</Button>
+            <Button variant="primary" icon={<Copy size={16} />} onClick={() => void copyErrorDetail()}>{t("about.copy")}</Button>
+          </>
+        }
+      >
+        <pre className="error-detail-box">{errorDetail || "—"}</pre>
+      </Modal>
+    </>
   );
 }
 
@@ -442,23 +632,32 @@ export function SettingsModal({
   onClose,
   config,
   commit,
+  refresh,
+  notify,
+  notifyRaw,
   busy,
 }: {
   open: boolean;
   onClose: () => void;
   config: AppConfig;
   commit: PageProps["commit"];
+  refresh: PageProps["refresh"];
+  notify: PageProps["notify"];
+  notifyRaw: PageProps["notifyRaw"];
   busy: boolean;
 }) {
   const { t } = useI18n();
   const [host, setHost] = React.useState(config.settings.bind_host);
   const [port, setPort] = React.useState(config.settings.port);
   const [allowLan, setAllowLan] = React.useState(config.settings.allow_lan);
+  const [lanKey, setLanKey] = React.useState(config.settings.lan_api_key);
+  const [regeneratingLanKey, setRegeneratingLanKey] = React.useState(false);
 
   useSeedOnOpen(open, () => {
     setHost(config.settings.bind_host);
     setPort(config.settings.port);
     setAllowLan(config.settings.allow_lan);
+    setLanKey(config.settings.lan_api_key);
   });
 
   async function submit() {
@@ -466,8 +665,33 @@ export function SettingsModal({
       d.settings.bind_host = host.trim();
       d.settings.port = Number(port);
       d.settings.allow_lan = allowLan;
+      d.settings.lan_api_key = lanKey.trim();
     });
     if (ok) onClose();
+  }
+
+  async function regenerateLanKey() {
+    setRegeneratingLanKey(true);
+    try {
+      const next = await api.regenerateLanApiKey();
+      setLanKey(next.config.settings.lan_api_key);
+      await refresh();
+      notify("toast.lanKeyRegenerated");
+    } catch (error) {
+      notifyRaw(String(error), "bad");
+    } finally {
+      setRegeneratingLanKey(false);
+    }
+  }
+
+  async function copyLanKey() {
+    await navigator.clipboard.writeText(lanKey);
+    notify("toast.copied");
+  }
+
+  function updateAllowLan(next: boolean) {
+    setAllowLan(next);
+    setHost(next ? "0.0.0.0" : "127.0.0.1");
   }
 
   return (
@@ -498,8 +722,23 @@ export function SettingsModal({
           <div className="mtr-title">{t("settings.allowLan")}</div>
           <div className="mtr-hint">{t("settings.allowLanHint")}</div>
         </div>
-        <Switch checked={allowLan} onChange={setAllowLan} />
+        <Switch checked={allowLan} onChange={updateAllowLan} />
       </div>
+      {allowLan && (
+        <Field label={t("settings.lanApiKey")}>
+          <div className="input-action-row">
+            <Input value={lanKey} onChange={(event) => setLanKey(event.target.value)} />
+            <IconButton title={t("about.copy")} icon={<Copy size={16} />} onClick={copyLanKey} />
+            <IconButton
+              title={t("settings.regenerateLanApiKey")}
+              icon={<RotateCcw size={16} className={regeneratingLanKey ? "spin" : ""} />}
+              onClick={regenerateLanKey}
+              disabled={regeneratingLanKey}
+            />
+          </div>
+          <div className="field-hint">{t("settings.lanApiKeyHint")}</div>
+        </Field>
+      )}
     </Modal>
   );
 }
@@ -607,6 +846,20 @@ const REASONING_LABELS: Record<ReasoningEffort, string> = {
   max: "Max",
 };
 
+const MODEL_CONTEXT_WINDOWS = [128_000, 200_000, 258_000, 400_000, 1_000_000] as const;
+const DEFAULT_MODEL_CONTEXT_WINDOW = 258_000;
+const MODEL_CONTEXT_OPTIONS: Option[] = MODEL_CONTEXT_WINDOWS.map((value) => ({
+  value: String(value),
+  label: formatContext(value),
+  tone: value >= 1_000_000 ? "bad" : value >= 400_000 ? "warn" : "ok",
+}));
+
+function normalizeModelContextWindow(value: number) {
+  return MODEL_CONTEXT_WINDOWS.includes(value as (typeof MODEL_CONTEXT_WINDOWS)[number])
+    ? value
+    : DEFAULT_MODEL_CONTEXT_WINDOW;
+}
+
 function providerReasoningDefaults(provider: Provider | undefined) {
   return reasoningDefaultsForProtocol(provider?.protocol ?? "open_ai_responses");
 }
@@ -627,7 +880,7 @@ function EMPTY_MODEL(provider: Provider | undefined): ModelEntry {
     id: "",
     display_name: "",
     description: "",
-    context_window: 258000,
+    context_window: DEFAULT_MODEL_CONTEXT_WINDOW,
     enabled: true,
     provider_id: provider?.id ?? "",
     upstream_model: null,
@@ -677,8 +930,13 @@ function ModelModal({
   const fetchToken = React.useRef(0);
 
   useSeedOnOpen(open, () => {
-    if (isEdit && editIndex !== null) setDraft(structuredClone(config.models[editIndex]));
-    else setDraft(EMPTY_MODEL(config.providers[0]));
+    if (isEdit && editIndex !== null) {
+      const model = structuredClone(config.models[editIndex]);
+      model.context_window = normalizeModelContextWindow(model.context_window);
+      setDraft(model);
+    } else {
+      setDraft(EMPTY_MODEL(config.providers[0]));
+    }
   });
 
   // Fetch the selected provider's model catalog whenever it changes.
@@ -717,12 +975,12 @@ function ModelModal({
   const selectedProvider = config.providers.find((p) => p.id === draft.provider_id);
   const protocolDefaults = providerReasoningDefaults(selectedProvider);
   const draftModelId = modelIdKey(draft.id);
-  const usesReservedCodexModelId = CODEX_RESERVED_MODEL_IDS.has(draftModelId);
   const duplicateModels = config.models.filter((model, index) => {
     if (isEdit && editIndex === index) return false;
     return sameModelId(model.id, draftModelId);
   });
   const hasDuplicateModelId = duplicateModels.length > 0;
+  const showContextPressureHint = normalizeModelContextWindow(draft.context_window) >= 400_000;
 
   function setProvider(providerId: string) {
     const provider = config.providers.find((p) => p.id === providerId);
@@ -744,6 +1002,7 @@ function ModelModal({
       ...draft,
       id: draftModelId,
       display_name: draft.display_name.trim() || draftModelId,
+      context_window: normalizeModelContextWindow(draft.context_window),
       upstream_model: draft.upstream_model?.trim() || null,
       ...runtimeDefaults,
     };
@@ -808,8 +1067,6 @@ function ModelModal({
           <Input value={draft.display_name} placeholder="GPT-5.5" onChange={(e) => patch({ display_name: e.target.value })} />
         </Field>
       </div>
-      {usesReservedCodexModelId ? <div className="reserved-model-warning">{t("model.reservedCodexId")}</div> : null}
-      {hasDuplicateModelId ? <div className="inline-warning">{isEdit ? t("model.duplicateEditHint") : t("model.duplicateAddHint")}</div> : null}
       <Field label={t("model.provider")}>
         <Dropdown value={draft.provider_id} options={providerOptions} onChange={setProvider} />
       </Field>
@@ -836,8 +1093,13 @@ function ModelModal({
         ) : null}
       </Field>
       <Field label={t("model.context")}>
-        <Input type="number" value={draft.context_window} onChange={(e) => patch({ context_window: Number(e.target.value) })} />
+        <Dropdown
+          value={String(normalizeModelContextWindow(draft.context_window))}
+          options={MODEL_CONTEXT_OPTIONS}
+          onChange={(value) => patch({ context_window: Number(value) })}
+        />
       </Field>
+      {showContextPressureHint ? <div className="inline-info">{t("model.contextPressureHint")}</div> : null}
       <Field label={t("model.description")}>
         <Input value={draft.description} onChange={(e) => patch({ description: e.target.value })} />
       </Field>
@@ -852,19 +1114,44 @@ function ModelModal({
 /* ============================================================
    Test result modal
    ============================================================ */
+const MODEL_TEST_OPTIONS: { value: ModelTestMode; key: MsgKey }[] = [
+  { value: "connectivity", key: "test.modeConnectivity" },
+  { value: "context_400k", key: "test.mode400k" },
+  { value: "context_1m", key: "test.mode1m" },
+];
+
 function TestModal({
   open,
   onClose,
   model,
-  state,
+  mode,
+  onModeChange,
+  onStart,
+  onCancel,
+  starting,
+  status,
 }: {
   open: boolean;
   onClose: () => void;
   model: string;
-  state: { loading: boolean; result: TestModelResult | null };
+  mode: ModelTestMode;
+  onModeChange: (mode: ModelTestMode) => void;
+  onStart: () => void;
+  onCancel: () => void;
+  starting: boolean;
+  status: ModelTestStatus | null;
 }) {
   const { t } = useI18n();
-  const r = state.result;
+  const running = starting || status?.state === "running";
+  const r = status?.result ?? null;
+  const targetLabel = status?.mode === "context_1m" ? "1M" : status?.mode === "context_400k" ? "400K" : "";
+  const progress = status?.target_tokens
+    ? Math.max(0, Math.min(100, (status.confirmed_tokens / status.pass_threshold_tokens) * 100))
+    : 0;
+  const modeOptions: Option[] = MODEL_TEST_OPTIONS.map((option) => ({
+    value: option.value,
+    label: t(option.key),
+  }));
   return (
     <Modal
       open={open}
@@ -873,52 +1160,120 @@ function TestModal({
       sub={model}
       icon={<Play size={18} />}
       color="sky"
-      width={460}
-      footer={<Button variant="ghost" onClick={onClose}>{t("common.close")}</Button>}
+      width={540}
+      footer={
+        <>
+          {running ? (
+            <Button variant="ghost" onClick={onCancel}>{t("common.cancel")}</Button>
+          ) : (
+            <Button variant="ghost" onClick={onClose}>{t("common.close")}</Button>
+          )}
+          <Button variant="primary" icon={<Play size={16} />} onClick={onStart} loading={starting} disabled={running}>
+            {t("test.start")}
+          </Button>
+        </>
+      }
     >
-      {state.loading ? (
-        <div className="test-loading">
-          <span className="test-spinner" />
-          <p>{t("test.sending", { model })}</p>
-        </div>
-      ) : r ? (
-        r.ok ? (
-          <div className="stack">
+      <div className="stack">
+        <Field label={t("test.mode")}>
+          <Dropdown value={mode} options={modeOptions} onChange={(value) => onModeChange(value as ModelTestMode)} />
+        </Field>
+
+        {running ? (
+          <div className="test-loading compact">
+            <span className="test-spinner" />
+            <p>{status?.stage === "connectivity" ? t("test.stageConnectivity") : t("test.stageProbe")}</p>
+          </div>
+        ) : null}
+
+        {status && status.mode !== "connectivity" ? (
+          <div className="test-progress-box">
+            <div className="test-progress-grid">
+              <TestMetric label={t("test.currentContext")} value={formatContext(status.current_tokens)} muted={status.current_estimated ? t("test.estimated") : ""} />
+              <TestMetric label={t("test.confirmedContext")} value={formatContext(status.confirmed_tokens)} muted={status.confirmed_estimated ? t("test.estimated") : ""} />
+              <TestMetric label={t("test.targetContext")} value={targetLabel || "-"} />
+              <TestMetric label={t("test.stage")} value={testStageLabel(t, status.stage)} />
+            </div>
+            {status.target_tokens ? (
+              <div className="about-progress test-progress-bar">
+                <span style={{ width: `${progress}%` }} />
+              </div>
+            ) : null}
+          </div>
+        ) : !status ? (
+          <div className="test-idle">{t("test.pickMode")}</div>
+        ) : null}
+
+        {status?.state === "completed" || status?.state === "cancelled" ? (
+          <div className={`test-summary ${status.supported ? "ok" : status.inconclusive ? "warn" : "bad"}`}>
+            {testSummary(t, status)}
+          </div>
+        ) : null}
+
+        {status?.last_error ? (
+          <div className="inline-warning">{t("test.lastError", { error: status.last_error })}</div>
+        ) : null}
+
+        {r?.ok ? (
+          <>
             <div className="test-reply">
               <div className="test-reply-label">{t("test.reply")} · {t("test.via", { provider: r.provider_name })}</div>
               <p>{r.reply || t("test.noReply")}</p>
             </div>
-            <div className="test-meta">
-              <Pill tone="ok" label={`${r.status}`} />
-              <span className="mono">{r.latency_ms}ms</span>
-            </div>
-            {r.usage.total_tokens > 0 ? (
-              <div className="test-tokens">
-                <TokenChip label={t("tokens.input")} value={r.usage.input_tokens} />
-                <TokenChip label={t("tokens.output")} value={r.usage.output_tokens} />
-                <TokenChip label={t("tokens.total")} value={r.usage.total_tokens} accent />
-              </div>
-            ) : null}
-          </div>
-        ) : (
+          </>
+        ) : r ? (
           <div className="test-fail">
             <div className="test-fail-icon">!</div>
             <strong>{t("test.failed")}</strong>
             <p>{r.error === "needs_codex_auth" ? t("test.needsAuth") : r.error}</p>
           </div>
-        )
-      ) : null}
+        ) : null}
+      </div>
     </Modal>
   );
 }
 
-function TokenChip({ label, value, accent }: { label: string; value: number; accent?: boolean }) {
+function TestMetric({ label, value, muted }: { label: string; value: string; muted?: string }) {
   return (
-    <div className={`token-chip ${accent ? "accent" : ""}`}>
-      <span className="tc-label">{label}</span>
-      <strong>{formatTokens(value)}</strong>
+    <div className="test-metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      {muted ? <em>{muted}</em> : null}
     </div>
   );
+}
+
+function testStageLabel(t: (key: MsgKey, vars?: Record<string, string | number>) => string, stage: string) {
+  switch (stage) {
+    case "queued":
+      return t("test.stageQueued");
+    case "connectivity":
+      return t("test.stageConnectivity");
+    case "probe":
+      return t("test.stageProbe");
+    case "done":
+      return t("test.stageDone");
+    case "cancelled":
+      return t("test.stageCancelled");
+    default:
+      return stage;
+  }
+}
+
+function testSummary(t: (key: MsgKey, vars?: Record<string, string | number>) => string, status: ModelTestStatus) {
+  if (status.state === "cancelled") return t("test.cancelled");
+  if (status.mode === "connectivity") {
+    return status.result?.ok ? t("test.connectivityOk") : t("test.failed");
+  }
+  if (status.inconclusive) {
+    return t("test.inconclusive", { error: status.last_error || status.summary || "" });
+  }
+  if (status.supported) {
+    return status.mode === "context_1m" ? t("test.supported1m") : t("test.supported400k");
+  }
+  return status.mode === "context_1m"
+    ? t("test.notReached1m", { tokens: formatContext(status.confirmed_tokens) })
+    : t("test.notReached400k", { tokens: formatContext(status.confirmed_tokens) });
 }
 
 type DisplayModel = {
@@ -945,8 +1300,11 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
   const [modalOpen, setModalOpen] = React.useState(false);
   const [editIndex, setEditIndex] = React.useState<number | null>(null);
   const [deleteIndex, setDeleteIndex] = React.useState<number | null>(null);
-  const [testModal, setTestModal] = React.useState<{ open: boolean; model: string }>({ open: false, model: "" });
-  const [testState, setTestState] = React.useState<{ loading: boolean; result: TestModelResult | null }>({ loading: false, result: null });
+  const [testModal, setTestModal] = React.useState<{ open: boolean; model: string; providerId: string }>({ open: false, model: "", providerId: "" });
+  const [testMode, setTestMode] = React.useState<ModelTestMode>("connectivity");
+  const [testStarting, setTestStarting] = React.useState(false);
+  const [testStatus, setTestStatus] = React.useState<ModelTestStatus | null>(null);
+  const [activeTestId, setActiveTestId] = React.useState<string | null>(null);
   const [dragIndex, setDragIndex] = React.useState<number | null>(null);
   const [dragOverIndex, setDragOverIndex] = React.useState<number | null>(null);
   const [dragPointer, setDragPointer] = React.useState<{ x: number; y: number } | null>(null);
@@ -1105,19 +1463,72 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
   }
 
   async function runTest(modelId: string, providerId: string) {
-    setTestModal({ open: true, model: modelId });
-    setTestState({ loading: true, result: null });
+    setTestModal({ open: true, model: modelId, providerId });
+    setTestStatus(null);
+    setActiveTestId(null);
+  }
+
+  async function startSelectedTest() {
+    if (!testModal.model) return;
+    setTestStarting(true);
+    setTestStatus(null);
     try {
-      const result = await api.testModel(modelId, providerId);
-      setTestState({ loading: false, result });
+      const result = await api.startModelTest(testModal.model, testModal.providerId, testMode);
+      setActiveTestId(result.test_id);
+      const status = await api.getModelTestStatus(result.test_id);
+      setTestStatus(status);
     } catch (error) {
       notifyRaw(String(error), "bad");
-      setTestState({
-        loading: false,
-        result: { ok: false, status: 0, latency_ms: 0, reply: "", error: String(error), usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 0 }, provider_name: "" },
-      });
+    } finally {
+      setTestStarting(false);
     }
   }
+
+  async function cancelSelectedTest() {
+    if (!activeTestId) return;
+    try {
+      const status = await api.cancelModelTest(activeTestId);
+      setTestStatus(status);
+      setActiveTestId(null);
+    } catch (error) {
+      notifyRaw(String(error), "bad");
+    }
+  }
+
+  async function closeTestModal() {
+    if (testStatus?.state === "running" && activeTestId) {
+      await cancelSelectedTest();
+    }
+    setTestModal({ open: false, model: "", providerId: "" });
+    setTestStatus(null);
+    setActiveTestId(null);
+  }
+
+  React.useEffect(() => {
+    if (!activeTestId || !testModal.open) return;
+    let stopped = false;
+    const poll = async () => {
+      try {
+        const status = await api.getModelTestStatus(activeTestId);
+        if (stopped) return;
+        setTestStatus(status);
+        if (status.state !== "running") {
+          setActiveTestId(null);
+        }
+      } catch (error) {
+        if (!stopped) {
+          notifyRaw(String(error), "bad");
+          setActiveTestId(null);
+        }
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [activeTestId, notifyRaw, testModal.open]);
 
   const modelTokens = (id: string) =>
     snapshot.stats.by_model.find((m) => m.model === id)?.total_tokens ?? 0;
@@ -1142,7 +1553,6 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
             const ident = prov ? providerIcon(prov) : { icon: <CustomProviderIcon size={20} />, cls: "custom" };
             const tokens = modelTokens(model.id);
             const modelStats = duplicateModelStats.get(modelIdKey(model.id));
-            const hasDuplicateId = (modelStats?.total ?? 0) > 1;
             const hasEnabledConflict = model.enabled && (modelStats?.enabled ?? 0) > 1;
             const dragVisualIndex = dragIndex === null ? null : displayPositionByIndex.get(dragIndex) ?? null;
             const dragOverVisualIndex = dragOverIndex === null ? null : displayPositionByIndex.get(dragOverIndex) ?? null;
@@ -1201,10 +1611,8 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
                     <strong>{model.display_name || t("models.empty")}</strong>
                     <span className="entity-sub mono">{model.id}</span>
                     <span className="entity-note">{prov?.name ?? "—"}</span>
-                    {hasDuplicateId ? (
-                      <span className={`entity-note ${hasEnabledConflict ? "warn" : ""}`}>
-                        {hasEnabledConflict ? t("model.duplicateEnabledConflict") : t("model.duplicateIdHint")}
-                      </span>
+                    {hasEnabledConflict ? (
+                      <span className="entity-note warn">{t("model.duplicateEnabledConflict")}</span>
                     ) : null}
                   </div>
                 </div>
@@ -1242,7 +1650,17 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
       )}
 
       <ModelModal open={modalOpen} onClose={() => setModalOpen(false)} config={config} editIndex={editIndex} commit={commit} notifyRaw={notifyRaw} busy={busy} />
-      <TestModal open={testModal.open} onClose={() => setTestModal({ open: false, model: "" })} model={testModal.model} state={testState} />
+      <TestModal
+        open={testModal.open}
+        onClose={() => void closeTestModal()}
+        model={testModal.model}
+        mode={testMode}
+        onModeChange={setTestMode}
+        onStart={() => void startSelectedTest()}
+        onCancel={() => void cancelSelectedTest()}
+        starting={testStarting}
+        status={testStatus}
+      />
       <ConfirmDialog
         open={deleteIndex !== null}
         onClose={() => setDeleteIndex(null)}
@@ -1746,7 +2164,7 @@ function ProviderModal({
             <Dropdown value={protocol} options={protoOptions} onChange={(v) => setProtocol(v as ProviderProtocol)} />
           </Field>
           <Field label={t("provider.apiAddress")}>
-            <Input value={baseUrl} placeholder="https://api.example.com/v1" onChange={(e) => setBaseUrl(e.target.value)} />
+            <Input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
           </Field>
         </>
       )}
@@ -2359,12 +2777,34 @@ function validCodexSettingModel(current: string | null | undefined, selectable: 
   return selectable[0]?.id ?? "";
 }
 
+function validCodexOption(current: string | null | undefined, options: Option[]) {
+  const selected = current?.trim() ?? "";
+  if (selected && options.some((option) => option.value === selected)) return selected;
+  return options[0]?.value ?? "";
+}
+
+function lanModelOption(model: LanModelInfo): Option {
+  return {
+    value: model.id,
+    label: model.display_name || model.id,
+    sub: `${model.id} · ${formatContext(model.context_window)}`,
+  };
+}
+
 export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyRaw, setBusy, busy }: PageProps) {
   const { t } = useI18n();
   const mode = config.settings.codex_injection_mode ?? "official_account";
-  const selectable = config.models.filter((model) => modelAvailableForCodexMode(model, config, snapshot, mode));
-  const defaultModel = validCodexSettingModel(config.settings.codex_default_model, selectable);
+  const lanMode = mode === "lan_share";
+  const selectable = lanMode
+    ? []
+    : config.models.filter((model) => modelAvailableForCodexMode(model, config, snapshot, mode));
   const autoInject = config.settings.auto_inject;
+  const [lanHost, setLanHost] = React.useState(config.settings.lan_remote_host);
+  const [lanPort, setLanPort] = React.useState(config.settings.lan_remote_port);
+  const [lanRemoteKey, setLanRemoteKey] = React.useState(config.settings.lan_remote_api_key);
+  const [lanModels, setLanModels] = React.useState<LanModelInfo[]>([]);
+  const [lanModelsLoading, setLanModelsLoading] = React.useState(false);
+  const [lanSettingsSaving, setLanSettingsSaving] = React.useState(false);
   const [importOpen, setImportOpen] = React.useState(false);
   const [importing, setImporting] = React.useState(false);
   const [configText, setConfigText] = React.useState("");
@@ -2388,6 +2828,43 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
     loadCodexConfig();
   }, [loadCodexConfig]);
 
+  React.useEffect(() => {
+    setLanHost(config.settings.lan_remote_host);
+    setLanPort(config.settings.lan_remote_port);
+    setLanRemoteKey(config.settings.lan_remote_api_key);
+  }, [
+    config.settings.lan_remote_api_key,
+    config.settings.lan_remote_host,
+    config.settings.lan_remote_port,
+  ]);
+
+  const lanConfigured = Boolean(
+    config.settings.lan_remote_host.trim() &&
+      config.settings.lan_remote_port > 0 &&
+      config.settings.lan_remote_api_key.trim(),
+  );
+
+  const loadLanModels = React.useCallback(async () => {
+    if (!lanMode || !lanConfigured) {
+      setLanModels([]);
+      return;
+    }
+    setLanModelsLoading(true);
+    try {
+      const result = await api.listLanModels();
+      setLanModels(result.models);
+    } catch (error) {
+      setLanModels([]);
+      notifyRaw(String(error), "bad");
+    } finally {
+      setLanModelsLoading(false);
+    }
+  }, [lanConfigured, lanMode, notifyRaw]);
+
+  React.useEffect(() => {
+    void loadLanModels();
+  }, [loadLanModels]);
+
   async function setDefaultModel(id: string) {
     await commit((d) => {
       d.settings.codex_default_model = id || null;
@@ -2406,14 +2883,37 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
     }, v ? "toast.autoInjectOn" : "toast.autoInjectOff");
   }
   async function setMode(next: CodexInjectionMode) {
-    const nextSelectable = config.models.filter((model) => modelAvailableForCodexMode(model, config, snapshot, next));
-    const nextDefault = validCodexSettingModel(config.settings.codex_default_model, nextSelectable);
-    const nextFallback = validCodexSettingModel(config.settings.fallback_model, nextSelectable);
+    const nextSelectable = next === "lan_share"
+      ? []
+      : config.models.filter((model) => modelAvailableForCodexMode(model, config, snapshot, next));
+    const nextDefault = next === "lan_share"
+      ? ""
+      : validCodexSettingModel(config.settings.codex_default_model, nextSelectable);
+    const nextFallback = next === "lan_share"
+      ? ""
+      : validCodexSettingModel(config.settings.fallback_model, nextSelectable);
     await commit((d) => {
       d.settings.codex_injection_mode = next;
       d.settings.codex_default_model = nextDefault || null;
       d.settings.fallback_model = nextFallback || null;
     });
+  }
+
+  async function saveLanSettings() {
+    setLanSettingsSaving(true);
+    try {
+      const ok = await commit((d) => {
+        d.settings.lan_remote_host = lanHost.trim();
+        d.settings.lan_remote_port = Number(lanPort);
+        d.settings.lan_remote_api_key = lanRemoteKey.trim();
+      });
+      if (ok) {
+        notify("toast.saved");
+        await refresh();
+      }
+    } finally {
+      setLanSettingsSaving(false);
+    }
   }
 
   async function saveCodexConfig() {
@@ -2482,9 +2982,18 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
     }
   }
 
-  const modelOptions = selectable.map((m) => ({ value: m.id, label: m.display_name, sub: m.id }));
-  const fallbackOptions = selectable.map((m) => ({ value: m.id, label: m.display_name || m.id, sub: m.id }));
-  const fallback = validCodexSettingModel(config.settings.fallback_model, selectable);
+  const modelOptions = lanMode
+    ? lanModels.map(lanModelOption)
+    : selectable.map((m) => ({ value: m.id, label: m.display_name, sub: m.id }));
+  const fallbackOptions = lanMode
+    ? lanModels.map(lanModelOption)
+    : selectable.map((m) => ({ value: m.id, label: m.display_name || m.id, sub: m.id }));
+  const defaultModel = lanMode
+    ? validCodexOption(config.settings.codex_default_model, modelOptions)
+    : validCodexSettingModel(config.settings.codex_default_model, selectable);
+  const fallback = lanMode
+    ? validCodexOption(config.settings.fallback_model, fallbackOptions)
+    : validCodexSettingModel(config.settings.fallback_model, selectable);
   React.useEffect(() => {
     if (!defaultModel && !fallback) return;
     const shouldFixDefault = Boolean(defaultModel) && config.settings.codex_default_model !== defaultModel;
@@ -2501,17 +3010,47 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
       <Panel title={t("nav.setup")} sub={t("setup.sub")} icon={<FileJson size={18} />} color="lav">
         <Field label={t("setup.mode")}>
           <div className="segmented setup-mode">
-            {(["official_account", "third_party_api"] as CodexInjectionMode[]).map((item) => (
+            {(["official_account", "third_party_api", "lan_share"] as CodexInjectionMode[]).map((item) => (
               <button
                 key={item}
                 className={`seg ${mode === item ? "active" : ""}`}
                 onClick={() => setMode(item)}
               >
-                {t(item === "official_account" ? "setup.modeOfficial" : "setup.modeThirdParty")}
+                {t(
+                  item === "official_account"
+                    ? "setup.modeOfficial"
+                    : item === "third_party_api"
+                      ? "setup.modeThirdParty"
+                      : "setup.modeLanShare",
+                )}
               </button>
             ))}
           </div>
         </Field>
+        {lanMode && (
+          <div className="lan-share-box">
+            <div className="grid grid-2">
+              <Field label={t("setup.lanHost")}>
+                <Input value={lanHost} onChange={(event) => setLanHost(event.target.value)} placeholder="192.168.1.20" />
+              </Field>
+              <Field label={t("setup.lanPort")}>
+                <Input type="number" value={lanPort} onChange={(event) => setLanPort(Number(event.target.value))} />
+              </Field>
+            </div>
+            <Field label={t("setup.lanApiKey")}>
+              <Input value={lanRemoteKey} onChange={(event) => setLanRemoteKey(event.target.value)} />
+              <div className="field-hint">{t("setup.lanShareHint")}</div>
+            </Field>
+            <div className="row wrap">
+              <Button variant="primary" icon={<ShieldCheck size={16} />} onClick={saveLanSettings} loading={lanSettingsSaving}>
+                {t("setup.saveLanShare")}
+              </Button>
+              <Button variant="ghost" icon={<RotateCcw size={16} />} onClick={loadLanModels} loading={lanModelsLoading} disabled={!lanConfigured}>
+                {t("setup.refreshLanModels")}
+              </Button>
+            </div>
+          </div>
+        )}
         <div className="grid grid-2" style={{ marginBottom: 16 }}>
           <Field label={t("setup.defaultModel")}>
             <Dropdown value={defaultModel} options={modelOptions} onChange={setDefaultModel} />

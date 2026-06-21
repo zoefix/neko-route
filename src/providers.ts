@@ -54,7 +54,7 @@ export function newCustomProvider(): Provider {
     name: "Custom Provider",
     kind: "custom",
     protocol: "open_ai_responses",
-    base_url: "https://api.example.com/v1",
+    base_url: "",
     key_ref: `provider:${id}`,
   };
 }

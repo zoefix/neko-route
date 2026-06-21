@@ -66,20 +66,22 @@ const NAV: NavItem[] = [
   { page: "about", label: "nav.about", icon: InfoCircle },
 ];
 
+function navForMode(mode: AppConfig["settings"]["codex_injection_mode"]) {
+  if (mode !== "lan_share") return NAV;
+  return NAV.filter((item) => item.page !== "models" && item.page !== "keys");
+}
+
 type Toast = { id: number; msg: string; tone: "ok" | "bad" };
 const CODEX_RESTART_CONFIRMED_KEY = "neko-route.codex-restart-confirmed";
 
 function AppTitlebar() {
   const isMac = typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
-  const isLinux =
-    typeof navigator !== "undefined" &&
-    (/linux/i.test(navigator.platform) || /linux/i.test(navigator.userAgent));
   const appWindow = React.useMemo(() => (isTauriRuntime() ? getCurrentWindow() : null), []);
   const [maximized, setMaximized] = React.useState(false);
 
   React.useEffect(() => {
-    document.documentElement.dataset.nativeTitlebar = isLinux ? "true" : "false";
-  }, [isLinux]);
+    document.documentElement.dataset.nativeTitlebar = "false";
+  }, []);
 
   const refreshMaximized = React.useCallback(() => {
     appWindow?.isMaximized().then(setMaximized).catch(() => undefined);
@@ -112,8 +114,6 @@ function AppTitlebar() {
       </button>
     </div>
   );
-
-  if (isLinux) return null;
 
   return (
     <div className={`app-titlebar ${isMac ? "mac" : "standard"}`}>
@@ -389,17 +389,31 @@ function App() {
   }, [page, refresh, snapshot?.requests]);
 
   React.useEffect(() => {
+    if (config?.settings.codex_injection_mode === "lan_share" && (page === "models" || page === "keys")) {
+      setPage("wizard");
+    }
+  }, [config?.settings.codex_injection_mode, page]);
+
+  React.useEffect(() => {
     if (typeof (window as any).__TAURI_INTERNALS__ === "undefined") return;
     let unlistenProvider: (() => void) | undefined;
     let unlistenModel: (() => void) | undefined;
     listen("neko-route://add-provider", () => {
-      setPage("keys");
+      if (config?.settings.codex_injection_mode === "lan_share") {
+        setPage("wizard");
+        return;
+      }
+      setPage((current) => (current === "keys" ? current : "keys"));
       setAppAction({ type: "add-provider", nonce: Date.now() + Math.random() });
     }).then((dispose) => {
       unlistenProvider = dispose;
     }).catch(() => undefined);
     listen("neko-route://add-model", () => {
-      setPage("models");
+      if (config?.settings.codex_injection_mode === "lan_share") {
+        setPage("wizard");
+        return;
+      }
+      setPage((current) => (current === "models" ? current : "models"));
       setAppAction({ type: "add-model", nonce: Date.now() + Math.random() });
     }).then((dispose) => {
       unlistenModel = dispose;
@@ -408,7 +422,7 @@ function App() {
       unlistenProvider?.();
       unlistenModel?.();
     };
-  }, []);
+  }, [config?.settings.codex_injection_mode]);
 
   const commit = React.useCallback<PageProps["commit"]>(
     async (updater, toastKey) => {
@@ -458,12 +472,14 @@ function App() {
     appAction,
     appVersion,
     updateStatus,
+    availableUpdateVersion: availableUpdate?.version ?? null,
     currentRelease,
     currentReleaseLoading,
     currentReleaseError,
     checkForUpdate,
   };
-  const active = NAV.find((n) => n.page === page)!;
+  const navItems = navForMode(config.settings.codex_injection_mode);
+  const active = navItems.find((n) => n.page === page) ?? NAV.find((n) => n.page === page) ?? navItems[0];
   const badges: Partial<Record<Page, number>> = {
     models: config.models.length,
     keys: config.providers.length,
@@ -485,7 +501,7 @@ function App() {
           </div>
 
           <nav className="nav">
-            {NAV.map((item) => {
+            {navItems.map((item) => {
               const Icon = item.icon;
               const badge = badges[item.page];
               return (
@@ -547,6 +563,9 @@ function App() {
         onClose={() => setSettingsOpen(false)}
         config={config}
         commit={commit}
+        refresh={refresh}
+        notify={notify}
+        notifyRaw={notifyRaw}
         busy={busy}
       />
       <UpdateDialog

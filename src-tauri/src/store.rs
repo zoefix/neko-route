@@ -2,12 +2,12 @@ use crate::codex_alias;
 use crate::key_store::KeyStore;
 use crate::request_log::RequestLog;
 use crate::types::{
-    default_config, reasoning_defaults_for_protocol, AppConfig, AppSnapshot, CodexInjectionMode,
-    KeyStatus, OfficialAccountQuota, Provider, ProviderKind, ProviderLocalUsage,
-    ProviderUsageStatus, RequestLogPage, RequestRecord, ServerStatus, Settings, TokenStats,
-    TokenUsage,
+    default_config, reasoning_defaults_for_protocol, AppConfig, AppSnapshot,
+    ClaudeContextPressureSample, CodexInjectionMode, ContextArtifact, KeyStatus,
+    OfficialAccountQuota, Provider, ProviderKind, ProviderLocalUsage, ProviderUsageStatus,
+    RequestLogPage, RequestRecord, ServerStatus, Settings, TokenStats, TokenUsage,
 };
-use crate::{catalog, claude_auth, official_auth};
+use crate::{catalog, claude_auth, lan_share, official_auth};
 use serde_json::to_string_pretty;
 use std::{
     collections::{HashMap, HashSet},
@@ -18,7 +18,7 @@ use std::{
 };
 use tokio::sync::RwLock;
 
-const CURRENT_CONFIG_VERSION: u32 = 10;
+const CURRENT_CONFIG_VERSION: u32 = 11;
 const DASHBOARD_RECENT_REQUESTS: usize = 6;
 
 #[derive(Clone)]
@@ -80,10 +80,16 @@ impl AppStore {
 
     pub async fn replace_config(&self, config: AppConfig) -> Result<(), String> {
         let previous = self.config().await;
-        let config = normalize_config(config);
+        let mut config = normalize_config(config);
         validate_bind_settings(&config)?;
         validate_provider_urls(&config)?;
         validate_enabled_model_ids(&config)?;
+        if config.settings.codex_injection_mode == CodexInjectionMode::LanShare
+            && !lan_remote_configured(&config.settings)
+        {
+            config.settings.codex_default_model = None;
+            config.settings.fallback_model = None;
+        }
         self.delete_removed_provider_keys(&previous, &config)?;
         self.write_config_file(&config)?;
         *self.inner.config.write().await = config.clone();
@@ -96,8 +102,20 @@ impl AppStore {
                 .codex_default_model
                 .clone()
                 .filter(|value| !value.trim().is_empty());
-            // Best-effort: never fail a config save because injection had trouble.
-            let _ = self.inject_codex_config_for(&config, default_model.as_deref());
+            if config.settings.codex_injection_mode == CodexInjectionMode::LanShare {
+                let store = self.clone();
+                let config = config.clone();
+                tokio::spawn(async move {
+                    let _ = store
+                        .inject_codex_config_for(&config, default_model.as_deref())
+                        .await;
+                });
+            } else {
+                // Best-effort: never fail a config save because injection had trouble.
+                let _ = self
+                    .inject_codex_config_for(&config, default_model.as_deref())
+                    .await;
+            }
         }
         Ok(())
     }
@@ -195,6 +213,85 @@ impl AppStore {
         .await;
     }
 
+    pub async fn archive_context_artifacts(&self, artifacts: Vec<ContextArtifact>) {
+        if artifacts.is_empty() {
+            return;
+        }
+        let log = self.inner.log.clone();
+        let _ = tokio::task::spawn_blocking(move || log.upsert_context_artifacts(&artifacts)).await;
+    }
+
+    pub async fn search_context_artifacts(
+        &self,
+        query: String,
+        limit: usize,
+    ) -> Vec<ContextArtifact> {
+        if query.trim().is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let log = self.inner.log.clone();
+        tokio::task::spawn_blocking(move || log.search_context_artifacts(&query, limit))
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn upsert_claude_context_pressure(
+        &self,
+        provider_id: String,
+        model: String,
+        context_key: String,
+        input_tokens: u64,
+        body_bytes: u64,
+    ) {
+        let log = self.inner.log.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            log.upsert_claude_context_pressure(
+                &provider_id,
+                &model,
+                &context_key,
+                input_tokens,
+                body_bytes,
+            )
+        })
+        .await;
+    }
+
+    pub async fn mark_claude_context_precompression(
+        &self,
+        provider_id: String,
+        model: String,
+        context_key: String,
+        context_full_body_bytes: u64,
+        compression_stage: Option<String>,
+    ) {
+        let log = self.inner.log.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            log.mark_claude_context_precompression(
+                &provider_id,
+                &model,
+                &context_key,
+                context_full_body_bytes,
+                compression_stage.as_deref(),
+            )
+        })
+        .await;
+    }
+
+    pub async fn claude_context_pressure(
+        &self,
+        provider_id: String,
+        model: String,
+        context_key: String,
+    ) -> Option<ClaudeContextPressureSample> {
+        let log = self.inner.log.clone();
+        tokio::task::spawn_blocking(move || {
+            log.claude_context_pressure(&provider_id, &model, &context_key)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     pub async fn clear_requests(&self) {
         let log = self.inner.log.clone();
         let _ = tokio::task::spawn_blocking(move || log.clear()).await;
@@ -249,19 +346,52 @@ impl AppStore {
 
     pub async fn export_catalog_to(&self, codex_home: &Path) -> Result<PathBuf, String> {
         let config = self.config().await;
+        if config.settings.codex_injection_mode == CodexInjectionMode::LanShare {
+            let models = self.lan_catalog_models_for_config(&config).await?;
+            return catalog::write_catalog_models(codex_home, &models);
+        }
         match self.codex_allowed_model_ids(&config)? {
             Some(allowed) => catalog::write_catalog_for_models(codex_home, &config, Some(&allowed)),
             None => catalog::write_catalog(codex_home, &config),
         }
     }
 
-    pub fn inject_codex_config_for(
+    pub async fn inject_codex_config_for(
         &self,
         config: &AppConfig,
         default_model: Option<&str>,
     ) -> Result<crate::codex_config::InjectionResult, String> {
+        if config.settings.codex_injection_mode == CodexInjectionMode::LanShare {
+            let models = self.lan_catalog_models_for_config(config).await?;
+            return crate::codex_config::inject_lan_share_config(default_model, &models);
+        }
         let allowed = self.codex_allowed_model_ids(config)?;
         crate::codex_config::inject_with_model_filter(config, default_model, allowed.as_ref())
+    }
+
+    pub async fn lan_catalog_models(&self) -> Result<Vec<catalog::CatalogModel>, String> {
+        let config = self.config().await;
+        self.lan_catalog_models_for_config(&config).await
+    }
+
+    pub async fn regenerate_lan_api_key(&self) -> Result<(), String> {
+        let mut config = self.config().await;
+        config.settings.lan_api_key = lan_share::generate_api_key();
+        let config = normalize_config(config);
+        validate_bind_settings(&config)?;
+        validate_provider_urls(&config)?;
+        validate_enabled_model_ids(&config)?;
+        self.write_config_file(&config)?;
+        *self.inner.config.write().await = config;
+        Ok(())
+    }
+
+    async fn lan_catalog_models_for_config(
+        &self,
+        config: &AppConfig,
+    ) -> Result<Vec<catalog::CatalogModel>, String> {
+        let client = reqwest::Client::new();
+        lan_share::fetch_remote_catalog_models(&client, &config.settings).await
     }
 
     pub fn codex_allowed_model_ids(
@@ -397,6 +527,13 @@ pub fn validate_bind_settings(config: &AppConfig) -> Result<(), String> {
 
 pub fn normalize_config(mut config: AppConfig) -> AppConfig {
     config.version = CURRENT_CONFIG_VERSION;
+    if config.settings.lan_api_key.trim().is_empty() {
+        config.settings.lan_api_key = lan_share::generate_api_key();
+    } else {
+        config.settings.lan_api_key = config.settings.lan_api_key.trim().to_string();
+    }
+    config.settings.lan_remote_host = config.settings.lan_remote_host.trim().to_string();
+    config.settings.lan_remote_api_key = config.settings.lan_remote_api_key.trim().to_string();
 
     let official = official_providers();
     let official_ids = official
@@ -493,6 +630,24 @@ pub fn normalize_config(mut config: AppConfig) -> AppConfig {
             .find(|provider| provider.id == model.provider_id)
             .is_some_and(|provider| provider.kind != ProviderKind::OfficialOpenAi)
     };
+    if config.settings.codex_injection_mode == CodexInjectionMode::LanShare {
+        config.settings.codex_default_model = config
+            .settings
+            .codex_default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        config.settings.fallback_model = config
+            .settings
+            .fallback_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        config.providers = providers;
+        return config;
+    }
     let codex_setting_model_ids = config
         .models
         .iter()
@@ -518,6 +673,12 @@ pub fn normalize_config(mut config: AppConfig) -> AppConfig {
         normalize_codex_setting(config.settings.fallback_model.clone());
     config.providers = providers;
     config
+}
+
+fn lan_remote_configured(settings: &Settings) -> bool {
+    !settings.lan_remote_host.trim().is_empty()
+        && settings.lan_remote_port > 0
+        && !settings.lan_remote_api_key.trim().is_empty()
 }
 
 pub fn validate_provider_urls(config: &AppConfig) -> Result<(), String> {
@@ -635,11 +796,12 @@ fn sanitize_provider_id(value: &str) -> String {
 mod tests {
     use super::{
         normalize_config, reset_config_preserving_settings, validate_bind_settings,
-        validate_enabled_model_ids, validate_provider_urls, CURRENT_CONFIG_VERSION,
+        validate_enabled_model_ids, validate_provider_urls, AppStore, CURRENT_CONFIG_VERSION,
     };
     use crate::types::{
         default_config, CodexInjectionMode, Provider, ProviderKind, ProviderProtocol,
     };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn rejects_public_bind_without_allow_lan() {
@@ -655,6 +817,56 @@ mod tests {
         config.settings.bind_host = "0.0.0.0".into();
         config.settings.allow_lan = true;
         assert!(validate_bind_settings(&config).is_ok());
+    }
+
+    #[test]
+    fn normalize_config_generates_lan_api_key() {
+        let mut config = default_config();
+        config.settings.lan_api_key = "   ".into();
+
+        let normalized = normalize_config(config);
+
+        assert!(normalized.settings.lan_api_key.starts_with("nr_"));
+    }
+
+    #[test]
+    fn lan_share_mode_does_not_select_local_models() {
+        let mut config = default_config();
+        config.settings.codex_injection_mode = CodexInjectionMode::LanShare;
+        config.settings.codex_default_model = None;
+        config.settings.fallback_model = None;
+
+        let normalized = normalize_config(config);
+
+        assert!(normalized.settings.codex_default_model.is_none());
+        assert!(normalized.settings.fallback_model.is_none());
+    }
+
+    #[tokio::test]
+    async fn lan_share_save_does_not_fetch_remote_models() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AppStore::load(temp.path().to_path_buf()).unwrap();
+        let mut config = store.config().await;
+        config.settings.codex_injection_mode = CodexInjectionMode::LanShare;
+        config.settings.lan_remote_host = "192.0.2.1".into();
+        config.settings.lan_remote_port = 8787;
+        config.settings.lan_remote_api_key = "remote-key".into();
+        config.settings.codex_default_model = Some("remote-default".into());
+        config.settings.fallback_model = Some("remote-fallback".into());
+
+        let started = Instant::now();
+        store.replace_config(config).await.unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let saved = store.config().await;
+        assert_eq!(
+            saved.settings.codex_default_model.as_deref(),
+            Some("remote-default")
+        );
+        assert_eq!(
+            saved.settings.fallback_model.as_deref(),
+            Some("remote-fallback")
+        );
     }
 
     #[test]
@@ -918,6 +1130,7 @@ mod tests {
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
         assert_eq!(config.providers.len(), 3);
         assert_eq!(config.settings.port, 8788);
+        assert!(config.settings.lan_api_key.starts_with("nr_"));
         assert_eq!(config.settings.request_log_limit, 123);
     }
 

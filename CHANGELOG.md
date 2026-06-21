@@ -8,6 +8,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-06-21
+
+### Added
+
+- Added LAN sharing mode with remote model discovery and Codex configuration support.
+- Added Claude context-pressure tracking, context bridge diagnostics, and archived tool-result recall.
+- Added request-log stream state tracking for converted Anthropic and Chat Completions streams.
+- Added richer Codex catalog metadata and unified auto-compact limits for all model protocols.
+
+### Changed
+
+- Mirrored Claude Desktop / Claude Code Anthropic Messages requests more closely, including separate messages and count-tokens profiles.
+- Improved Anthropic Messages conversion for system placement, prompt cache positioning, thinking restoration, and large tool-result compression.
+- Improved OpenAI Chat Completions bridging from Responses input, including tool-call pairing, multimodal content, reasoning, response formats, and stream conversion.
+- Downgraded unsupported Chat Completions `json_schema` response formats to `json_object` for non-allowlisted providers.
+- Raised generated model auto-compact limits to 90% for every protocol.
+- Refined provider, model, log, Codex setup, and LAN sharing UI surfaces.
+
+### Fixed
+
+- Fixed Claude context-full requests repeatedly failing once before succeeding after compression.
+- Fixed Anthropic mid-conversation `system` messages so they are only placed where Claude accepts them.
+- Fixed converted Anthropic streams incorrectly reporting success after upstream interruption or missing `message_stop`.
+- Fixed Anthropic `max_tokens` stop reasons so they surface as incomplete Responses results.
+- Fixed Chat Completions model tests that could miss returned content or reasoning-only output.
+- Fixed provider compatibility issues caused by sending `json_schema` to upstreams that only support `json_object`.
+
 ## [0.1.2] - 2026-06-20
 
 ### Added

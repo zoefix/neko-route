@@ -212,7 +212,7 @@ export function Empty({ icon, title, hint }: { icon: React.ReactNode; title: str
 }
 
 /* ---------- Custom Dropdown ---------- */
-export type Option = { value: string; label: string; sub?: string };
+export type Option = { value: string; label: string; sub?: string; tone?: "ok" | "warn" | "bad" };
 export function Dropdown({
   value,
   options,
@@ -227,6 +227,7 @@ export function Dropdown({
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef<HTMLDivElement>(null);
   const selected = options.find((o) => o.value === value);
+  const selectedToneClass = selected?.tone ? `dd-tone-${selected.tone}` : "";
 
   React.useEffect(() => {
     if (!open) return;
@@ -246,7 +247,7 @@ export function Dropdown({
 
   return (
     <div className={`dropdown ${open ? "open" : ""}`} ref={ref}>
-      <button type="button" className="dropdown-trigger" onClick={() => setOpen((o) => !o)}>
+      <button type="button" className={`dropdown-trigger ${selectedToneClass}`} onClick={() => setOpen((o) => !o)}>
         <span className={selected ? "" : "dd-placeholder"}>
           {selected ? selected.label : placeholder ?? ""}
         </span>
@@ -260,7 +261,7 @@ export function Dropdown({
               key={o.value}
               role="option"
               aria-selected={o.value === value}
-              className={`dropdown-item ${o.value === value ? "active" : ""}`}
+              className={`dropdown-item ${o.value === value ? "active" : ""} ${o.tone ? `dd-tone-${o.tone}` : ""}`}
               onClick={() => {
                 onChange(o.value);
                 setOpen(false);

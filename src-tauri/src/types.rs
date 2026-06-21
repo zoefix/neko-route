@@ -25,6 +25,7 @@ pub enum ProviderProtocol {
 pub enum CodexInjectionMode {
     OfficialAccount,
     ThirdPartyApi,
+    LanShare,
 }
 
 impl Default for CodexInjectionMode {
@@ -69,6 +70,14 @@ pub struct Settings {
     pub bind_host: String,
     pub port: u16,
     pub allow_lan: bool,
+    #[serde(default = "default_lan_api_key")]
+    pub lan_api_key: String,
+    #[serde(default)]
+    pub lan_remote_host: String,
+    #[serde(default = "default_lan_remote_port")]
+    pub lan_remote_port: u16,
+    #[serde(default)]
+    pub lan_remote_api_key: String,
     pub request_log_limit: usize,
     /// When set, any request for a model that is not configured is routed to
     /// this model instead of failing. Lets you confine Codex's auxiliary
@@ -133,6 +142,102 @@ impl TokenUsage {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextBridgeDiagnostics {
+    #[serde(default)]
+    pub strategy: String,
+    #[serde(default)]
+    pub original_body_bytes: u64,
+    #[serde(default)]
+    pub final_body_bytes: u64,
+    #[serde(default)]
+    pub original_tool_result_bytes: u64,
+    #[serde(default)]
+    pub tool_result_count: u64,
+    #[serde(default)]
+    pub kept_tool_results: u64,
+    #[serde(default)]
+    pub archived_tool_results: u64,
+    #[serde(default)]
+    pub archived_bytes: u64,
+    #[serde(default)]
+    pub recalled_artifacts: u64,
+    #[serde(default)]
+    pub recalled_bytes: u64,
+    #[serde(default)]
+    pub count_tokens_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub count_tokens_error: Option<String>,
+    #[serde(default)]
+    pub context_management: bool,
+    #[serde(default)]
+    pub raw_precheck_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub final_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub estimated_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub estimate_source: Option<String>,
+    #[serde(default)]
+    pub estimate_confidence: Option<String>,
+    #[serde(default)]
+    pub protection_triggered: bool,
+    #[serde(default)]
+    pub target_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub previous_success_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub previous_success_body_bytes: Option<u64>,
+    #[serde(default)]
+    pub compression_stage: Option<String>,
+    #[serde(default)]
+    pub protection_failure_reason: Option<String>,
+    #[serde(default)]
+    pub compression_reason: Option<String>,
+    #[serde(default)]
+    pub last_message_role: Option<String>,
+    #[serde(default)]
+    pub last_message_content_type: Option<String>,
+    #[serde(default)]
+    pub last_message_text_length: u64,
+    #[serde(default)]
+    pub last_message_preview_head: Option<String>,
+    #[serde(default)]
+    pub last_message_preview_tail: Option<String>,
+    #[serde(default)]
+    pub last_message_from_function_call_output: bool,
+    #[serde(default)]
+    pub single_dot_user_message: bool,
+    #[serde(default)]
+    pub latest_tool_result_count: u64,
+    #[serde(default)]
+    pub latest_tool_result_text_length: u64,
+    #[serde(default)]
+    pub latest_tool_result_single_dot: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaudeContextPressureSample {
+    pub input_tokens: u64,
+    pub body_bytes: u64,
+    pub requires_precompression: bool,
+    pub context_full_body_bytes: u64,
+    pub compression_stage: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextArtifact {
+    pub hash: String,
+    pub created_at: DateTime<Utc>,
+    pub request_id: String,
+    pub model: String,
+    pub tool_name: Option<String>,
+    pub tool_args: Option<String>,
+    pub content_bytes: u64,
+    pub content_text: String,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestRecord {
     pub id: String,
@@ -159,6 +264,8 @@ pub struct RequestRecord {
     pub last_event: Option<String>,
     #[serde(default)]
     pub stream_bytes: u64,
+    #[serde(default)]
+    pub context_bridge: Option<ContextBridgeDiagnostics>,
     #[serde(default)]
     pub usage: TokenUsage,
 }
@@ -269,7 +376,7 @@ pub struct AppSnapshot {
 
 pub fn default_config() -> AppConfig {
     AppConfig {
-        version: 10,
+        version: 11,
         providers: vec![
             Provider {
                 id: "openai-official".into(),
@@ -326,6 +433,10 @@ pub fn default_config() -> AppConfig {
             bind_host: "127.0.0.1".into(),
             port: 8787,
             allow_lan: false,
+            lan_api_key: default_lan_api_key(),
+            lan_remote_host: String::new(),
+            lan_remote_port: default_lan_remote_port(),
+            lan_remote_api_key: String::new(),
             request_log_limit: 300,
             fallback_model: Some("gpt-5.5".into()),
             auto_inject: false,
@@ -338,6 +449,14 @@ pub fn default_config() -> AppConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_lan_remote_port() -> u16 {
+    8787
+}
+
+pub fn default_lan_api_key() -> String {
+    format!("nr_{}", uuid::Uuid::new_v4().simple())
 }
 
 fn model(
