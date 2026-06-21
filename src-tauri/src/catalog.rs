@@ -1,6 +1,8 @@
 use crate::{
     codex_alias,
-    types::{AppConfig, ModelEntry, ProviderProtocol},
+    types::{
+        AppConfig, CodexInjectionMode, CodexSlotAssignment, ModelEntry, ProviderProtocol, Settings,
+    },
 };
 use serde_json::{json, Value};
 use std::{
@@ -15,6 +17,7 @@ pub const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 90;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogModel {
     pub slug: String,
+    pub target_model_id: Option<String>,
     pub display_name: String,
     pub description: String,
     pub context_window: u64,
@@ -69,19 +72,17 @@ pub fn catalog_models_for_config(
         })
         .collect::<Vec<_>>();
     let slug_map = codex_alias::export_slug_map(config, &models)?;
-    models
+    Ok(models
         .into_iter()
-        .map(|model| {
-            let slug = slug_map
-                .get(&model.id)
-                .ok_or_else(|| format!("Missing Codex catalog slug for model '{}'", model.id))?;
-            Ok(catalog_model_from_entry(
+        .filter_map(|model| {
+            let slug = slug_map.get(&model.id)?;
+            Some(catalog_model_from_entry(
                 model,
                 slug,
                 protocols.get(model.provider_id.as_str()).cloned(),
             ))
         })
-        .collect::<Result<Vec<_>, String>>()
+        .collect())
 }
 
 pub fn catalog_json_for_catalog_models(models: &[CatalogModel]) -> Result<Value, String> {
@@ -111,10 +112,6 @@ pub fn export_slug_for_model(
         .get(model_id)
         .cloned()
         .ok_or_else(|| format!("Codex model '{model_id}' is not available for export"))
-}
-
-pub fn write_catalog(codex_home: &Path, config: &AppConfig) -> Result<PathBuf, String> {
-    write_catalog_for_models(codex_home, config, None)
 }
 
 pub fn write_catalog_for_models(
@@ -157,6 +154,7 @@ fn catalog_model_from_entry(
 ) -> CatalogModel {
     CatalogModel {
         slug: slug.to_string(),
+        target_model_id: (slug != model.id).then(|| model.id.clone()),
         display_name: model.display_name.clone(),
         description: model.description.clone(),
         context_window: model.context_window,
@@ -164,6 +162,52 @@ fn catalog_model_from_entry(
         default_reasoning_level: model.default_reasoning_level.clone(),
         supported_reasoning_levels: model.supported_reasoning_levels.clone(),
         provider_protocol,
+    }
+}
+
+pub fn lan_slot_catalog_models(
+    settings: &Settings,
+    remote_models: &[CatalogModel],
+) -> Result<(Vec<CatalogModel>, Vec<CodexSlotAssignment>), String> {
+    let source = codex_alias::lan_slot_source(settings);
+    let targets = codex_alias::remote_slot_targets(
+        &source,
+        remote_models
+            .iter()
+            .map(|model| model.real_target_model_id().to_string()),
+    );
+    let priority = codex_alias::priority_target_ids(
+        settings.codex_default_model.as_deref(),
+        settings.fallback_model.as_deref(),
+    );
+    let allocation = codex_alias::allocate_codex_slots(
+        CodexInjectionMode::LanShare,
+        &settings.codex_slots,
+        &targets,
+        &priority,
+    );
+    let models = remote_models
+        .iter()
+        .filter_map(|model| {
+            let target = model.real_target_model_id();
+            let slot = allocation.slots_by_target.get(target)?;
+            let mut mapped = model.clone();
+            mapped.slug = slot.clone();
+            mapped.target_model_id = Some(target.to_string());
+            Some(mapped)
+        })
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        return Err("No LAN shared models could be mapped to Codex slots".into());
+    }
+    Ok((models, allocation.assignments))
+}
+
+impl CatalogModel {
+    pub fn real_target_model_id(&self) -> &str {
+        self.target_model_id
+            .as_deref()
+            .unwrap_or(self.slug.as_str())
     }
 }
 
@@ -248,6 +292,7 @@ fn reasoning_description(level: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{catalog_json, catalog_json_for_models};
+    use crate::codex_alias;
     use crate::types::{
         default_config, reasoning_defaults_for_protocol, CodexInjectionMode, Provider,
         ProviderKind, ProviderProtocol,
@@ -357,6 +402,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url: "https://deepseek.example/v1".into(),
             key_ref: Some("provider:deepseek".into()),
+            http_proxy: Default::default(),
         });
         let mut model = config.models[0].clone();
         model.id = "deepseek-v4-pro".into();
@@ -389,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn third_party_catalog_exports_claude_with_visible_alias() {
+    fn third_party_catalog_exports_claude_with_codex_slot() {
         let mut config = default_config();
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
 
@@ -400,12 +446,12 @@ mod tests {
             .find(|model| model["display_name"] == "Claude Opus 4.8")
             .unwrap();
 
-        assert_eq!(claude["slug"], "gpt-5.4-mini");
+        assert_eq!(claude["slug"], "gpt-5.5");
         assert_eq!(claude["default_reasoning_level"], "max");
     }
 
     #[test]
-    fn third_party_catalog_errors_when_alias_pool_is_exhausted() {
+    fn third_party_catalog_skips_overflow_when_slot_pool_is_exhausted() {
         let mut config = default_config();
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
         let template = config
@@ -414,16 +460,20 @@ mod tests {
             .find(|model| model.id == "claude-opus-4-8")
             .unwrap()
             .clone();
-        for id in ["claude-extra-1", "claude-extra-2"] {
+        for index in 0..10 {
             let mut model = template.clone();
-            model.id = id.into();
-            model.display_name = id.into();
+            model.id = format!("claude-extra-{index}");
+            model.display_name = model.id.clone();
             model.codex_alias = None;
             config.models.push(model);
         }
 
-        let error = catalog_json_for_models(&config, None).unwrap_err();
+        let catalog = catalog_json_for_models(&config, None).unwrap();
+        let models = catalog["models"].as_array().unwrap();
 
-        assert!(error.contains("Codex-compatible menu alias"));
+        assert_eq!(models.len(), codex_alias::CODEX_SLOT_POOL.len());
+        assert!(models
+            .iter()
+            .any(|model| model["display_name"] == "Claude Opus 4.8"));
     }
 }

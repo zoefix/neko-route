@@ -1,5 +1,5 @@
 use crate::{
-    catalog, claude_auth, lan_share, official_auth, official_usage,
+    catalog, claude_auth, lan_share, official_auth, official_usage, provider_proxy,
     redact::redact,
     router::{match_route, RouteMatch},
     store::{validate_bind_settings, AppStore},
@@ -177,6 +177,9 @@ async fn health(State(state): State<ServerState>) -> Json<Value> {
     Json(json!({
         "ok": true,
         "service": "neko-route",
+        "version": env!("CARGO_PKG_VERSION"),
+        "config_version": config.version,
+        "codex_slot_count": config.settings.codex_slots.len(),
         "providers": config.providers.len(),
         "models": config.models.iter().filter(|model| model.enabled).count(),
         "keys": keys,
@@ -223,82 +226,26 @@ fn validate_lan_authorization(
 }
 
 async fn proxy_lan_models(state: &ServerState, settings: &Settings) -> Response {
-    let url = match lan_share::remote_base_url(settings) {
-        Ok(base_url) => format!("{base_url}/models"),
-        Err(error) => {
-            return RouteError::new(StatusCode::BAD_REQUEST, "lan_remote_invalid", error)
-                .into_response();
-        }
-    };
-    let bearer = match lan_share::bearer_value(&settings.lan_remote_api_key) {
-        Ok(value) => value,
-        Err(error) => {
-            return RouteError::new(StatusCode::BAD_REQUEST, "lan_remote_invalid", error)
-                .into_response();
-        }
-    };
-    match state
-        .client
-        .get(url)
-        .header(header::AUTHORIZATION, bearer)
-        .timeout(lan_share::remote_models_timeout())
-        .send()
-        .await
-    {
-        Ok(response) => proxy_raw_models_response(response),
+    if let Err(error) = lan_share::remote_base_url(settings) {
+        return RouteError::new(StatusCode::BAD_REQUEST, "lan_remote_invalid", error)
+            .into_response();
+    }
+    if let Err(error) = lan_share::bearer_value(&settings.lan_remote_api_key) {
+        return RouteError::new(StatusCode::BAD_REQUEST, "lan_remote_invalid", error)
+            .into_response();
+    }
+    match state.store.lan_codex_catalog_models().await {
+        Ok(models) => models_response(models),
         Err(error) => RouteError::new(
             StatusCode::BAD_GATEWAY,
             "lan_remote_unavailable",
-            format!("Could not reach LAN host: {error}"),
+            format!("LAN remote models could not be loaded: {error}"),
         )
         .into_response(),
     }
 }
 
-fn proxy_raw_models_response(response: reqwest::Response) -> Response {
-    let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::OK);
-    let headers = response
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| {
-            if should_skip_proxy_response_header(name.as_str()) {
-                return None;
-            }
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_string(), value.to_string()))
-        })
-        .collect::<Vec<_>>();
-    let stream = response.bytes_stream().map(|item| {
-        item.map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))
-    });
-    let mut builder = Response::builder().status(status);
-    for (name, value) in headers {
-        builder = builder.header(name, value);
-    }
-    builder.body(Body::from_stream(stream)).unwrap()
-}
-
-async fn models(
-    State(state): State<ServerState>,
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(error) = ensure_lan_request_authorized(&state, remote_addr, &headers).await {
-        return error.into_response();
-    }
-    let config = state.store.config().await;
-    if config.settings.codex_injection_mode == CodexInjectionMode::LanShare {
-        return proxy_lan_models(&state, &config.settings).await;
-    }
-    let models = match catalog::catalog_models_for_config(&config, None) {
-        Ok(models) => models,
-        Err(error) => {
-            return RouteError::new(StatusCode::INTERNAL_SERVER_ERROR, "catalog_failed", error)
-                .into_response();
-        }
-    };
+fn models_response(models: Vec<catalog::CatalogModel>) -> Response {
     Json(json!({
         "object": "list",
         "data": models
@@ -322,6 +269,35 @@ async fn models(
             .collect::<Vec<_>>()
     }))
     .into_response()
+}
+
+async fn models(
+    State(state): State<ServerState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(error) = ensure_lan_request_authorized(&state, remote_addr, &headers).await {
+        return error.into_response();
+    }
+    let config = state.store.config().await;
+    if config.settings.codex_injection_mode == CodexInjectionMode::LanShare {
+        return proxy_lan_models(&state, &config.settings).await;
+    }
+    let allowed_model_ids = match state.store.codex_allowed_model_ids(&config) {
+        Ok(value) => value,
+        Err(error) => {
+            return RouteError::new(StatusCode::INTERNAL_SERVER_ERROR, "catalog_failed", error)
+                .into_response();
+        }
+    };
+    let models = match catalog::catalog_models_for_config(&config, allowed_model_ids.as_ref()) {
+        Ok(models) => models,
+        Err(error) => {
+            return RouteError::new(StatusCode::INTERNAL_SERVER_ERROR, "catalog_failed", error)
+                .into_response();
+        }
+    };
+    models_response(models)
 }
 
 async fn responses(
@@ -487,10 +463,23 @@ async fn route_response(
         .to_string();
     let config = state.store.config().await;
     if config.settings.codex_injection_mode == CodexInjectionMode::LanShare {
-        let matched = lan_route_match(&config.settings, &model);
-        let response = forward_lan_responses(&state, &headers, body_bytes, &request_id, &model)
+        let lan_model = state
+            .store
+            .resolve_lan_codex_model(&model)
             .await
-            .map_err(|error| error.with_match(&matched))?;
+            .map_err(|error| {
+                RouteError::new(StatusCode::NOT_FOUND, "lan_model_not_mapped", error)
+            })?;
+        let matched = lan_route_match(&config.settings, &model, &lan_model);
+        let response = forward_lan_responses(
+            &state,
+            &headers,
+            body,
+            &request_id,
+            lan_model.real_target_model_id(),
+        )
+        .await
+        .map_err(|error| error.with_match(&matched))?;
         return Ok((response, matched, None, None));
     }
     let matched = match_route(&config, &model).map_err(|message| {
@@ -565,21 +554,26 @@ async fn route_response(
     Ok((response, matched, usage, context_bridge))
 }
 
-fn lan_route_match(settings: &Settings, model: &str) -> RouteMatch {
+fn lan_route_match(
+    settings: &Settings,
+    requested_model: &str,
+    lan_model: &catalog::CatalogModel,
+) -> RouteMatch {
+    let target_model = lan_model.real_target_model_id().to_string();
     RouteMatch {
         model: ModelEntry {
-            id: model.to_string(),
-            display_name: model.to_string(),
-            description: "LAN shared model".into(),
-            context_window: 0,
+            id: target_model.clone(),
+            display_name: lan_model.display_name.clone(),
+            description: lan_model.description.clone(),
+            context_window: lan_model.context_window,
             enabled: true,
             provider_id: "lan-share".into(),
             upstream_model: None,
             timeout_ms: 0,
             retry_count: 0,
-            reasoning_enabled: false,
-            default_reasoning_level: "medium".into(),
-            supported_reasoning_levels: Vec::new(),
+            reasoning_enabled: lan_model.reasoning_enabled,
+            default_reasoning_level: lan_model.default_reasoning_level.clone(),
+            supported_reasoning_levels: lan_model.supported_reasoning_levels.clone(),
             codex_alias: None,
         },
         provider: Provider {
@@ -590,14 +584,18 @@ fn lan_route_match(settings: &Settings, model: &str) -> RouteMatch {
                 settings.lan_remote_port
             ),
             kind: ProviderKind::Custom,
-            protocol: ProviderProtocol::OpenAiResponses,
+            protocol: lan_model
+                .provider_protocol
+                .clone()
+                .unwrap_or(ProviderProtocol::OpenAiResponses),
             base_url: lan_share::remote_base_url(settings).unwrap_or_default(),
             key_ref: None,
+            http_proxy: Default::default(),
         },
-        upstream_model: model.to_string(),
+        upstream_model: target_model,
         timeout_ms: 0,
         retry_count: 0,
-        requested_model: model.to_string(),
+        requested_model: requested_model.to_string(),
         route_reason: "lan_share".into(),
         locked_from_model: None,
     }
@@ -606,9 +604,9 @@ fn lan_route_match(settings: &Settings, model: &str) -> RouteMatch {
 async fn forward_lan_responses(
     state: &ServerState,
     inbound_headers: &HeaderMap,
-    body_bytes: Bytes,
+    mut body: Value,
     request_id: &str,
-    _requested_model: &str,
+    target_model: &str,
 ) -> Result<Response, RouteError> {
     let config = state.store.config().await;
     let base_url = lan_share::remote_base_url(&config.settings)
@@ -628,6 +626,16 @@ async fn forward_lan_responses(
         ));
     }
     let url = format!("{base_url}/responses");
+    body["model"] = Value::String(target_model.to_string());
+    let body_bytes = serde_json::to_vec(&body)
+        .map(Bytes::from)
+        .map_err(|error| {
+            RouteError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "lan_proxy_body_failed",
+                format!("Could not prepare LAN request body: {error}"),
+            )
+        })?;
     let upstream = post_bytes_with_retries(&state.client, &url, headers, body_bytes, 0, 0).await?;
     let streaming = is_event_stream(upstream.headers());
     let context = RawProxyContext::from_response(&upstream, request_id.to_string(), streaming);
@@ -679,6 +687,18 @@ fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+fn client_for_provider(state: &ServerState, provider: &Provider) -> Result<Client, RouteError> {
+    provider_proxy::client_for_provider(&state.client, state.store.key_store(), provider).map_err(
+        |message| {
+            RouteError::new(
+                StatusCode::FAILED_DEPENDENCY,
+                "provider_proxy_unavailable",
+                message,
+            )
+        },
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResponsesAuthMode {
     CodexOfficial,
@@ -699,10 +719,17 @@ async fn forward_responses_proxy(
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let upstream_body = responses_proxy_body(body, body_bytes, requested_model, matched)?;
     let url = responses_proxy_url(auth_mode, inbound_headers, &matched.provider)?;
-    let headers =
-        proxy_request_headers(state, inbound_headers, &matched.provider, auth_mode).await?;
+    let client = client_for_provider(state, &matched.provider)?;
+    let headers = proxy_request_headers(
+        state,
+        &client,
+        inbound_headers,
+        &matched.provider,
+        auth_mode,
+    )
+    .await?;
     let upstream = post_bytes_with_retries(
-        &state.client,
+        &client,
         &url,
         headers,
         upstream_body,
@@ -791,6 +818,7 @@ fn responses_proxy_url(
 
 async fn proxy_request_headers(
     state: &ServerState,
+    client: &Client,
     inbound_headers: &HeaderMap,
     provider: &Provider,
     auth_mode: ResponsesAuthMode,
@@ -853,7 +881,7 @@ async fn proxy_request_headers(
             }
         }
         ResponsesAuthMode::StoredOfficialAccount => {
-            let auth = official_auth::auth_for_provider(&state.client, provider)
+            let auth = official_auth::auth_for_provider(client, provider)
                 .await
                 .map_err(|message| {
                     RouteError::new(StatusCode::UNAUTHORIZED, "missing_official_auth", message)
@@ -1973,7 +2001,8 @@ async fn forward_anthropic(
     let (upstream_model, one_million_context) =
         anthropic_model_for_request(&matched.upstream_model, matched.model.context_window);
     let original_anthropic_body = build_anthropic_body(&body, &upstream_model, stream);
-    let (base_url, headers) = anthropic_upstream(state, &matched.provider).await?;
+    let client = client_for_provider(state, &matched.provider)?;
+    let (base_url, headers) = anthropic_upstream(state, &client, &matched.provider).await?;
     let url = anthropic_messages_url(&base_url, one_million_context);
     let message_headers = claude_code_mirror_headers(headers.clone(), &body);
     let count_headers = claude_code_count_tokens_headers(headers, &body);
@@ -2014,13 +2043,8 @@ async fn forward_anthropic(
     let mut raw_precheck_input_tokens = None::<u64>;
     let mut count_tokens_error = None::<String>;
 
-    match count_anthropic_input_tokens(
-        &state.client,
-        &base_url,
-        &count_headers,
-        &original_anthropic_body,
-    )
-    .await
+    match count_anthropic_input_tokens(&client, &base_url, &count_headers, &original_anthropic_body)
+        .await
     {
         Ok(input_tokens) => {
             raw_precheck_input_tokens = Some(input_tokens);
@@ -2138,13 +2162,8 @@ async fn forward_anthropic(
         context_bridge.raw_precheck_input_tokens = raw_precheck_input_tokens;
         context_bridge.context_management = anthropic_body.get("context_management").is_some();
         context_bridge.final_body_bytes = json_size(&anthropic_body) as u64;
-        match count_anthropic_input_tokens(
-            &state.client,
-            &base_url,
-            &count_headers,
-            &anthropic_body,
-        )
-        .await
+        match count_anthropic_input_tokens(&client, &base_url, &count_headers, &anthropic_body)
+            .await
         {
             Ok(input_tokens) => {
                 context_bridge.final_input_tokens = Some(input_tokens);
@@ -2182,7 +2201,7 @@ async fn forward_anthropic(
                         anthropic_body.get("context_management").is_some();
                     context_bridge.final_body_bytes = json_size(&anthropic_body) as u64;
                     match count_anthropic_input_tokens(
-                        &state.client,
+                        &client,
                         &base_url,
                         &count_headers,
                         &anthropic_body,
@@ -2233,7 +2252,7 @@ async fn forward_anthropic(
     }
 
     let mut upstream = post_json_with_retries(
-        &state.client,
+        &client,
         &url,
         message_headers.clone(),
         anthropic_body.clone(),
@@ -2290,7 +2309,7 @@ async fn forward_anthropic(
             }
             anthropic_body = retry_body;
             upstream = post_json_with_retries(
-                &state.client,
+                &client,
                 &url,
                 message_headers.clone(),
                 anthropic_body.clone(),
@@ -2385,8 +2404,9 @@ async fn forward_chat_completions(
         build_chat_completions_body_with_profile(&body, &matched.upstream_model, stream, profile);
     let url = endpoint(&matched.provider.base_url, "chat/completions");
     let headers = provider_headers(state, &matched.provider).await?;
+    let client = client_for_provider(state, &matched.provider)?;
     let mut upstream = post_json_with_retries(
-        &state.client,
+        &client,
         &url,
         headers.clone(),
         chat_body.clone(),
@@ -2399,7 +2419,7 @@ async fn forward_chat_completions(
         let text = upstream.text().await.unwrap_or_default();
         if should_retry_chat_without_response_format(status, &text, &chat_body) {
             upstream = post_json_with_retries(
-                &state.client,
+                &client,
                 &url,
                 headers,
                 chat_body_without_response_format(chat_body),
@@ -2471,6 +2491,7 @@ async fn provider_headers(
 
 async fn anthropic_upstream(
     state: &ServerState,
+    client: &Client,
     provider: &Provider,
 ) -> Result<(String, Vec<(String, String)>), RouteError> {
     match &provider.kind {
@@ -2492,7 +2513,7 @@ async fn anthropic_upstream(
             Ok((auth.base_url, auth.headers))
         }
         ProviderKind::OfficialAnthropicAccount => {
-            let auth = official_auth::auth_for_provider(&state.client, provider)
+            let auth = official_auth::auth_for_provider(client, provider)
                 .await
                 .map_err(|message| {
                     RouteError::new(StatusCode::UNAUTHORIZED, "missing_official_auth", message)
@@ -6391,7 +6412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lan_models_proxy_returns_remote_models() {
+    async fn lan_models_proxy_returns_codex_slots() {
         let app = axum::Router::new().route(
             "/v1/models",
             axum::routing::get(|headers: HeaderMap| async move {
@@ -6420,6 +6441,8 @@ mod tests {
         config.settings.lan_remote_host = "127.0.0.1".into();
         config.settings.lan_remote_port = port;
         config.settings.lan_remote_api_key = "remote-key".into();
+        store.replace_config(config).await.unwrap();
+        let config = store.config().await;
         let state = ServerState {
             store,
             client: Client::new(),
@@ -6431,12 +6454,13 @@ mod tests {
             .unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(value["data"][0]["id"], "remote-gpt");
+        assert_eq!(value["data"][0]["id"], "gpt-5.5");
+        assert_eq!(value["data"][0]["display_name"], "remote-gpt");
         server.abort();
     }
 
     #[tokio::test]
-    async fn lan_response_proxy_forwards_raw_body_to_remote() {
+    async fn lan_response_proxy_restores_real_remote_model() {
         let app = axum::Router::new()
             .route(
                 "/v1/models",
@@ -6456,7 +6480,9 @@ mod tests {
                             .and_then(|v| v.to_str().ok()),
                         Some("Bearer remote-key")
                     );
-                    assert!(String::from_utf8_lossy(&body).contains("input_image"));
+                    let value: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(value["model"], "remote-gpt");
+                    assert!(value.to_string().contains("input_image"));
                     axum::Json(json!({"id": "resp_lan", "status": "completed"}))
                 }),
             );
@@ -6480,7 +6506,7 @@ mod tests {
             client: Client::new(),
         };
         let body = json!({
-            "model": "remote-gpt",
+            "model": "gpt-5.5",
             "input": [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}],
             "stream": false
         });
@@ -6496,6 +6522,8 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(matched.route_reason, "lan_share");
+        assert_eq!(matched.model.id, "remote-gpt");
+        assert_eq!(matched.requested_model, "gpt-5.5");
         assert_eq!(value["id"], "resp_lan");
         server.abort();
     }
@@ -6612,6 +6640,7 @@ mod tests {
             protocol: ProviderProtocol::AnthropicMessages,
             base_url: format!("http://127.0.0.1:{port}/v1"),
             key_ref: Some("provider:anthropic-relay".into()),
+            http_proxy: Default::default(),
         });
         config.models.push(ModelEntry {
             id: "claude-relay-opus".into(),
@@ -6768,6 +6797,7 @@ mod tests {
             protocol: ProviderProtocol::AnthropicMessages,
             base_url: format!("http://127.0.0.1:{port}/v1"),
             key_ref: Some("provider:anthropic-relay".into()),
+            http_proxy: Default::default(),
         });
         config.models.push(ModelEntry {
             id: "claude-relay-opus".into(),
@@ -6909,6 +6939,7 @@ mod tests {
             protocol: ProviderProtocol::AnthropicMessages,
             base_url: format!("http://127.0.0.1:{port}/v1"),
             key_ref: Some("provider:anthropic-relay".into()),
+            http_proxy: Default::default(),
         });
         config.models.push(ModelEntry {
             id: "claude-relay-opus".into(),
@@ -7031,6 +7062,7 @@ mod tests {
             protocol: ProviderProtocol::AnthropicMessages,
             base_url: format!("http://127.0.0.1:{port}/v1"),
             key_ref: Some("provider:anthropic-relay".into()),
+            http_proxy: Default::default(),
         });
         let mut model = config.models[1].clone();
         model.id = "claude-relay-opus".into();
@@ -8139,6 +8171,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url: "https://api.openai.com/v1".into(),
             key_ref: None,
+            http_proxy: Default::default(),
         };
         assert_eq!(
             chat_completions_compatibility_profile(&provider, "gpt-5.5"),
@@ -8170,6 +8203,7 @@ mod tests {
                 protocol: ProviderProtocol::OpenAiChatCompletions,
                 base_url: base_url.into(),
                 key_ref: None,
+                http_proxy: Default::default(),
             };
             assert_eq!(
                 chat_completions_compatibility_profile(&provider, "chat-model"),
@@ -8344,6 +8378,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url,
             key_ref: None,
+            http_proxy: Default::default(),
         };
         let matched = RouteMatch {
             model: ModelEntry {
@@ -8440,6 +8475,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url,
             key_ref: None,
+            http_proxy: Default::default(),
         };
         let matched = RouteMatch {
             model: ModelEntry {
@@ -9410,6 +9446,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiResponses,
             base_url: "https://api.openai.com/v1".into(),
             key_ref: None,
+            http_proxy: Default::default(),
         };
         let headers = HeaderMap::new();
 
@@ -9501,6 +9538,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url: "https://deepseek.example/v1".into(),
             key_ref: Some("provider:deepseek".into()),
+            http_proxy: Default::default(),
         });
         let mut deepseek = config.models[0].clone();
         deepseek.id = "deepseek-v4-pro".into();
@@ -9572,10 +9610,15 @@ mod tests {
             HeaderValue::from_static("gzip, br"),
         );
 
-        let headers =
-            proxy_request_headers(&state, &inbound, provider, ResponsesAuthMode::CodexOfficial)
-                .await
-                .unwrap();
+        let headers = proxy_request_headers(
+            &state,
+            &state.client,
+            &inbound,
+            provider,
+            ResponsesAuthMode::CodexOfficial,
+        )
+        .await
+        .unwrap();
         let encodings = headers
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))

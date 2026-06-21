@@ -91,6 +91,7 @@ pub fn parse_models_response(value: &Value) -> Result<Vec<CatalogModel>, String>
         }
         models.push(CatalogModel {
             slug: id.to_string(),
+            target_model_id: None,
             display_name: string_field(item, "display_name").unwrap_or_else(|| id.to_string()),
             description: string_field(item, "description")
                 .or_else(|| string_field(item, "owned_by"))

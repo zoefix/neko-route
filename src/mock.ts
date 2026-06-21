@@ -149,6 +149,15 @@ export function mockCancelModelTest(testId: string): ModelTestStatus {
   return next;
 }
 
+function mockHttpProxy() {
+  return {
+    enabled: false,
+    url: "",
+    username: "",
+    password_ref: null,
+  };
+}
+
 export function mockSnapshot(): AppSnapshot {
   return {
     config: {
@@ -161,6 +170,7 @@ export function mockSnapshot(): AppSnapshot {
           protocol: "open_ai_responses",
           base_url: "https://api.openai.com/v1",
           key_ref: null,
+          http_proxy: mockHttpProxy(),
         },
         {
           id: "anthropic-cli",
@@ -169,6 +179,7 @@ export function mockSnapshot(): AppSnapshot {
           protocol: "anthropic_messages",
           base_url: "local://claude-code",
           key_ref: null,
+          http_proxy: mockHttpProxy(),
         },
         {
           id: "anthropic-desktop",
@@ -177,6 +188,7 @@ export function mockSnapshot(): AppSnapshot {
           protocol: "anthropic_messages",
           base_url: "local://claude-desktop",
           key_ref: null,
+          http_proxy: mockHttpProxy(),
         },
         {
           id: "custom-demo1234",
@@ -185,6 +197,7 @@ export function mockSnapshot(): AppSnapshot {
           protocol: "open_ai_chat_completions",
           base_url: "",
           key_ref: "provider:custom-demo1234",
+          http_proxy: mockHttpProxy(),
         },
         {
           id: "openai-account-demo",
@@ -193,6 +206,7 @@ export function mockSnapshot(): AppSnapshot {
           protocol: "open_ai_responses",
           base_url: "https://api.openai.com/v1",
           key_ref: "official-token:openai-account-demo",
+          http_proxy: mockHttpProxy(),
         },
         {
           id: "claude-account-demo",
@@ -201,6 +215,7 @@ export function mockSnapshot(): AppSnapshot {
           protocol: "anthropic_messages",
           base_url: "https://api.anthropic.com",
           key_ref: "official-token:claude-account-demo",
+          http_proxy: mockHttpProxy(),
         },
       ],
       models: [
@@ -232,7 +247,7 @@ export function mockSnapshot(): AppSnapshot {
           reasoning_enabled: true,
           default_reasoning_level: "max",
           supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max"],
-          codex_alias: "gpt-5.4-mini",
+          codex_alias: null,
         },
         {
           id: "claude-sonnet-4-5",
@@ -247,7 +262,7 @@ export function mockSnapshot(): AppSnapshot {
           reasoning_enabled: true,
           default_reasoning_level: "max",
           supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max"],
-          codex_alias: "gpt-5.3-codex",
+          codex_alias: null,
         },
       ],
       settings: {
@@ -264,6 +279,7 @@ export function mockSnapshot(): AppSnapshot {
         codex_default_model: null,
         codex_injection_mode: "official_account",
         codex_internal_model_lock: true,
+        codex_slots: [],
       },
     },
     keys: [
@@ -280,6 +296,7 @@ export function mockSnapshot(): AppSnapshot {
       { provider_id: "claude-account-demo", present: true, available: true, message: null },
     ],
     server: { bind_url: "http://127.0.0.1:8787/v1", running: true, error: null },
+    codex_apply_error: null,
     requests: [
       {
         id: "1",
@@ -364,7 +381,7 @@ export function mockSnapshot(): AppSnapshot {
         started_at: new Date(Date.now() - 64000).toISOString(),
         model: "claude-sonnet-4-5",
         requested_model: "gpt-5.3-codex",
-        route_reason: "codex_alias",
+        route_reason: "codex_slot",
         provider_id: "anthropic-desktop",
         provider_name: "Claude Desktop Official",
         provider_protocol: "anthropic_messages",

@@ -86,7 +86,7 @@ pub fn desktop_credential_json() -> Result<String, String> {
 }
 
 pub fn cli_status() -> (bool, bool, Option<String>) {
-    match discover_cli_token(true) {
+    match discover_cli_token(false) {
         Ok(token) => (true, true, Some(format!("Using {}", token.source))),
         Err(message) => (false, true, Some(message)),
     }
@@ -108,7 +108,7 @@ fn token_record_value(token: &TokenRecord) -> Value {
 }
 
 pub fn desktop_status() -> (bool, bool, Option<String>) {
-    match token_from_desktop_config(true) {
+    match token_from_desktop_config(false) {
         Ok(DesktopTokenLookup::Usable(token)) => {
             (true, true, Some(format!("Using {}", token.source)))
         }

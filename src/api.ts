@@ -204,6 +204,24 @@ export const api = {
     return invoke<AppSnapshot>("delete_provider_key", { providerId });
   },
 
+  readProviderProxyPassword: (providerId: string) => {
+    if (!isTauri) {
+      const provider = demoSnap().config.providers.find((p) => p.id === providerId);
+      return Promise.resolve(provider?.http_proxy.password_ref ? "demo-proxy-password" : "");
+    }
+    return invoke<string>("read_provider_proxy_password", { providerId });
+  },
+
+  setProviderProxyPassword: (providerId: string, password: string) => {
+    if (!isTauri) return Promise.resolve(demoSnap());
+    return invoke<AppSnapshot>("set_provider_proxy_password", { providerId, password });
+  },
+
+  deleteProviderProxyPassword: (providerId: string) => {
+    if (!isTauri) return Promise.resolve(demoSnap());
+    return invoke<AppSnapshot>("delete_provider_proxy_password", { providerId });
+  },
+
   testRoute: (model: string) =>
     isTauri
       ? invoke<Record<string, unknown>>("test_route", { model })

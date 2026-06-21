@@ -56,6 +56,7 @@ export function newCustomProvider(): Provider {
     protocol: "open_ai_responses",
     base_url: "",
     key_ref: `provider:${id}`,
+    http_proxy: defaultHttpProxy(),
   };
 }
 
@@ -68,6 +69,7 @@ export function newOpenAiAccountProvider(): Provider {
     protocol: "open_ai_responses",
     base_url: "https://api.openai.com/v1",
     key_ref: `official-token:${id}`,
+    http_proxy: defaultHttpProxy(),
   };
 }
 
@@ -80,6 +82,16 @@ export function newClaudeAccountProvider(): Provider {
     protocol: "anthropic_messages",
     base_url: "https://api.anthropic.com/v1",
     key_ref: `official-token:${id}`,
+    http_proxy: defaultHttpProxy(),
+  };
+}
+
+export function defaultHttpProxy() {
+  return {
+    enabled: false,
+    url: "",
+    username: "",
+    password_ref: null,
   };
 }
 

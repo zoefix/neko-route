@@ -1,7 +1,8 @@
 use crate::{
     catalog,
     catalog::CatalogModel,
-    types::{AppConfig, CodexInjectionMode, ProviderProtocol},
+    codex_alias,
+    types::{AppConfig, CodexInjectionMode, ProviderProtocol, Settings},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -78,14 +79,16 @@ pub fn inject_with_model_filter(
 }
 
 pub fn inject_lan_share_config(
+    settings: &Settings,
     default_model: Option<&str>,
     models: &[CatalogModel],
 ) -> Result<InjectionResult, String> {
-    inject_lan_share_config_into(&resolve_codex_home(), default_model, models)
+    inject_lan_share_config_into(&resolve_codex_home(), settings, default_model, models)
 }
 
 pub fn inject_lan_share_config_into(
     codex_home: &Path,
+    settings: &Settings,
     default_model: Option<&str>,
     models: &[CatalogModel],
 ) -> Result<InjectionResult, String> {
@@ -117,7 +120,7 @@ pub fn inject_lan_share_config_into(
     let selected = match requested_default {
         Some(model) => models
             .iter()
-            .find(|entry| entry.slug == model)
+            .find(|entry| entry.slug == model || entry.real_target_model_id() == model)
             .ok_or_else(|| format!("LAN shared default model '{model}' is not available"))?,
         None => models
             .first()
@@ -144,7 +147,7 @@ pub fn inject_lan_share_config_into(
     document["model_context_window"] = value(context_window_value);
     document["model_auto_compact_token_limit"] = value(auto_compact_value);
 
-    ensure_neko_route_provider(&mut document, false)?;
+    ensure_neko_route_provider(&mut document, settings, false)?;
 
     fs::write(&config_path, document.to_string()).map_err(|error| error.to_string())?;
 
@@ -333,7 +336,7 @@ pub fn inject_into_with_model_filter(
             .remove("model_auto_compact_token_limit");
     }
 
-    ensure_neko_route_provider(&mut document, !third_party)?;
+    ensure_neko_route_provider(&mut document, &config.settings, !third_party)?;
 
     fs::write(&config_path, document.to_string()).map_err(|error| error.to_string())?;
 
@@ -360,6 +363,7 @@ pub fn inject_into_with_model_filter(
 
 fn ensure_neko_route_provider(
     document: &mut DocumentMut,
+    settings: &Settings,
     requires_openai_auth: bool,
 ) -> Result<(), String> {
     ensure_table(document, "model_providers");
@@ -378,10 +382,23 @@ fn ensure_neko_route_provider(
         .and_then(Item::as_table_mut)
         .ok_or_else(|| "Failed to create neko-route provider table".to_string())?;
     provider["name"] = value("neko-route");
-    provider["base_url"] = value("http://127.0.0.1:8787/v1");
+    provider["base_url"] = value(local_codex_base_url(settings));
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(requires_openai_auth);
     Ok(())
+}
+
+pub fn local_codex_base_url(settings: &Settings) -> String {
+    let host = settings.bind_host.trim();
+    let host = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(addr)) if addr.is_unspecified() => "127.0.0.1".to_string(),
+        Ok(std::net::IpAddr::V4(addr)) => addr.to_string(),
+        Ok(std::net::IpAddr::V6(addr)) if addr.is_unspecified() => "127.0.0.1".to_string(),
+        Ok(std::net::IpAddr::V6(addr)) => format!("[{addr}]"),
+        Err(_) if host.is_empty() => "127.0.0.1".to_string(),
+        Err(_) => host.to_string(),
+    };
+    format!("http://{}:{}/v1", host, settings.port)
 }
 
 fn validate_model_injectable(
@@ -414,6 +431,11 @@ fn resolve_config_model_id<'a>(
     let value = value.trim();
     if value.is_empty() {
         return None;
+    }
+    if include_aliases {
+        if let Some(model) = codex_alias::resolve_slot_model(config, value) {
+            return Some(model.id.as_str());
+        }
     }
     config
         .models
@@ -513,7 +535,7 @@ fn selected_model_context(
 mod tests {
     use super::{
         inject_into, inject_into_with_model_filter, inject_lan_share_config_into,
-        read_codex_config_file_from, restore_from, save_codex_config_file_to,
+        local_codex_base_url, read_codex_config_file_from, restore_from, save_codex_config_file_to,
     };
     use crate::{
         catalog::CatalogModel,
@@ -620,6 +642,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url: "https://deepseek.example/v1".into(),
             key_ref: Some("provider:deepseek".into()),
+            http_proxy: Default::default(),
         });
         let mut model = config.models[0].clone();
         model.id = "deepseek-v4-pro".into();
@@ -658,6 +681,7 @@ mod tests {
         let mut config = normalize_config(default_config());
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
         config.settings.fallback_model = Some("claude-opus-4-8".into());
+        let config = normalize_config(config);
         let allowed = HashSet::from(["claude-opus-4-8".to_string()]);
 
         let result = inject_into_with_model_filter(
@@ -671,19 +695,22 @@ mod tests {
         let catalog = fs::read_to_string(&result.catalog_path).unwrap();
 
         assert!(config_toml.contains("requires_openai_auth = false"));
-        assert!(config_toml.contains("model = \"gpt-5.4-mini\""));
+        assert!(config_toml.contains("model = \"gpt-5.5\""));
         assert!(config_toml.contains("model_context_window = 200000"));
         assert!(config_toml.contains("model_auto_compact_token_limit = 180000"));
-        assert!(catalog.contains("\"slug\": \"gpt-5.4-mini\""));
+        assert!(catalog.contains("\"slug\": \"gpt-5.5\""));
         assert!(catalog.contains("\"display_name\": \"Claude Opus 4.8\""));
-        assert!(!catalog.contains("gpt-5.5"));
+        assert!(!catalog.contains("\"slug\": \"claude-opus-4-8\""));
     }
 
     #[test]
-    fn lan_share_injection_writes_remote_models_only() {
+    fn lan_share_injection_writes_slot_model_with_remote_metadata() {
         let dir = tempfile::tempdir().unwrap();
+        let mut settings = default_config().settings;
+        settings.port = 9898;
         let models = vec![CatalogModel {
-            slug: "remote-gpt".into(),
+            slug: "gpt-5.5".into(),
+            target_model_id: Some("remote-gpt".into()),
             display_name: "Remote GPT".into(),
             description: "LAN model".into(),
             context_window: 258_000,
@@ -693,25 +720,39 @@ mod tests {
             provider_protocol: None,
         }];
 
-        let result = inject_lan_share_config_into(dir.path(), Some("remote-gpt"), &models).unwrap();
+        let result =
+            inject_lan_share_config_into(dir.path(), &settings, Some("remote-gpt"), &models)
+                .unwrap();
         let config_toml = fs::read_to_string(&result.config_path).unwrap();
         let catalog = fs::read_to_string(&result.catalog_path).unwrap();
 
         assert!(config_toml.contains("requires_openai_auth = false"));
-        assert!(config_toml.contains("model = \"remote-gpt\""));
+        assert!(config_toml.contains("base_url = \"http://127.0.0.1:9898/v1\""));
+        assert!(config_toml.contains("model = \"gpt-5.5\""));
         assert!(config_toml.contains("model_context_window = 258000"));
         assert!(config_toml.contains("model_auto_compact_token_limit = 232200"));
-        assert!(catalog.contains("\"slug\": \"remote-gpt\""));
-        assert!(!catalog.contains("gpt-5.5"));
+        assert!(catalog.contains("\"slug\": \"gpt-5.5\""));
+        assert!(catalog.contains("\"display_name\": \"Remote GPT\""));
+        assert!(!catalog.contains("\"slug\": \"remote-gpt\""));
     }
 
     #[test]
-    fn third_party_injection_resolves_existing_alias_model() {
+    fn local_codex_base_url_uses_current_port_and_loopback_for_public_bind() {
+        let mut settings = default_config().settings;
+        settings.bind_host = "0.0.0.0".into();
+        settings.port = 9898;
+
+        assert_eq!(local_codex_base_url(&settings), "http://127.0.0.1:9898/v1");
+    }
+
+    #[test]
+    fn third_party_injection_resolves_existing_slot_model() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("config.toml"), "model = \"gpt-5.4-mini\"\n").unwrap();
+        fs::write(dir.path().join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
         let mut config = normalize_config(default_config());
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
         config.settings.fallback_model = Some("claude-opus-4-8".into());
+        let mut config = normalize_config(config);
         config
             .models
             .iter_mut()
@@ -724,7 +765,7 @@ mod tests {
             inject_into_with_model_filter(&config, dir.path(), None, Some(&allowed)).unwrap();
         let config_toml = fs::read_to_string(&result.config_path).unwrap();
 
-        assert!(config_toml.contains("model = \"gpt-5.4-mini\""));
+        assert!(config_toml.contains("model = \"gpt-5.5\""));
         assert!(config_toml.contains("model_reasoning_effort = \"max\""));
         assert!(config_toml.contains("model_context_window = 258000"));
         assert!(config_toml.contains("model_auto_compact_token_limit = 232200"));

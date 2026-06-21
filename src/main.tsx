@@ -72,7 +72,6 @@ function navForMode(mode: AppConfig["settings"]["codex_injection_mode"]) {
 }
 
 type Toast = { id: number; msg: string; tone: "ok" | "bad" };
-const CODEX_RESTART_CONFIRMED_KEY = "neko-route.codex-restart-confirmed";
 
 function AppTitlebar() {
   const isMac = typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
@@ -355,20 +354,10 @@ function App() {
   }, [notify, notifyRaw]);
 
   const triggerCodexRestart = React.useCallback(async () => {
-    try {
-      const status = await api.codexAppStatus();
-      if (status.running && window.localStorage.getItem(CODEX_RESTART_CONFIRMED_KEY) !== "1") {
-        setCodexRestartConfirmOpen(true);
-        return;
-      }
-      await performCodexRestart();
-    } catch (error) {
-      notifyRaw(String(error), "bad");
-    }
-  }, [notifyRaw, performCodexRestart]);
+    setCodexRestartConfirmOpen(true);
+  }, []);
 
   const confirmCodexRestart = React.useCallback(async () => {
-    window.localStorage.setItem(CODEX_RESTART_CONFIRMED_KEY, "1");
     setCodexRestartConfirmOpen(false);
     await performCodexRestart();
   }, [performCodexRestart]);

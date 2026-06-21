@@ -42,6 +42,20 @@ pub struct Provider {
     pub protocol: ProviderProtocol,
     pub base_url: String,
     pub key_ref: Option<String>,
+    #[serde(default)]
+    pub http_proxy: ProviderHttpProxy,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderHttpProxy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +77,16 @@ pub struct ModelEntry {
     pub supported_reasoning_levels: Vec<String>,
     #[serde(default)]
     pub codex_alias: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexSlotAssignment {
+    #[serde(default)]
+    pub mode: CodexInjectionMode,
+    #[serde(default)]
+    pub source: String,
+    pub slot: String,
+    pub target_model_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +122,8 @@ pub struct Settings {
     /// model instead of letting them hit similarly named upstream models.
     #[serde(default = "default_true")]
     pub codex_internal_model_lock: bool,
+    #[serde(default)]
+    pub codex_slots: Vec<CodexSlotAssignment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +393,8 @@ pub struct AppSnapshot {
     pub config: AppConfig,
     pub keys: Vec<KeyStatus>,
     pub server: ServerStatus,
+    #[serde(default)]
+    pub codex_apply_error: Option<String>,
     pub requests: Vec<RequestRecord>,
     pub request_log_count: u64,
     pub stats: TokenStats,
@@ -376,7 +404,7 @@ pub struct AppSnapshot {
 
 pub fn default_config() -> AppConfig {
     AppConfig {
-        version: 11,
+        version: 13,
         providers: vec![
             Provider {
                 id: "openai-official".into(),
@@ -385,6 +413,7 @@ pub fn default_config() -> AppConfig {
                 protocol: ProviderProtocol::OpenAiResponses,
                 base_url: "https://api.openai.com/v1".into(),
                 key_ref: None,
+                http_proxy: ProviderHttpProxy::default(),
             },
             Provider {
                 id: "anthropic-cli".into(),
@@ -393,6 +422,7 @@ pub fn default_config() -> AppConfig {
                 protocol: ProviderProtocol::AnthropicMessages,
                 base_url: "local://claude-code".into(),
                 key_ref: None,
+                http_proxy: ProviderHttpProxy::default(),
             },
             Provider {
                 id: "anthropic-desktop".into(),
@@ -401,6 +431,7 @@ pub fn default_config() -> AppConfig {
                 protocol: ProviderProtocol::AnthropicMessages,
                 base_url: "local://claude-desktop".into(),
                 key_ref: None,
+                http_proxy: ProviderHttpProxy::default(),
             },
         ],
         models: vec![
@@ -443,6 +474,7 @@ pub fn default_config() -> AppConfig {
             codex_default_model: None,
             codex_injection_mode: CodexInjectionMode::OfficialAccount,
             codex_internal_model_lock: true,
+            codex_slots: Vec::new(),
         },
     }
 }

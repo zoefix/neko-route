@@ -7,6 +7,7 @@ mod lan_share;
 mod official_auth;
 mod official_usage;
 mod pricing;
+mod provider_proxy;
 mod redact;
 mod request_log;
 mod router;
@@ -158,6 +159,7 @@ async fn save_config(
     if server_bind_settings_changed(&previous.settings, &next.settings) {
         server_runtime.restart().await;
     }
+    store.apply_auto_codex_config_if_enabled().await;
     Ok(store.snapshot().await)
 }
 
@@ -181,6 +183,21 @@ async fn list_lan_models(store: tauri::State<'_, AppStore>) -> Result<LanModelLi
         })
         .collect();
     Ok(LanModelList { models })
+}
+
+fn default_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent("NekoRoute/0.1")
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn client_for_provider(
+    store: &AppStore,
+    default_client: &reqwest::Client,
+    provider: &Provider,
+) -> Result<reqwest::Client, String> {
+    provider_proxy::client_for_provider(default_client, store.key_store(), provider)
 }
 
 #[tauri::command]
@@ -219,6 +236,71 @@ async fn delete_provider_key(
         .as_deref()
         .ok_or_else(|| "This provider does not use a stored API key".to_string())?;
     store.key_store().delete_secret(key_ref)?;
+    Ok(store.snapshot().await)
+}
+
+#[tauri::command]
+async fn read_provider_proxy_password(
+    store: tauri::State<'_, AppStore>,
+    provider_id: String,
+) -> Result<String, String> {
+    let config = store.config().await;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| "Provider not found".to_string())?;
+    let Some(key_ref) = provider.http_proxy.password_ref.as_deref() else {
+        return Ok(String::new());
+    };
+    store
+        .key_store()
+        .get_secret(key_ref)
+        .map(|value| value.unwrap_or_default())
+}
+
+#[tauri::command]
+async fn set_provider_proxy_password(
+    store: tauri::State<'_, AppStore>,
+    provider_id: String,
+    password: String,
+) -> Result<AppSnapshot, String> {
+    let config = store.config().await;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| "Provider not found".to_string())?;
+    let key_ref = provider
+        .http_proxy
+        .password_ref
+        .clone()
+        .unwrap_or_else(|| provider_proxy::proxy_password_ref(&provider.id));
+    if password.is_empty() {
+        store.key_store().delete_secret(&key_ref)?;
+    } else {
+        store.key_store().set_secret(&key_ref, &password)?;
+    }
+    Ok(store.snapshot().await)
+}
+
+#[tauri::command]
+async fn delete_provider_proxy_password(
+    store: tauri::State<'_, AppStore>,
+    provider_id: String,
+) -> Result<AppSnapshot, String> {
+    let config = store.config().await;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| "Provider not found".to_string())?;
+    let key_ref = provider
+        .http_proxy
+        .password_ref
+        .clone()
+        .unwrap_or_else(|| provider_proxy::proxy_password_ref(&provider.id));
+    store.key_store().delete_secret(&key_ref)?;
     Ok(store.snapshot().await)
 }
 
@@ -332,7 +414,8 @@ async fn finish_openai_oauth(
         return Err("OpenAI OAuth session expired. Generate a new authorization link.".into());
     }
     let code = official_auth::extract_openai_oauth_code(&callback_or_code, &session.state)?;
-    let client = reqwest::Client::new();
+    let default_client = default_http_client()?;
+    let client = client_for_provider(&store, &default_client, provider)?;
     let token =
         official_auth::exchange_openai_oauth_code(&client, &code, &session.code_verifier).await?;
     official_auth::set_provider_token_value(&provider.id, token)?;
@@ -385,7 +468,8 @@ async fn finish_claude_oauth(
         return Err("Claude OAuth session expired. Generate a new authorization link.".into());
     }
     let code = official_auth::extract_claude_oauth_code(&callback_or_code, &session.state)?;
-    let client = reqwest::Client::new();
+    let default_client = default_http_client()?;
+    let client = client_for_provider(&store, &default_client, provider)?;
     let token =
         official_auth::exchange_claude_oauth_code(&client, &code, &session.code_verifier).await?;
     official_auth::set_provider_token_value(&provider.id, token)?;
@@ -408,7 +492,8 @@ async fn finish_claude_cookie_oauth(
     if provider.kind != ProviderKind::OfficialAnthropicAccount {
         return Err("This provider does not use Claude OAuth".into());
     }
-    let client = reqwest::Client::new();
+    let default_client = default_http_client()?;
+    let client = client_for_provider(&store, &default_client, provider)?;
     let token = official_auth::exchange_claude_cookie_session_key(&client, &session_key).await?;
     official_auth::set_provider_token_value(&provider.id, token)?;
     let _ = refresh_official_usage_for_provider(&store, provider).await;
@@ -444,7 +529,8 @@ async fn refresh_official_provider_token(
         .iter()
         .find(|provider| provider.id == provider_id)
         .ok_or_else(|| "Provider not found".to_string())?;
-    let client = reqwest::Client::new();
+    let default_client = default_http_client()?;
+    let client = client_for_provider(&store, &default_client, provider)?;
     official_auth::refresh_provider_token(&client, provider).await?;
     if matches!(
         provider.kind,
@@ -1074,7 +1160,34 @@ async fn run_context_pressure_attempt(
     mode: ModelTestMode,
     probe_tokens: u64,
 ) -> PressureAttemptResult {
-    let client = reqwest::Client::new();
+    let default_client = match default_http_client() {
+        Ok(client) => client,
+        Err(error) => {
+            return PressureAttemptResult {
+                ok: false,
+                status: 0,
+                latency_ms: 0,
+                usage: TokenUsage::default(),
+                proof_verified: false,
+                error: Some(error),
+                context_limit: false,
+            };
+        }
+    };
+    let client = match client_for_provider(store, &default_client, &matched.provider) {
+        Ok(client) => client,
+        Err(error) => {
+            return PressureAttemptResult {
+                ok: false,
+                status: 0,
+                latency_ms: 0,
+                usage: TokenUsage::default(),
+                proof_verified: false,
+                error: Some(error),
+                context_limit: false,
+            };
+        }
+    };
     let prompt = context_pressure_prompt(probe_tokens);
     let (url, headers, payload) =
         match pressure_test_request_parts(store, &client, matched, mode, prompt.text.clone()).await
@@ -1375,7 +1488,8 @@ async fn test_matched_model(
     store: &AppStore,
     matched: RouteMatch,
 ) -> Result<TestModelResult, String> {
-    let client = reqwest::Client::new();
+    let default_client = default_http_client()?;
+    let client = client_for_provider(store, &default_client, &matched.provider)?;
     let (url, headers, payload) = test_request_parts(store, &client, &matched).await?;
 
     let started = Instant::now();
@@ -1914,6 +2028,8 @@ async fn list_upstream_models(
             error: None,
         });
     }
+    let default_client = default_http_client()?;
+    let client = client_for_provider(&store, &default_client, provider)?;
 
     // Resolve base URL + auth headers per provider kind.
     let (base_url, headers, anthropic) = match &provider.kind {
@@ -1927,7 +2043,7 @@ async fn list_upstream_models(
             (auth.base_url, auth.headers, true)
         }
         ProviderKind::OfficialAnthropicAccount => {
-            let auth = official_auth::auth_for_provider(&reqwest::Client::new(), provider).await?;
+            let auth = official_auth::auth_for_provider(&client, provider).await?;
             (auth.base_url, auth.headers, true)
         }
         ProviderKind::Custom => {
@@ -1945,7 +2061,6 @@ async fn list_upstream_models(
         }
     };
 
-    let client = reqwest::Client::new();
     let models = fetch_upstream_models(&client, &base_url, &headers, anthropic).await?;
     Ok(UpstreamModelList {
         models,
@@ -2681,7 +2796,8 @@ async fn refresh_official_usage_for_provider(
     store: &AppStore,
     provider: &Provider,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let default_client = default_http_client()?;
+    let client = client_for_provider(store, &default_client, provider)?;
     let quota = match &provider.kind {
         ProviderKind::OfficialOpenAiAccount => {
             official_usage::fetch_openai_quota(&client, provider).await
@@ -2715,9 +2831,19 @@ async fn install_codex_config(
     default_model: Option<String>,
 ) -> Result<codex_config::InjectionResult, String> {
     let config = store.config().await;
-    store
+    match store
         .inject_codex_config_for(&config, default_model.as_deref())
         .await
+    {
+        Ok(result) => {
+            store.clear_codex_apply_error().await;
+            Ok(result)
+        }
+        Err(error) => {
+            store.set_codex_apply_error(error.clone()).await;
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -3071,6 +3197,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiResponses,
             base_url: "https://api.openai.com/v1".into(),
             key_ref: None,
+            http_proxy: Default::default(),
         };
         let added = Provider {
             id: "openai-account".into(),
@@ -3079,6 +3206,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiResponses,
             base_url: "https://api.openai.com/v1".into(),
             key_ref: Some("official-token:openai-account".into()),
+            http_proxy: Default::default(),
         };
 
         let fixed_models = openai_official_upstream_models(&fixed).unwrap();
@@ -3463,6 +3591,9 @@ pub fn run() {
             list_lan_models,
             set_provider_key,
             delete_provider_key,
+            read_provider_proxy_password,
+            set_provider_proxy_password,
+            delete_provider_proxy_password,
             set_official_provider_token,
             start_openai_oauth,
             finish_openai_oauth,

@@ -29,6 +29,14 @@ export type Provider = {
   protocol: ProviderProtocol;
   base_url: string;
   key_ref: string | null;
+  http_proxy: ProviderHttpProxy;
+};
+
+export type ProviderHttpProxy = {
+  enabled: boolean;
+  url: string;
+  username: string;
+  password_ref: string | null;
 };
 
 export type ModelEntry = {
@@ -47,6 +55,13 @@ export type ModelEntry = {
   codex_alias: string | null;
 };
 
+export type CodexSlotAssignment = {
+  mode: CodexInjectionMode;
+  source: string;
+  slot: string;
+  target_model_id: string;
+};
+
 export type SettingsState = {
   bind_host: string;
   port: number;
@@ -61,6 +76,7 @@ export type SettingsState = {
   codex_default_model: string | null;
   codex_injection_mode: CodexInjectionMode;
   codex_internal_model_lock: boolean;
+  codex_slots: CodexSlotAssignment[];
 };
 
 export type AppConfig = {
@@ -341,6 +357,7 @@ export type AppSnapshot = {
   config: AppConfig;
   keys: KeyStatus[];
   server: { bind_url: string; running: boolean; error: string | null };
+  codex_apply_error: string | null;
   requests: RequestRecord[];
   request_log_count: number;
   stats: TokenStats;

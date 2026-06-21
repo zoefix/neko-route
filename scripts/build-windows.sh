@@ -106,9 +106,13 @@ if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" && -f "$ROOT/updater-signing-key.local
   export TAURI_SIGNING_PRIVATE_KEY="$(<"$ROOT/updater-signing-key.local")"
 fi
 
+ARTIFACT_DIR="src-tauri/target/$TARGET/release/bundle/nsis"
+if [[ -d "$ARTIFACT_DIR" ]]; then
+  rm -f "$ARTIFACT_DIR"/*setup.exe "$ARTIFACT_DIR"/*setup.exe.sig "$ARTIFACT_DIR"/*setup.exe.zip "$ARTIFACT_DIR"/*setup.exe.zip.sig
+fi
+
 corepack pnpm tauri build --target "$TARGET" --bundles nsis --ci
 
-ARTIFACT_DIR="src-tauri/target/$TARGET/release/bundle/nsis"
 ARTIFACT="$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*setup.exe' -print -quit)"
 if [[ -z "$ARTIFACT" ]]; then
   echo "No NSIS installer found in $ARTIFACT_DIR" >&2

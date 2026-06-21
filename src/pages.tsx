@@ -13,12 +13,13 @@ import {
   IconCoins as Coins,
   IconCopy as Copy,
   IconCpu as Cpu,
+  IconEye as Eye,
+  IconEyeOff as EyeOff,
   IconFileCode as FileJson,
   IconGauge as Gauge,
   IconGripVertical as GripVertical,
   IconInbox as Inbox,
   IconExternalLink as ExternalLink,
-  IconKey as KeyRound,
   IconListTree as ListTree,
   IconPencil as Pencil,
   IconPlugConnected as CustomProviderIcon,
@@ -26,6 +27,7 @@ import {
   IconPlus as Plus,
   IconRefresh as RotateCcw,
   IconRocket as Rocket,
+  IconRouteAltLeft as RouteProxy,
   IconServer as Server,
   IconSettings as Settings2,
   IconShieldCheck as ShieldCheck,
@@ -46,6 +48,7 @@ import type {
   ModelEntry,
   OfficialQuotaWindow,
   Provider,
+  ProviderHttpProxy,
   ProviderUsageStatus,
   ProviderProtocol,
   ReasoningEffort,
@@ -122,6 +125,28 @@ function isOfficialAccountProvider(provider: Provider) {
     provider.kind === "official_open_ai_account" ||
     provider.kind === "official_anthropic_account"
   );
+}
+
+function isBuiltInOfficialClient(provider: Provider) {
+  return (
+    provider.kind === "official_open_ai" ||
+    provider.kind === "official_anthropic_cli" ||
+    provider.kind === "official_anthropic_desktop"
+  );
+}
+
+function providerVisibleInUi(provider: Provider, snapshot: AppSnapshot) {
+  if (!isBuiltInOfficialClient(provider)) return true;
+  const status = snapshot.keys.find((item) => item.provider_id === provider.id);
+  return Boolean(status?.present && status.available !== false);
+}
+
+function visibleUiProviders(config: AppConfig, snapshot: AppSnapshot) {
+  return config.providers.filter((provider) => providerVisibleInUi(provider, snapshot));
+}
+
+function visibleUiProviderIds(config: AppConfig, snapshot: AppSnapshot) {
+  return new Set(visibleUiProviders(config, snapshot).map((provider) => provider.id));
 }
 
 function providerShortSourceKey(provider?: Provider): MsgKey {
@@ -766,8 +791,9 @@ function TokenBar({ label, value, total, cls }: { label: string; value: number; 
 export function Dashboard({ snapshot, config }: PageProps) {
   const { t } = useI18n();
   const [range, setRange] = React.useState<Range>("today");
-  const enabledModels = config.models.filter((m) => m.enabled).length;
-  const providerCount = config.providers.length;
+  const visibleProviderIds = visibleUiProviderIds(config, snapshot);
+  const enabledModels = config.models.filter((m) => m.enabled && visibleProviderIds.has(m.provider_id)).length;
+  const providerCount = visibleProviderIds.size;
   const total = snapshot.requests.length;
   const success =
     total === 0
@@ -907,6 +933,7 @@ function modelSwitchLabel(model: ModelEntry, config: AppConfig) {
 function ModelModal({
   open,
   onClose,
+  snapshot,
   config,
   editIndex,
   commit,
@@ -915,6 +942,7 @@ function ModelModal({
 }: {
   open: boolean;
   onClose: () => void;
+  snapshot: AppSnapshot;
   config: AppConfig;
   editIndex: number | null;
   commit: PageProps["commit"];
@@ -923,7 +951,12 @@ function ModelModal({
 }) {
   const { t } = useI18n();
   const isEdit = editIndex !== null;
-  const [draft, setDraft] = React.useState<ModelEntry>(EMPTY_MODEL(config.providers[0]));
+  const visibleProviders = React.useMemo(
+    () => visibleUiProviders(config, snapshot),
+    [config.providers, snapshot.keys],
+  );
+  const defaultProvider = visibleProviders[0] ?? config.providers[0];
+  const [draft, setDraft] = React.useState<ModelEntry>(EMPTY_MODEL(defaultProvider));
   const [upstreamOptions, setUpstreamOptions] = React.useState<Option[]>([]);
   const [loadingUpstream, setLoadingUpstream] = React.useState(false);
   const [upstreamError, setUpstreamError] = React.useState<string | null>(null);
@@ -935,7 +968,7 @@ function ModelModal({
       model.context_window = normalizeModelContextWindow(model.context_window);
       setDraft(model);
     } else {
-      setDraft(EMPTY_MODEL(config.providers[0]));
+      setDraft(EMPTY_MODEL(defaultProvider));
     }
   });
 
@@ -990,7 +1023,10 @@ function ModelModal({
     });
   }
 
-  const valid = draft.id.trim().length > 0 && draft.provider_id.length > 0;
+  const valid =
+    draft.id.trim().length > 0 &&
+    draft.provider_id.length > 0 &&
+    visibleProviders.some((provider) => provider.id === draft.provider_id);
 
   async function submit() {
     if (!valid) return;
@@ -1037,7 +1073,7 @@ function ModelModal({
     if (ok) onClose();
   }
 
-  const providerOptions = config.providers.map((p) => ({
+  const providerOptions = visibleProviders.map((p) => ({
     value: p.id,
     label: p.name,
     sub: t(protocolKey(p.protocol)),
@@ -1282,9 +1318,10 @@ type DisplayModel = {
   visualIndex: number;
 };
 
-function modelsForDisplay(models: ModelEntry[]): DisplayModel[] {
+function modelsForDisplay(models: ModelEntry[], visibleProviderIds: Set<string>): DisplayModel[] {
   return models
     .map((model, index) => ({ model, index }))
+    .filter(({ model }) => visibleProviderIds.has(model.provider_id))
     .sort((a, b) => {
       if (a.model.enabled !== b.model.enabled) return a.model.enabled ? -1 : 1;
       return a.index - b.index;
@@ -1297,6 +1334,14 @@ function modelsForDisplay(models: ModelEntry[]): DisplayModel[] {
    ============================================================ */
 export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appAction }: PageProps) {
   const { t } = useI18n();
+  const visibleProviderIds = React.useMemo(
+    () => visibleUiProviderIds(config, snapshot),
+    [config.providers, snapshot.keys],
+  );
+  const displayModels = React.useMemo(
+    () => modelsForDisplay(config.models, visibleProviderIds),
+    [config.models, visibleProviderIds],
+  );
   const [modalOpen, setModalOpen] = React.useState(false);
   const [editIndex, setEditIndex] = React.useState<number | null>(null);
   const [deleteIndex, setDeleteIndex] = React.useState<number | null>(null);
@@ -1313,7 +1358,7 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
   const dragOverRef = React.useRef<number | null>(null);
   const duplicateModelStats = React.useMemo(() => {
     const stats = new Map<string, { total: number; enabled: number }>();
-    for (const model of config.models) {
+    for (const { model } of displayModels) {
       const id = modelIdKey(model.id);
       if (!id) continue;
       const current = stats.get(id) ?? { total: 0, enabled: 0 };
@@ -1322,8 +1367,7 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
       stats.set(id, current);
     }
     return stats;
-  }, [config.models]);
-  const displayModels = React.useMemo(() => modelsForDisplay(config.models), [config.models]);
+  }, [displayModels]);
   const displayPositionByIndex = React.useMemo(() => {
     const positions = new Map<number, number>();
     displayModels.forEach((item) => positions.set(item.index, item.visualIndex));
@@ -1540,11 +1584,11 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
   return (
     <div className="stack page-enter">
       <div className="row row-between wrap">
-        <div className="page-lead">{t("models.count", { count: config.models.length })}</div>
+        <div className="page-lead">{t("models.count", { count: displayModels.length })}</div>
         <Button variant="primary" icon={<Plus size={16} />} onClick={openAdd}>{t("models.add")}</Button>
       </div>
 
-      {config.models.length === 0 ? (
+      {displayModels.length === 0 ? (
         <Empty icon={<Cpu size={26} />} title={t("models.empty")} hint={t("models.emptyHint")} />
       ) : (
         <div className="entity-list">
@@ -1649,7 +1693,7 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
         </div>
       )}
 
-      <ModelModal open={modalOpen} onClose={() => setModalOpen(false)} config={config} editIndex={editIndex} commit={commit} notifyRaw={notifyRaw} busy={busy} />
+      <ModelModal open={modalOpen} onClose={() => setModalOpen(false)} snapshot={snapshot} config={config} editIndex={editIndex} commit={commit} notifyRaw={notifyRaw} busy={busy} />
       <TestModal
         open={testModal.open}
         onClose={() => void closeTestModal()}
@@ -1681,6 +1725,50 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
 type ProviderFormKind = "custom" | "openai_account" | "claude_account";
 type OpenAiAuthMode = "oauth" | "json";
 type ClaudeAuthMode = "manual" | "cookie" | "json";
+
+function providerProxyPasswordRef(providerId: string) {
+  return `provider-proxy:${providerId}`;
+}
+
+function emptyHttpProxy(): ProviderHttpProxy {
+  return {
+    enabled: false,
+    url: "",
+    username: "",
+    password_ref: null,
+  };
+}
+
+function proxyForProvider(provider: Provider | null | undefined): ProviderHttpProxy {
+  return provider?.http_proxy ?? emptyHttpProxy();
+}
+
+function normalizeProxyInput(raw: string, username: string, password: string) {
+  let input = raw.trim();
+  let nextUsername = username.trim();
+  let nextPassword = password;
+  if (!input) {
+    return { url: "", username: nextUsername, password: nextPassword };
+  }
+  if (!/^https?:\/\//i.test(input)) input = `http://${input}`;
+  const url = new URL(input);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("HTTP proxy must start with http:// or https://");
+  }
+  if (!url.hostname) {
+    throw new Error("HTTP proxy host is required");
+  }
+  if (url.username && !nextUsername) {
+    nextUsername = decodeURIComponent(url.username);
+  }
+  if (url.password) {
+    nextPassword = decodeURIComponent(url.password);
+  }
+  url.username = "";
+  url.password = "";
+  const clean = url.toString().replace(/\/$/, "");
+  return { url: clean, username: nextUsername, password: nextPassword };
+}
 
 function providerFormKind(provider: Provider | null): ProviderFormKind {
   if (provider?.kind === "official_open_ai_account") return "openai_account";
@@ -1721,6 +1809,7 @@ function ProviderModal({
   const [baseUrl, setBaseUrl] = React.useState("");
   const [useKey, setUseKey] = React.useState(true);
   const [secret, setSecret] = React.useState("");
+  const [showSecret, setShowSecret] = React.useState(false);
   const [tokenJson, setTokenJson] = React.useState("");
   const [openAiAuthMode, setOpenAiAuthMode] = React.useState<OpenAiAuthMode>("oauth");
   const [claudeAuthMode, setClaudeAuthMode] = React.useState<ClaudeAuthMode>("manual");
@@ -1729,16 +1818,28 @@ function ProviderModal({
   const [oauthCallback, setOauthCallback] = React.useState("");
   const [claudeSessionKey, setClaudeSessionKey] = React.useState("");
   const [oauthLoading, setOauthLoading] = React.useState(false);
+  const [proxyEnabled, setProxyEnabled] = React.useState(false);
+  const [proxyUrl, setProxyUrl] = React.useState("");
+  const [proxyUsername, setProxyUsername] = React.useState("");
+  const [proxyPassword, setProxyPassword] = React.useState("");
+  const [credentialLoaded, setCredentialLoaded] = React.useState(false);
+  const [proxyPasswordLoaded, setProxyPasswordLoaded] = React.useState(false);
 
   useSeedOnOpen(open, () => {
     if (existing) {
+      const proxy = proxyForProvider(existing);
       setFormKind(providerFormKind(existing));
       setName(existing.name);
       setProtocol(existing.protocol);
       setBaseUrl(existing.base_url);
       setUseKey(Boolean(existing.key_ref));
-      setOpenAiAuthMode(existing.kind === "official_open_ai_account" ? "oauth" : "json");
-      setClaudeAuthMode(existing.kind === "official_anthropic_account" ? "manual" : "json");
+      setOpenAiAuthMode(existing.kind === "official_open_ai_account" ? "json" : "oauth");
+      setClaudeAuthMode(existing.kind === "official_anthropic_account" ? "json" : "manual");
+      setProxyEnabled(proxy.enabled);
+      setProxyUrl(proxy.url);
+      setProxyUsername(proxy.username);
+      setCredentialLoaded(false);
+      setProxyPasswordLoaded(false);
     } else {
       const seed = newCustomProvider();
       setFormKind("custom");
@@ -1748,14 +1849,56 @@ function ProviderModal({
       setUseKey(true);
       setOpenAiAuthMode("oauth");
       setClaudeAuthMode("manual");
+      setProxyEnabled(false);
+      setProxyUrl("");
+      setProxyUsername("");
+      setCredentialLoaded(true);
+      setProxyPasswordLoaded(true);
     }
     setSecret("");
+    setShowSecret(false);
     setTokenJson("");
+    setProxyPassword("");
     setOauthSessionId("");
     setOauthAuthUrl("");
     setOauthCallback("");
     setClaudeSessionKey("");
   });
+
+  React.useEffect(() => {
+    if (!open || !existing) return;
+    let cancelled = false;
+    api
+      .readProviderCredential(existing.id)
+      .then((credential) => {
+        if (cancelled) return;
+        if (existing.kind === "custom") {
+          setSecret(credential.value);
+        } else if (isOfficialAccountProvider(existing)) {
+          setTokenJson(credential.value);
+        }
+        setCredentialLoaded(true);
+      })
+      .catch((error) => {
+        if (!cancelled) notifyRaw(String(error), "bad");
+        if (!cancelled) setCredentialLoaded(true);
+      });
+    api
+      .readProviderProxyPassword(existing.id)
+      .then((password) => {
+        if (!cancelled) {
+          setProxyPassword(password);
+          setProxyPasswordLoaded(true);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) notifyRaw(String(error), "bad");
+        if (!cancelled) setProxyPasswordLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, existing?.id]);
 
   const officialAccount = formKind !== "custom";
   const openAiAccount = formKind === "openai_account";
@@ -1769,7 +1912,9 @@ function ProviderModal({
     : claudeCookieMode
       ? claudeSessionKey.trim().length > 0
       : tokenJson.trim().length > 0;
-  const valid = name.trim().length > 0 && (officialAccount ? isEdit || officialCredentialReady : baseUrl.trim().length > 0);
+  const editSecretsLoaded = !isEdit || (credentialLoaded && proxyPasswordLoaded);
+  const proxyValid = !proxyEnabled || proxyUrl.trim().length > 0;
+  const valid = editSecretsLoaded && proxyValid && name.trim().length > 0 && (officialAccount ? isEdit || officialCredentialReady : baseUrl.trim().length > 0);
 
   const protoOptions = [
     { value: "open_ai_responses", label: t("proto.responses") },
@@ -1791,22 +1936,37 @@ function ProviderModal({
       setProtocol(seed.protocol);
       setBaseUrl(seed.base_url);
       setUseKey(true);
+      setShowSecret(false);
+      setProxyEnabled(false);
+      setProxyUrl("");
+      setProxyUsername("");
+      setProxyPassword("");
     } else if (kind === "openai_account") {
       const seed = newOpenAiAccountProvider();
       setName(seed.name);
       setProtocol(seed.protocol);
       setBaseUrl(seed.base_url);
       setUseKey(false);
+      setShowSecret(false);
       setOpenAiAuthMode("oauth");
       setClaudeAuthMode("manual");
+      setProxyEnabled(false);
+      setProxyUrl("");
+      setProxyUsername("");
+      setProxyPassword("");
     } else {
       const seed = newClaudeAccountProvider();
       setName(seed.name);
       setProtocol(seed.protocol);
       setBaseUrl(seed.base_url);
       setUseKey(false);
+      setShowSecret(false);
       setOpenAiAuthMode("oauth");
       setClaudeAuthMode("manual");
+      setProxyEnabled(false);
+      setProxyUrl("");
+      setProxyUsername("");
+      setProxyPassword("");
     }
   }
 
@@ -1844,6 +2004,16 @@ function ProviderModal({
     }
   }
 
+  async function copyText(value: string) {
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      notify("toast.copied");
+    } catch (error) {
+      notifyRaw(String(error), "bad");
+    }
+  }
+
   async function submit() {
     if (!valid) return;
     if ((openAiOAuthMode || claudeManualMode) && oauthCallback.trim() && !oauthSessionId) {
@@ -1858,6 +2028,25 @@ function ProviderModal({
         return;
       }
     }
+    let parsedProxy: { url: string; username: string; password: string };
+    try {
+      parsedProxy = normalizeProxyInput(proxyUrl, proxyUsername, proxyPassword);
+    } catch (error) {
+      notifyRaw(String(error), "bad");
+      return;
+    }
+    if (proxyEnabled && !parsedProxy.url) {
+      notifyRaw(t("provider.proxyRequired"), "bad");
+      return;
+    }
+    const proxyForId = (id: string): ProviderHttpProxy => proxyEnabled
+      ? {
+          enabled: true,
+          url: parsedProxy.url,
+          username: parsedProxy.username,
+          password_ref: parsedProxy.password ? providerProxyPasswordRef(id) : null,
+        }
+      : emptyHttpProxy();
     let providerId = editId;
     const cleanUrl = officialAccount ? baseUrl : normalizeBaseUrl(baseUrl);
     const ok = await commit((d) => {
@@ -1865,6 +2054,7 @@ function ProviderModal({
         const idx = d.providers.findIndex((p) => p.id === existing.id);
         if (idx >= 0) {
           d.providers[idx].name = name.trim();
+          d.providers[idx].http_proxy = proxyForId(existing.id);
           if (existing.kind === "custom") {
             d.providers[idx].protocol = protocol;
             d.providers[idx].base_url = cleanUrl;
@@ -1884,11 +2074,11 @@ function ProviderModal({
       } else if (formKind === "openai_account") {
         const seed = newOpenAiAccountProvider();
         providerId = seed.id;
-        d.providers.push({ ...seed, name: name.trim() });
+        d.providers.push({ ...seed, name: name.trim(), http_proxy: proxyForId(seed.id) });
       } else if (formKind === "claude_account") {
         const seed = newClaudeAccountProvider();
         providerId = seed.id;
-        d.providers.push({ ...seed, name: name.trim() });
+        d.providers.push({ ...seed, name: name.trim(), http_proxy: proxyForId(seed.id) });
       } else {
         const seed = newCustomProvider();
         providerId = seed.id;
@@ -1898,11 +2088,28 @@ function ProviderModal({
           protocol,
           base_url: cleanUrl,
           key_ref: useKey ? seed.key_ref : null,
+          http_proxy: proxyForId(seed.id),
         });
       }
     }, isEdit ? "toast.providerUpdated" : "toast.providerAdded");
 
     if (!ok) return;
+
+    if (providerId) {
+      setBusy(true);
+      try {
+        if (proxyEnabled && parsedProxy.password) {
+          await api.setProviderProxyPassword(providerId, parsedProxy.password);
+        } else {
+          await api.deleteProviderProxyPassword(providerId);
+        }
+      } catch (error) {
+        notifyRaw(String(error), "bad");
+        return;
+      } finally {
+        setBusy(false);
+      }
+    }
 
     if (openAiOAuthMode && oauthCallback.trim() && providerId) {
       setBusy(true);
@@ -1912,6 +2119,7 @@ function ProviderModal({
         await refresh();
       } catch (error) {
         notifyRaw(String(error), "bad");
+        return;
       } finally {
         setBusy(false);
       }
@@ -1923,6 +2131,7 @@ function ProviderModal({
         await refresh();
       } catch (error) {
         notifyRaw(String(error), "bad");
+        return;
       } finally {
         setBusy(false);
       }
@@ -1934,6 +2143,7 @@ function ProviderModal({
         await refresh();
       } catch (error) {
         notifyRaw(String(error), "bad");
+        return;
       } finally {
         setBusy(false);
       }
@@ -1945,17 +2155,36 @@ function ProviderModal({
         await refresh();
       } catch (error) {
         notifyRaw(String(error), "bad");
+        return;
       } finally {
         setBusy(false);
       }
-    } else if (!officialAccount && useKey && secret.trim() && providerId) {
+    } else if (officialJsonMode && isEdit && providerId) {
       setBusy(true);
       try {
-        await api.setProviderKey(providerId, secret.trim());
-        notify("toast.keySaved");
+        await api.deleteOfficialProviderToken(providerId);
+        notify("toast.keyDeleted");
         await refresh();
       } catch (error) {
         notifyRaw(String(error), "bad");
+        return;
+      } finally {
+        setBusy(false);
+      }
+    } else if (!officialAccount && useKey && providerId) {
+      setBusy(true);
+      try {
+        if (secret.trim()) {
+          await api.setProviderKey(providerId, secret.trim());
+          notify("toast.keySaved");
+        } else {
+          await api.deleteProviderKey(providerId);
+          notify("toast.keyDeleted");
+        }
+        await refresh();
+      } catch (error) {
+        notifyRaw(String(error), "bad");
+        return;
       } finally {
         setBusy(false);
       }
@@ -2045,6 +2274,11 @@ function ProviderModal({
             </div>
           ) : (
             <Field label={t("provider.tokenJson")} hint={isEdit ? t("provider.tokenJsonEditHint") : t("provider.tokenJsonHint")}>
+              <div className="row row-end">
+                <Button variant="ghost" icon={<Copy size={16} />} onClick={() => copyText(tokenJson)} disabled={!tokenJson}>
+                  {t("common.copy")}
+                </Button>
+              </div>
               <textarea
                 className="input token-json-input"
                 value={tokenJson}
@@ -2140,6 +2374,11 @@ function ProviderModal({
             </div>
           ) : (
             <Field label={t("provider.tokenJson")} hint={isEdit ? t("provider.tokenJsonEditHint") : t("provider.tokenJsonHint")}>
+              <div className="row row-end">
+                <Button variant="ghost" icon={<Copy size={16} />} onClick={() => copyText(tokenJson)} disabled={!tokenJson}>
+                  {t("common.copy")}
+                </Button>
+              </div>
               <textarea
                 className="input token-json-input"
                 value={tokenJson}
@@ -2151,6 +2390,11 @@ function ProviderModal({
         </>
       ) : officialAccount ? (
         <Field label={t("provider.tokenJson")} hint={isEdit ? t("provider.tokenJsonEditHint") : t("provider.tokenJsonHint")}>
+          <div className="row row-end">
+            <Button variant="ghost" icon={<Copy size={16} />} onClick={() => copyText(tokenJson)} disabled={!tokenJson}>
+              {t("common.copy")}
+            </Button>
+          </div>
           <textarea
             className="input token-json-input"
             value={tokenJson}
@@ -2175,27 +2419,68 @@ function ProviderModal({
         </div>
       ) : null}
       {!officialAccount && useKey ? (
-        <Field label={t("keyModal.field")}>
-          <Input
-            type="password"
-            value={secret}
-            placeholder={existing?.key_ref ? "••••••••" : t("keyModal.placeholder")}
-            onChange={(e) => setSecret(e.target.value)}
-          />
+        <Field label={t("provider.apiKey")}>
+          <div className="input-action-row">
+            <Input
+              type={showSecret ? "text" : "password"}
+              value={secret}
+              placeholder={t("provider.apiKeyPlaceholder")}
+              autoComplete="off"
+              onChange={(e) => setSecret(e.target.value)}
+            />
+            <IconButton
+              icon={showSecret ? <EyeOff size={16} /> : <Eye size={16} />}
+              title={t(showSecret ? "provider.hideSecret" : "provider.showSecret")}
+              onClick={() => setShowSecret((value) => !value)}
+            />
+            <IconButton
+              icon={<Copy size={16} />}
+              title={t("common.copy")}
+              onClick={() => copyText(secret)}
+              disabled={!secret}
+            />
+          </div>
         </Field>
+      ) : null}
+      <div className="modal-toggle-row">
+        <div>
+          <div className="mtr-title">{t("provider.httpProxy")}</div>
+          <div className="mtr-hint">{t("provider.httpProxyHint")}</div>
+        </div>
+        <Switch checked={proxyEnabled} onChange={setProxyEnabled} />
+      </div>
+      {proxyEnabled ? (
+        <>
+          <Field label={t("provider.proxyUrl")} hint={t("provider.proxyUrlHint")}>
+            <Input
+              value={proxyUrl}
+              placeholder="http://127.0.0.1:7890"
+              onChange={(event) => setProxyUrl(event.target.value)}
+            />
+          </Field>
+          <Field label={t("provider.proxyUsername")}>
+            <Input
+              value={proxyUsername}
+              onChange={(event) => setProxyUsername(event.target.value)}
+            />
+          </Field>
+          <Field label={t("provider.proxyPassword")}>
+            <Input
+              value={proxyPassword}
+              onChange={(event) => setProxyPassword(event.target.value)}
+            />
+          </Field>
+        </>
       ) : null}
     </Modal>
   );
 }
 
-/* ============================================================
-   Key-only modal (for official providers that accept keys — currently custom only,
-   but kept generic for managing an existing provider's secret)
-   ============================================================ */
-function KeyModal({
+function ProviderProxyModal({
   open,
   onClose,
   provider,
+  commit,
   refresh,
   setBusy,
   busy,
@@ -2205,6 +2490,7 @@ function KeyModal({
   open: boolean;
   onClose: () => void;
   provider: Provider | null;
+  commit: PageProps["commit"];
   refresh: PageProps["refresh"];
   setBusy: PageProps["setBusy"];
   busy: boolean;
@@ -2212,41 +2498,35 @@ function KeyModal({
   notifyRaw: PageProps["notifyRaw"];
 }) {
   const { t } = useI18n();
-  const [secret, setSecret] = React.useState("");
-  const [editable, setEditable] = React.useState(false);
-  const [deletable, setDeletable] = React.useState(false);
-  const [loading, setLoading] = React.useState(false);
-  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [enabled, setEnabled] = React.useState(false);
+  const [url, setUrl] = React.useState("");
+  const [username, setUsername] = React.useState("");
+  const [password, setPassword] = React.useState("");
+  const [loaded, setLoaded] = React.useState(false);
 
   useSeedOnOpen(open, () => {
-    setSecret("");
-    setEditable(false);
-    setDeletable(false);
-    setLoadError(null);
+    const proxy = proxyForProvider(provider);
+    setEnabled(proxy.enabled);
+    setUrl(proxy.url);
+    setUsername(proxy.username);
+    setPassword("");
+    setLoaded(false);
   });
 
   React.useEffect(() => {
     if (!open || !provider) return;
     let cancelled = false;
-    setLoading(true);
-    setLoadError(null);
     api
-      .readProviderCredential(provider.id)
-      .then((credential) => {
-        if (cancelled) return;
-        setSecret(credential.value);
-        setEditable(credential.editable);
-        setDeletable(credential.deletable);
+      .readProviderProxyPassword(provider.id)
+      .then((value) => {
+        if (!cancelled) {
+          setPassword(value);
+          setLoaded(true);
+        }
       })
       .catch((error) => {
-        if (cancelled) return;
-        setSecret("");
-        setEditable(false);
-        setDeletable(false);
-        setLoadError(String(error));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) notifyRaw(String(error), "bad");
+        if (!cancelled) setLoaded(true);
       });
     return () => {
       cancelled = true;
@@ -2255,56 +2535,46 @@ function KeyModal({
 
   if (!provider) return null;
 
-  const officialTokenProvider = isOfficialAccountProvider(provider);
-  const multiline = officialTokenProvider || provider.kind !== "custom";
-  const canSave = editable && !loading;
-  const canDelete = editable && deletable && !loading && secret.trim().length > 0;
-
   async function save() {
     if (!provider) return;
+    let parsed: { url: string; username: string; password: string };
+    try {
+      parsed = normalizeProxyInput(url, username, password);
+    } catch (error) {
+      notifyRaw(String(error), "bad");
+      return;
+    }
+    if (enabled && !parsed.url) {
+      notifyRaw(t("provider.proxyRequired"), "bad");
+      return;
+    }
+    const nextProxy: ProviderHttpProxy = enabled
+      ? {
+          enabled: true,
+          url: parsed.url,
+          username: parsed.username,
+          password_ref: parsed.password ? providerProxyPasswordRef(provider.id) : null,
+        }
+      : emptyHttpProxy();
+    const ok = await commit((draft) => {
+      const item = draft.providers.find((candidate) => candidate.id === provider.id);
+      if (item) item.http_proxy = nextProxy;
+    }, "toast.providerUpdated");
+    if (!ok) return;
+
     setBusy(true);
     try {
-      if (officialTokenProvider) {
-        await api.setOfficialProviderToken(provider.id, secret.trim());
+      if (enabled && parsed.password) {
+        await api.setProviderProxyPassword(provider.id, parsed.password);
       } else {
-        await api.setProviderKey(provider.id, secret.trim());
+        await api.deleteProviderProxyPassword(provider.id);
       }
-      notify("toast.keySaved");
       await refresh();
       onClose();
     } catch (error) {
       notifyRaw(String(error), "bad");
     } finally {
       setBusy(false);
-    }
-  }
-
-  async function remove() {
-    if (!provider) return;
-    setBusy(true);
-    try {
-      if (officialTokenProvider) {
-        await api.deleteOfficialProviderToken(provider.id);
-      } else {
-        await api.deleteProviderKey(provider.id);
-      }
-      notify("toast.keyDeleted");
-      await refresh();
-      onClose();
-    } catch (error) {
-      notifyRaw(String(error), "bad");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function copyCredential() {
-    if (!secret) return;
-    try {
-      await navigator.clipboard.writeText(secret);
-      notify("toast.copied");
-    } catch (error) {
-      notifyRaw(String(error), "bad");
     }
   }
 
@@ -2312,45 +2582,38 @@ function KeyModal({
     <Modal
       open={open}
       onClose={onClose}
-      title={t("keyModal.title")}
-      sub={t("keyModal.sub", { name: provider.name })}
-      icon={<KeyRound size={18} />}
-      color="peach"
-      width={640}
+      title={t("provider.proxySettings")}
+      sub={provider.name}
+      icon={<Settings2 size={18} />}
+      color="sakura"
+      width={560}
       footer={
         <>
-          {canDelete ? <Button variant="danger" icon={<Trash2 size={16} />} onClick={remove} loading={busy}>{t("keyModal.delete")}</Button> : null}
-          <div style={{ flex: 1 }} />
           <Button variant="ghost" onClick={onClose}>{t("common.cancel")}</Button>
-          {secret ? <Button variant="ghost" icon={<Copy size={16} />} onClick={copyCredential}>{t("keyModal.copy")}</Button> : null}
-          {canSave ? <Button variant="primary" icon={<ShieldCheck size={16} />} onClick={save} loading={busy} disabled={!secret.trim()}>{t("keyModal.save")}</Button> : null}
+          <Button variant="primary" onClick={save} loading={busy} disabled={!loaded || (enabled && !url.trim())}>{t("common.save")}</Button>
         </>
       }
     >
-      {loadError ? <div className="inline-warning">{t("keyModal.loadError", { error: loadError })}</div> : null}
-      <Field
-        label={officialTokenProvider ? t("provider.tokenJson") : t("keyModal.field")}
-      >
-        {multiline ? (
-          <textarea
-            className="input token-json-input"
-            value={loading ? t("keyModal.loading") : secret}
-            readOnly={!editable || loading}
-            placeholder={t("keyModal.placeholder")}
-            onChange={(e) => setSecret(e.target.value)}
-            autoFocus
-          />
-        ) : (
-          <Input
-            type="text"
-            value={loading ? t("keyModal.loading") : secret}
-            readOnly={!editable || loading}
-            placeholder={t("keyModal.placeholder")}
-            onChange={(e) => setSecret(e.target.value)}
-            autoFocus
-          />
-        )}
-      </Field>
+      <div className="modal-toggle-row">
+        <div>
+          <div className="mtr-title">{t("provider.httpProxy")}</div>
+          <div className="mtr-hint">{t("provider.httpProxyHint")}</div>
+        </div>
+        <Switch checked={enabled} onChange={setEnabled} />
+      </div>
+      {enabled ? (
+        <>
+          <Field label={t("provider.proxyUrl")} hint={t("provider.proxyUrlHint")}>
+            <Input value={url} placeholder="http://127.0.0.1:7890" onChange={(event) => setUrl(event.target.value)} />
+          </Field>
+          <Field label={t("provider.proxyUsername")}>
+            <Input value={username} onChange={(event) => setUsername(event.target.value)} />
+          </Field>
+          <Field label={t("provider.proxyPassword")}>
+            <Input value={password} onChange={(event) => setPassword(event.target.value)} />
+          </Field>
+        </>
+      ) : null}
     </Modal>
   );
 }
@@ -2464,8 +2727,12 @@ function OfficialAccountUsage({
 
 export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw, setBusy, busy, appAction }: PageProps) {
   const { t } = useI18n();
+  const visibleProviders = React.useMemo(
+    () => visibleUiProviders(config, snapshot),
+    [config.providers, snapshot.keys],
+  );
   const [providerModal, setProviderModal] = React.useState<{ open: boolean; editId: string | null }>({ open: false, editId: null });
-  const [keyModal, setKeyModal] = React.useState<Provider | null>(null);
+  const [proxyModal, setProxyModal] = React.useState<Provider | null>(null);
   const [deleteProvider, setDeleteProvider] = React.useState<Provider | null>(null);
   const [usageRefreshing, setUsageRefreshing] = React.useState<string | null>(null);
 
@@ -2544,6 +2811,7 @@ export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw,
   function renderRow(provider: Provider, index: number) {
     const ident = providerIcon(provider);
     const editable = provider.kind === "custom" || isOfficialAccountProvider(provider);
+    const builtInOfficial = isBuiltInOfficialClient(provider);
     const st = keyStatus(provider);
     const subtitle = provider.kind === "custom" ? t(protocolKey(provider.protocol)) : t(providerShortSourceKey(provider));
     const usage = snapshot.provider_usage.find((item) => item.provider_id === provider.id);
@@ -2563,7 +2831,14 @@ export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw,
         <div className="entity-main">
           <span className={`entity-avatar ${ident.cls}`}>{ident.icon}</span>
           <div className="entity-title">
-            <strong>{provider.name}</strong>
+            <div className="provider-title-line">
+              <strong>{provider.name}</strong>
+              {provider.http_proxy.enabled ? (
+                <span className="provider-proxy-icon" title={t("provider.proxyOn")} aria-label={t("provider.proxyOn")}>
+                  <RouteProxy size={14} stroke={2.2} />
+                </span>
+              ) : null}
+            </div>
             <span className="entity-sub">{subtitle}</span>
           </div>
         </div>
@@ -2585,11 +2860,8 @@ export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw,
         </div>
 
         <div className="entity-actions">
-          {provider.kind === "custom" && provider.key_ref ? (
-            <IconButton icon={<KeyRound size={15} />} title={t("provider.manageKey")} onClick={() => setKeyModal(provider)} />
-          ) : null}
-          {provider.kind !== "custom" ? (
-            <IconButton icon={<KeyRound size={15} />} title={t("provider.manageKey")} onClick={() => setKeyModal(provider)} />
+          {builtInOfficial ? (
+            <IconButton icon={<Settings2 size={15} />} title={t("provider.proxySettings")} onClick={() => setProxyModal(provider)} />
           ) : null}
           {editable ? (
             <>
@@ -2610,7 +2882,7 @@ export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw,
       </div>
 
       <div className="entity-list">
-        {config.providers.map((p, i) => renderRow(p, i))}
+        {visibleProviders.map((p, i) => renderRow(p, i))}
       </div>
 
       <ProviderModal
@@ -2625,10 +2897,11 @@ export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw,
         notify={notify}
         notifyRaw={notifyRaw}
       />
-      <KeyModal
-        open={keyModal !== null}
-        onClose={() => setKeyModal(null)}
-        provider={keyModal}
+      <ProviderProxyModal
+        open={proxyModal !== null}
+        onClose={() => setProxyModal(null)}
+        provider={proxyModal}
+        commit={commit}
         refresh={refresh}
         setBusy={setBusy}
         busy={busy}
@@ -2758,10 +3031,10 @@ function modelAvailableForCodexMode(
   snapshot: AppSnapshot,
   mode: CodexInjectionMode,
 ) {
-  if (mode === "official_account") return model.enabled;
-
   const provider = config.providers.find((p) => p.id === model.provider_id);
   if (!provider || !model.enabled) return false;
+  if (!providerVisibleInUi(provider, snapshot)) return false;
+  if (mode === "official_account") return true;
   if (provider.kind === "official_open_ai") return false;
 
   const key = snapshot.keys.find((item) => item.provider_id === provider.id);
@@ -2811,6 +3084,7 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
   const [configLoading, setConfigLoading] = React.useState(false);
   const [configSaving, setConfigSaving] = React.useState(false);
   const [configEditorOpen, setConfigEditorOpen] = React.useState(false);
+  const lastApplyErrorRef = React.useRef<string | null>(null);
 
   const loadCodexConfig = React.useCallback(async () => {
     setConfigLoading(true);
@@ -2827,6 +3101,14 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
   React.useEffect(() => {
     loadCodexConfig();
   }, [loadCodexConfig]);
+
+  React.useEffect(() => {
+    const error = snapshot.codex_apply_error;
+    if (error && error !== lastApplyErrorRef.current) {
+      notifyRaw(error, "bad");
+    }
+    lastApplyErrorRef.current = error ?? null;
+  }, [notifyRaw, snapshot.codex_apply_error]);
 
   React.useEffect(() => {
     setLanHost(config.settings.lan_remote_host);
@@ -3067,6 +3349,11 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
           </div>
           <Switch checked={autoInject} onChange={setAutoInject} />
         </div>
+        {snapshot.codex_apply_error ? (
+          <div className="inline-warning" style={{ marginBottom: 16 }}>
+            {snapshot.codex_apply_error}
+          </div>
+        ) : null}
 
         <Field label={t("setup.codexHome")}>
           <Input value={snapshot.codex_home} readOnly />

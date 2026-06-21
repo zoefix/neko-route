@@ -1194,7 +1194,7 @@ textarea.input:focus {
 .entity-row.off { opacity: 0.62; filter: grayscale(0.35); }
 .model-row { grid-template-columns: 30px minmax(250px, 1.2fr) minmax(380px, 1.9fr) auto; }
 .provider-row {
-  grid-template-columns: minmax(200px, 240px) minmax(0, 1fr) 204px;
+  grid-template-columns: minmax(235px, 285px) minmax(0, 1fr) 140px;
 }
 .entity-row.dragging {
   opacity: 0.18;
@@ -1315,6 +1315,12 @@ body.model-drag-active * {
   gap: 3px;
   min-width: 0;
 }
+.provider-title-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
 .entity-title strong {
   min-width: 0;
   color: var(--ink);
@@ -1322,6 +1328,21 @@ body.model-drag-active * {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.provider-title-line strong {
+  flex: 0 1 auto;
+}
+.provider-proxy-icon {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  border-radius: 8px;
+  background: rgba(36, 197, 133, 0.1);
+  color: #15945f;
+  border: 1px solid rgba(36, 197, 133, 0.16);
+  box-shadow: 0 4px 12px rgba(36, 197, 133, 0.12);
 }
 .entity-sub {
   min-width: 0;
@@ -1527,8 +1548,8 @@ body.model-drag-active * {
 }
 .provider-row .entity-actions {
   justify-self: end;
-  width: 204px;
-  min-width: 204px;
+  width: 140px;
+  min-width: 140px;
   flex-wrap: nowrap;
 }
 

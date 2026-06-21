@@ -4,7 +4,7 @@ use crate::{
 };
 
 pub const ROUTE_REASON_DIRECT: &str = "direct";
-pub const ROUTE_REASON_CODEX_ALIAS: &str = "codex_alias";
+pub const ROUTE_REASON_CODEX_SLOT: &str = "codex_slot";
 pub const ROUTE_REASON_CODEX_INTERNAL_LOCKED: &str = "codex_internal_locked";
 pub const ROUTE_REASON_FALLBACK_UNKNOWN: &str = "fallback_unknown";
 
@@ -102,10 +102,10 @@ fn resolve_route_model<'a>(
     config: &'a AppConfig,
     requested: &str,
 ) -> Result<RouteModel<'a>, String> {
-    if let Some(model) = codex_alias::resolve_alias_model(config, requested) {
+    if let Some(model) = codex_alias::resolve_slot_model(config, requested) {
         return Ok(RouteModel {
             model,
-            reason: ROUTE_REASON_CODEX_ALIAS,
+            reason: ROUTE_REASON_CODEX_SLOT,
             locked_from_model: None,
         });
     }
@@ -169,7 +169,7 @@ fn resolve_configured_model<'a>(config: &'a AppConfig, model_id: &str) -> Option
         return None;
     }
     codex_alias::resolve_direct_model(config, model_id)
-        .or_else(|| codex_alias::resolve_alias_model(config, model_id))
+        .or_else(|| codex_alias::resolve_slot_model(config, model_id))
 }
 
 /// When a request names an unknown model, redirect it to the configured fallback
@@ -194,8 +194,8 @@ fn resolve_fallback<'a>(config: &'a AppConfig, requested: &str) -> Option<&'a Mo
 #[cfg(test)]
 mod tests {
     use super::{
-        match_route, match_route_for_provider, ROUTE_REASON_CODEX_ALIAS,
-        ROUTE_REASON_CODEX_INTERNAL_LOCKED, ROUTE_REASON_DIRECT, ROUTE_REASON_FALLBACK_UNKNOWN,
+        match_route, match_route_for_provider, ROUTE_REASON_CODEX_INTERNAL_LOCKED,
+        ROUTE_REASON_CODEX_SLOT, ROUTE_REASON_DIRECT, ROUTE_REASON_FALLBACK_UNKNOWN,
     };
     use crate::store::normalize_config;
     use crate::types::{
@@ -212,6 +212,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url: "https://proxy.example/v1".into(),
             key_ref: Some("provider:custom-chat".into()),
+            http_proxy: Default::default(),
         });
         let model = config
             .models
@@ -250,6 +251,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiResponses,
             base_url: "https://api.openai.com/v1".into(),
             key_ref: Some("official-token:openai-account-user".into()),
+            http_proxy: Default::default(),
         });
         let mut account_model = config
             .models
@@ -291,17 +293,19 @@ mod tests {
     }
 
     #[test]
-    fn codex_alias_routes_to_real_model() {
+    fn codex_slot_routes_to_real_model() {
         let mut config = normalize_config(default_config());
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
+        config.settings.codex_default_model = Some("claude-opus-4-8".into());
         config.settings.fallback_model = None;
+        let config = normalize_config(config);
 
-        let matched = match_route(&config, "gpt-5.4-mini").unwrap();
+        let matched = match_route(&config, "gpt-5.5").unwrap();
 
         assert_eq!(matched.model.id, "claude-opus-4-8");
         assert_eq!(matched.upstream_model, "claude-opus-4-8");
         assert_eq!(matched.provider.id, "anthropic-cli");
-        assert_eq!(matched.route_reason, ROUTE_REASON_CODEX_ALIAS);
+        assert_eq!(matched.route_reason, ROUTE_REASON_CODEX_SLOT);
         assert!(matched.locked_from_model.is_none());
     }
 
@@ -383,6 +387,7 @@ mod tests {
             protocol: ProviderProtocol::OpenAiChatCompletions,
             base_url: "https://deepseek.example/v1".into(),
             key_ref: Some("provider:deepseek".into()),
+            http_proxy: Default::default(),
         });
         let mut model = config.models[0].clone();
         model.id = "deepseek-v4-pro".into();
