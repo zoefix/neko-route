@@ -99,6 +99,18 @@ Neko Route 是本地控制面板。它的目标是避免把服务商凭证写进
 
 安装包通过 [GitHub Releases](https://github.com/zoefix/neko-route/releases) 发布。桌面更新器从 GitHub 读取 Release 信息，并在安装前展示当前版本更新内容。
 
+macOS 也可以通过 Homebrew 安装：
+
+```bash
+brew install --cask zoefix/neko-route/neko-route
+```
+
+更新 Homebrew 安装的版本：
+
+```bash
+brew update && brew upgrade --cask neko-route
+```
+
 支持的桌面平台：
 
 - Windows

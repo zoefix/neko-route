@@ -210,3 +210,9 @@ jobs:
           GITHUB_RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
           PUBLISH_RELEASE: "1"
         run: scripts/prepare-updater-release.sh "$GITHUB_RELEASE_TAG"
+
+      - name: Update Homebrew tap
+        env:
+          GITHUB_RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: scripts/update-homebrew-tap.sh "$GITHUB_RELEASE_TAG"

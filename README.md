@@ -99,6 +99,18 @@ Sensitive values are stored through the app's credential storage flow. If the pl
 
 Downloads are published through [GitHub Releases](https://github.com/zoefix/neko-route/releases). The desktop updater reads release metadata from GitHub and shows the current release notes in the app before installation.
 
+macOS can also be installed with Homebrew:
+
+```bash
+brew install --cask zoefix/neko-route/neko-route
+```
+
+Update the Homebrew installation:
+
+```bash
+brew update && brew upgrade --cask neko-route
+```
+
 Supported desktop platforms:
 
 - Windows

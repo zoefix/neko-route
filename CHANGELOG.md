@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Added Homebrew Cask installation and release automation for macOS.
+
 ## [0.1.3] - 2026-06-21
 
 ### Added

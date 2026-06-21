@@ -99,6 +99,18 @@ Neko Route はローカルコントロールプレーンアプリです。生成
 
 インストーラーは [GitHub Releases](https://github.com/zoefix/neko-route/releases) で公開されます。デスクトップアップデーターは GitHub から Release 情報を読み取り、インストール前に現在のリリースノートをアプリ内で表示します。
 
+macOS は Homebrew でもインストールできます。
+
+```bash
+brew install --cask zoefix/neko-route/neko-route
+```
+
+Homebrew 版を更新するには、次のコマンドを実行します。
+
+```bash
+brew update && brew upgrade --cask neko-route
+```
+
 対応デスクトッププラットフォーム：
 
 - Windows
