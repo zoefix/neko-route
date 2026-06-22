@@ -39,7 +39,6 @@ import { useI18n } from "./i18n";
 import type { MsgKey } from "./messages";
 import type {
   AppConfig,
-  AppAction,
   AppSnapshot,
   CodexInjectionMode,
   LanModelInfo,
@@ -102,7 +101,6 @@ export type PageProps = {
   notifyRaw: (msg: string, tone?: "ok" | "bad") => void;
   busy: boolean;
   setBusy: (v: boolean) => void;
-  appAction: AppAction | null;
   appVersion: string;
   updateStatus: UpdateStatus;
   availableUpdateVersion: string | null;
@@ -297,43 +295,10 @@ function requestErrorDetail(
     const bridge = record.context_bridge;
     lines.push(
       "",
-      `${t("logs.contextBridge")}: ${bridge.strategy}`,
       `${t("logs.contextBridgeOriginal")}: ${formatBytes(bridge.original_body_bytes)}`,
       `${t("logs.contextBridgeFinal")}: ${formatBytes(bridge.final_body_bytes)}`,
-      `${t("logs.contextBridgeToolResults")}: ${bridge.archived_tool_results}/${bridge.tool_result_count} · ${formatBytes(bridge.archived_bytes)} / ${formatBytes(bridge.original_tool_result_bytes)}`,
-      `${t("logs.contextBridgeRecall")}: ${bridge.recalled_artifacts} · ${formatBytes(bridge.recalled_bytes)}`,
-      `${t("logs.contextBridgeCountTokens")}: ${
-        bridge.count_tokens_input_tokens
-          ? formatTokens(bridge.count_tokens_input_tokens)
-          : bridge.count_tokens_error || "—"
-      }`,
-      `${t("logs.contextBridgeRawPrecheck")}: ${
-        bridge.raw_precheck_input_tokens != null ? formatTokens(bridge.raw_precheck_input_tokens) : "—"
-      }`,
-      `${t("logs.contextBridgeFinalTokens")}: ${
-        bridge.final_input_tokens != null ? formatTokens(bridge.final_input_tokens) : "—"
-      }`,
-      `${t("logs.contextBridgeEstimatedTokens")}: ${
-        bridge.estimated_input_tokens != null ? formatTokens(bridge.estimated_input_tokens) : "—"
-      }`,
-      `${t("logs.contextBridgeEstimateSource")}: ${bridge.estimate_source || "—"} · ${
-        bridge.estimate_confidence || "—"
-      }`,
-      `${t("logs.contextBridgeProtection")}: ${bridge.protection_triggered ? "on" : "off"} · ${
-        bridge.compression_stage || "—"
-      }`,
-      `${t("logs.contextBridgeTarget")}: ${
-        bridge.target_input_tokens != null ? formatTokens(bridge.target_input_tokens) : "—"
-      }`,
-      `${t("logs.contextBridgePreviousPressure")}: ${
-        bridge.previous_success_input_tokens != null
-          ? `${formatTokens(bridge.previous_success_input_tokens)} · ${
-              bridge.previous_success_body_bytes != null ? formatBytes(bridge.previous_success_body_bytes) : "—"
-            }`
-          : "—"
-      }`,
-      `${t("logs.contextBridgeCompressionReason")}: ${bridge.compression_reason || "—"}`,
-      `${t("logs.contextBridgeProtectionFailure")}: ${bridge.protection_failure_reason || "—"}`,
+      `${t("logs.contextBridgeToolResults")}: ${bridge.tool_result_count} · ${formatBytes(bridge.original_tool_result_bytes)}`,
+      `${t("logs.contextBridgeTruncated")}: ${bridge.tool_results_truncated} · ${formatBytes(bridge.tool_results_truncated_bytes)}`,
       `${t("logs.contextBridgeLastMessage")}: ${bridge.last_message_role || "—"} · ${
         bridge.last_message_content_type || "—"
       } · ${formatTokens(bridge.last_message_text_length)}`,
@@ -348,7 +313,12 @@ function requestErrorDetail(
       `${t("logs.contextBridgeLatestTool")}: ${bridge.latest_tool_result_count} · ${formatTokens(
         bridge.latest_tool_result_text_length,
       )}`,
-      `${t("logs.contextBridgeManagement")}: ${bridge.context_management ? "on" : "off"}`,
+      `${t("logs.contextBridgeManagement")}: ${bridge.context_management ? "on" : "off"}${
+        bridge.context_management_edits ? ` · ${bridge.context_management_edits}` : ""
+      }${bridge.applied_edits ? ` · applied=${bridge.applied_edits}` : ""}`,
+      `${t("logs.contextBridgeCompaction")}: persisted=${
+        bridge.compaction_persisted ? "yes" : "no"
+      } · injected=${bridge.compaction_injected ? "yes" : "no"}`,
     );
   }
   if (record.error) {
@@ -1332,7 +1302,7 @@ function modelsForDisplay(models: ModelEntry[], visibleProviderIds: Set<string>)
 /* ============================================================
    Models page
    ============================================================ */
-export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appAction }: PageProps) {
+export function ModelGarden({ snapshot, config, commit, busy, notifyRaw }: PageProps) {
   const { t } = useI18n();
   const visibleProviderIds = React.useMemo(
     () => visibleUiProviderIds(config, snapshot),
@@ -1382,11 +1352,6 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw, appActi
     setEditIndex(i);
     setModalOpen(true);
   }
-
-  React.useEffect(() => {
-    if (appAction?.type !== "add-model") return;
-    openAdd();
-  }, [appAction?.nonce]);
 
   async function confirmDelete() {
     if (deleteIndex === null) return;
@@ -2725,7 +2690,7 @@ function OfficialAccountUsage({
   );
 }
 
-export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw, setBusy, busy, appAction }: PageProps) {
+export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw, setBusy, busy }: PageProps) {
   const { t } = useI18n();
   const visibleProviders = React.useMemo(
     () => visibleUiProviders(config, snapshot),
@@ -2735,11 +2700,6 @@ export function KeyVault({ snapshot, config, commit, refresh, notify, notifyRaw,
   const [proxyModal, setProxyModal] = React.useState<Provider | null>(null);
   const [deleteProvider, setDeleteProvider] = React.useState<Provider | null>(null);
   const [usageRefreshing, setUsageRefreshing] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    if (appAction?.type !== "add-provider") return;
-    setProviderModal({ open: true, editId: null });
-  }, [appAction?.nonce]);
 
   async function confirmDeleteProvider() {
     if (!deleteProvider) return;

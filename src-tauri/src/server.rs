@@ -4,8 +4,8 @@ use crate::{
     router::{match_route, RouteMatch},
     store::{validate_bind_settings, AppStore},
     types::{
-        ClaudeContextPressureSample, CodexInjectionMode, ContextArtifact, ContextBridgeDiagnostics,
-        ModelEntry, Provider, ProviderKind, ProviderProtocol, RequestRecord, Settings, TokenUsage,
+        CodexInjectionMode, ContextBridgeDiagnostics, ModelEntry, Provider, ProviderKind,
+        ProviderProtocol, RequestRecord, Settings, TokenUsage,
     },
     usage::{parse_usage, usage_from_responses_text},
 };
@@ -25,7 +25,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     future::Future,
     net::SocketAddr,
@@ -43,8 +43,6 @@ const ANTHROPIC_ONE_MILLION_CONTEXT_WINDOW: u64 = 1_000_000;
 const ANTHROPIC_ONE_MILLION_SUFFIX: &str = "[1m]";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub(crate) const CLAUDE_DESKTOP_MESSAGES_BETA: &str = "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07,effort-2025-11-24";
-pub(crate) const CLAUDE_DESKTOP_COUNT_TOKENS_BETA: &str =
-    "claude-code-20250219,interleaved-thinking-2025-05-14,token-counting-2024-11-01";
 const CLAUDE_DESKTOP_USER_AGENT: &str =
     "claude-cli/2.1.170 (external, claude-desktop-3p, agent-sdk/0.3.170)";
 const CLAUDE_CODE_STAINLESS_PACKAGE_VERSION: &str = "0.94.0";
@@ -55,12 +53,16 @@ const CLAUDE_DESKTOP_BILLING_HEADER: &str =
 const CLAUDE_DESKTOP_IDENTITY: &str =
     "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
 const ANTHROPIC_THINKING_PREFIX: &str = "neko-route-anthropic-thinking:v1:";
-const CONTEXT_BRIDGE_KEEP_TOOL_RESULTS: usize = 12;
-const CONTEXT_BRIDGE_FALLBACK_KEEP_TOOL_RESULTS: usize = 6;
-const CONTEXT_BRIDGE_TOKEN_TARGET_PERCENT: u64 = 88;
-const CONTEXT_BRIDGE_RECALL_LIMIT: usize = 4;
+const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+const COMPACT_BETA: &str = "compact-2026-01-12";
+/// thinking 开启时的输出预算下限。Claude Code 的 max-effort profile 需要足够的
+/// max_tokens 容纳「思考 + 正文」；Codex 常只发 1024，会被思考占满导致无正文。
+const ANTHROPIC_THINKING_MIN_MAX_TOKENS: u64 = 32_000;
+const TOOL_RESULT_TRUNCATE_CHARS: usize = 32_000;
+const CONTEXT_EDITING_TRIGGER_TOKENS: u64 = 100_000;
+const CONTEXT_EDITING_KEEP_TOOL_USES: u64 = 3;
+const COMPACTION_TRIGGER_TOKENS: u64 = 150_000;
 const CONTEXT_BRIDGE_PREVIEW_CHARS: usize = 80;
-const CONTEXT_BRIDGE_PRECOMPRESSION_THRESHOLD_PERCENT: u64 = 80;
 
 #[derive(Clone)]
 struct ServerState {
@@ -1048,34 +1050,9 @@ fn claude_code_stainless_os() -> &'static str {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ClaudeDesktopRequestProfile {
-    Messages,
-    CountTokens,
-}
-
 pub(crate) fn claude_code_mirror_headers(
     base_headers: Vec<(String, String)>,
     request: &Value,
-) -> Vec<(String, String)> {
-    claude_desktop_mirror_headers(base_headers, request, ClaudeDesktopRequestProfile::Messages)
-}
-
-fn claude_code_count_tokens_headers(
-    base_headers: Vec<(String, String)>,
-    request: &Value,
-) -> Vec<(String, String)> {
-    claude_desktop_mirror_headers(
-        base_headers,
-        request,
-        ClaudeDesktopRequestProfile::CountTokens,
-    )
-}
-
-fn claude_desktop_mirror_headers(
-    base_headers: Vec<(String, String)>,
-    request: &Value,
-    profile: ClaudeDesktopRequestProfile,
 ) -> Vec<(String, String)> {
     let auth = header_value(&base_headers, "authorization")
         .or_else(|| header_value(&base_headers, "x-api-key").map(|key| format!("Bearer {key}")));
@@ -1106,21 +1083,11 @@ fn claude_desktop_mirror_headers(
         "x-stainless-runtime-version".into(),
         CLAUDE_CODE_STAINLESS_RUNTIME_VERSION.into(),
     ));
-    match profile {
-        ClaudeDesktopRequestProfile::Messages => {
-            headers.push((
-                "x-stainless-timeout".into(),
-                CLAUDE_DESKTOP_STAINLESS_TIMEOUT.into(),
-            ));
-            headers.push(("anthropic-beta".into(), CLAUDE_DESKTOP_MESSAGES_BETA.into()));
-        }
-        ClaudeDesktopRequestProfile::CountTokens => {
-            headers.push((
-                "anthropic-beta".into(),
-                CLAUDE_DESKTOP_COUNT_TOKENS_BETA.into(),
-            ));
-        }
-    }
+    headers.push((
+        "x-stainless-timeout".into(),
+        CLAUDE_DESKTOP_STAINLESS_TIMEOUT.into(),
+    ));
+    headers.push(("anthropic-beta".into(), CLAUDE_DESKTOP_MESSAGES_BETA.into()));
     headers.push((
         "anthropic-dangerous-direct-browser-access".into(),
         "true".into(),
@@ -1136,163 +1103,6 @@ fn append_beta_query(url: String) -> String {
     } else {
         format!("{url}?beta=true")
     }
-}
-
-fn anthropic_count_tokens_url(base_url: &str) -> String {
-    append_beta_query(endpoint(base_url, "messages/count_tokens"))
-}
-
-#[derive(Clone, Default)]
-struct ToolUseInfo {
-    name: Option<String>,
-    args: Option<String>,
-}
-
-async fn bridge_anthropic_context(
-    state: &ServerState,
-    body: &mut Value,
-    original_request: &Value,
-    request_id: &str,
-    model: &str,
-    preserve_recent_tool_results: usize,
-    target_body_bytes: Option<u64>,
-    compression_reason: impl Into<String>,
-) -> ContextBridgeDiagnostics {
-    let query = current_anthropic_query_text(body);
-    let recalled = state
-        .store
-        .search_context_artifacts(query, CONTEXT_BRIDGE_RECALL_LIMIT)
-        .await;
-    let (diagnostics, artifacts) = bridge_anthropic_context_body(
-        body,
-        original_request,
-        request_id,
-        model,
-        preserve_recent_tool_results,
-        target_body_bytes,
-        &recalled,
-        Some(compression_reason.into()),
-    );
-    state.store.archive_context_artifacts(artifacts).await;
-    diagnostics
-}
-
-fn bridge_anthropic_context_body(
-    body: &mut Value,
-    original_request: &Value,
-    request_id: &str,
-    model: &str,
-    preserve_recent_tool_results: usize,
-    target_body_bytes: Option<u64>,
-    recalled: &[ContextArtifact],
-    compression_reason: Option<String>,
-) -> (ContextBridgeDiagnostics, Vec<ContextArtifact>) {
-    let original_body_bytes = json_size(body) as u64;
-    let tool_uses = collect_anthropic_tool_uses(body);
-    let tool_result_positions = collect_anthropic_tool_result_positions(body);
-    let original_tool_result_bytes = tool_result_positions
-        .iter()
-        .map(|position| position.content_bytes)
-        .sum::<usize>() as u64;
-    let tool_result_count = tool_result_positions.len() as u64;
-    let keep_from = tool_result_positions
-        .len()
-        .saturating_sub(preserve_recent_tool_results);
-    let query = current_anthropic_query_text(body);
-    let query_tokens = bridge_search_tokens(&query);
-    let mut artifacts = Vec::new();
-    let mut archived_tool_results = 0_u64;
-    let mut archived_bytes = 0_u64;
-    let mut candidates = tool_result_positions
-        .into_iter()
-        .enumerate()
-        .filter_map(|(ordinal, position)| {
-            if ordinal >= keep_from || position.content.trim().is_empty() {
-                return None;
-            }
-            let relevant = content_matches_tokens(&position.content, &query_tokens);
-            Some((ordinal, relevant, position))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(
-        |(left_ordinal, left_relevant, left), (right_ordinal, right_relevant, right)| {
-            left_relevant
-                .cmp(right_relevant)
-                .then(left_ordinal.cmp(right_ordinal))
-                .then(right.content_bytes.cmp(&left.content_bytes))
-        },
-    );
-
-    for (_ordinal, relevant, position) in candidates {
-        if target_body_bytes
-            .map(|target| json_size(body) as u64 <= target)
-            .unwrap_or(false)
-        {
-            break;
-        }
-        let hash = sha256_hex(&position.content);
-        let tool = position
-            .tool_use_id
-            .as_deref()
-            .and_then(|id| tool_uses.get(id))
-            .cloned()
-            .unwrap_or_default();
-        let summary = summarize_tool_result(
-            &position.content,
-            tool.name.as_deref(),
-            tool.args.as_deref(),
-            relevant,
-        );
-        archived_tool_results += 1;
-        archived_bytes += position.content_bytes as u64;
-        artifacts.push(ContextArtifact {
-            hash: hash.clone(),
-            created_at: Utc::now(),
-            request_id: request_id.to_string(),
-            model: model.to_string(),
-            tool_name: tool.name.clone(),
-            tool_args: tool.args.clone(),
-            content_bytes: position.content_bytes as u64,
-            content_text: position.content.clone(),
-            summary: summary.clone(),
-        });
-        replace_tool_result_content(
-            body,
-            position.message_index,
-            position.part_index,
-            archived_tool_result_card(
-                &hash,
-                &summary,
-                position.content_bytes,
-                tool.name.as_deref(),
-                tool.args.as_deref(),
-            ),
-        );
-    }
-
-    let (recalled_artifacts, recalled_bytes) = append_recalled_context(body, recalled);
-    let final_body_bytes = json_size(body) as u64;
-    let strategy = if archived_tool_results > 0 || recalled_artifacts > 0 {
-        format!("artifact_bridge_preserve{preserve_recent_tool_results}")
-    } else {
-        "pass_through".to_string()
-    };
-    let mut diagnostics = context_bridge_diagnostics(
-        body,
-        original_request,
-        original_body_bytes,
-        original_tool_result_bytes,
-    );
-    diagnostics.strategy = strategy;
-    diagnostics.final_body_bytes = final_body_bytes;
-    diagnostics.tool_result_count = tool_result_count;
-    diagnostics.kept_tool_results = tool_result_count.saturating_sub(archived_tool_results);
-    diagnostics.archived_tool_results = archived_tool_results;
-    diagnostics.archived_bytes = archived_bytes;
-    diagnostics.recalled_artifacts = recalled_artifacts;
-    diagnostics.recalled_bytes = recalled_bytes;
-    diagnostics.compression_reason = compression_reason;
-    (diagnostics, artifacts)
 }
 
 fn context_bridge_diagnostics(
@@ -1315,31 +1125,11 @@ fn context_bridge_diagnostics(
         latest_tool_result_summary(body);
 
     ContextBridgeDiagnostics {
-        strategy: "pass_through".to_string(),
         original_body_bytes,
         final_body_bytes: json_size(body) as u64,
         original_tool_result_bytes,
         tool_result_count: tool_result_positions.len() as u64,
-        kept_tool_results: tool_result_positions.len() as u64,
-        archived_tool_results: 0,
-        archived_bytes: 0,
-        recalled_artifacts: 0,
-        recalled_bytes: 0,
-        count_tokens_input_tokens: None,
-        count_tokens_error: None,
         context_management: false,
-        raw_precheck_input_tokens: None,
-        final_input_tokens: None,
-        estimated_input_tokens: None,
-        estimate_source: None,
-        estimate_confidence: None,
-        protection_triggered: false,
-        target_input_tokens: None,
-        previous_success_input_tokens: None,
-        previous_success_body_bytes: None,
-        compression_stage: None,
-        protection_failure_reason: None,
-        compression_reason: None,
         last_message_role: last_role,
         last_message_content_type: last_type,
         last_message_text_length: last_text.chars().count() as u64,
@@ -1350,6 +1140,7 @@ fn context_bridge_diagnostics(
         latest_tool_result_count,
         latest_tool_result_text_length,
         latest_tool_result_single_dot,
+        ..Default::default()
     }
 }
 
@@ -1498,10 +1289,6 @@ fn preview_head_tail(content: &str, max_chars: usize) -> (Option<String>, Option
 
 #[derive(Clone)]
 struct ToolResultPosition {
-    message_index: usize,
-    part_index: Option<usize>,
-    tool_use_id: Option<String>,
-    content: String,
     content_bytes: usize,
 }
 
@@ -1510,21 +1297,14 @@ fn collect_anthropic_tool_result_positions(body: &Value) -> Vec<ToolResultPositi
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return positions;
     };
-    for (message_index, message) in messages.iter().enumerate() {
+    for message in messages {
         match message.get("content") {
             Some(Value::Array(parts)) => {
-                for (part_index, part) in parts.iter().enumerate() {
+                for part in parts {
                     if part.get("type").and_then(Value::as_str) == Some("tool_result") {
                         let content = value_to_text(part.get("content").unwrap_or(&Value::Null));
                         positions.push(ToolResultPosition {
-                            message_index,
-                            part_index: Some(part_index),
-                            tool_use_id: part
-                                .get("tool_use_id")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned),
                             content_bytes: content.len(),
-                            content,
                         });
                     }
                 }
@@ -1533,11 +1313,7 @@ fn collect_anthropic_tool_result_positions(body: &Value) -> Vec<ToolResultPositi
                 if message.get("type").and_then(Value::as_str) == Some("tool_result") {
                     let content = value_to_text(content);
                     positions.push(ToolResultPosition {
-                        message_index,
-                        part_index: None,
-                        tool_use_id: None,
                         content_bytes: content.len(),
-                        content,
                     });
                 }
             }
@@ -1545,274 +1321,6 @@ fn collect_anthropic_tool_result_positions(body: &Value) -> Vec<ToolResultPositi
         }
     }
     positions
-}
-
-fn collect_anthropic_tool_uses(body: &Value) -> HashMap<String, ToolUseInfo> {
-    let mut tool_uses = HashMap::new();
-    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
-        return tool_uses;
-    };
-    for message in messages {
-        let Some(parts) = message.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        for part in parts {
-            if part.get("type").and_then(Value::as_str) != Some("tool_use") {
-                continue;
-            }
-            let Some(id) = part.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            tool_uses.insert(
-                id.to_string(),
-                ToolUseInfo {
-                    name: part
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    args: part.get("input").map(compact_json_string),
-                },
-            );
-        }
-    }
-    tool_uses
-}
-
-fn replace_tool_result_content(
-    body: &mut Value,
-    message_index: usize,
-    part_index: Option<usize>,
-    replacement: String,
-) {
-    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
-        return;
-    };
-    let Some(message) = messages.get_mut(message_index) else {
-        return;
-    };
-    match part_index {
-        Some(part_index) => {
-            if let Some(part) = message
-                .get_mut("content")
-                .and_then(Value::as_array_mut)
-                .and_then(|parts| parts.get_mut(part_index))
-            {
-                part["content"] = Value::String(replacement);
-            }
-        }
-        None => {
-            message["content"] = Value::String(replacement);
-        }
-    }
-}
-
-fn append_recalled_context(body: &mut Value, recalled: &[ContextArtifact]) -> (u64, u64) {
-    if recalled.is_empty() {
-        return (0, 0);
-    }
-    let mut recalled_bytes = 0_u64;
-    let mut text = String::from(
-        "Neko Route recalled relevant archived tool outputs. Exact originals remain stored locally; use these excerpts as working memory.\n",
-    );
-    for artifact in recalled {
-        let excerpt = excerpt_text(&artifact.content_text, 900, 900);
-        recalled_bytes += excerpt.len() as u64;
-        text.push_str(&format!(
-            "\n- sha256:{} · {} bytes · {}\n{}\n",
-            artifact.hash,
-            artifact.content_bytes,
-            artifact.tool_name.as_deref().unwrap_or("unknown tool"),
-            excerpt
-        ));
-    }
-    append_system_text(body, text);
-    (recalled.len() as u64, recalled_bytes)
-}
-
-fn append_system_text(body: &mut Value, text: String) {
-    let block = json!({
-        "type": "text",
-        "text": text,
-        "cache_control": { "type": "ephemeral" }
-    });
-    match body.get_mut("system") {
-        Some(Value::Array(parts)) => parts.push(block),
-        Some(existing) => {
-            let previous = existing.take();
-            *existing = Value::Array(vec![previous, block]);
-        }
-        None => {
-            body["system"] = Value::Array(vec![block]);
-        }
-    }
-}
-
-fn archived_tool_result_card(
-    hash: &str,
-    summary: &str,
-    original_bytes: usize,
-    tool_name: Option<&str>,
-    tool_args: Option<&str>,
-) -> String {
-    let args = tool_args
-        .map(|value| truncate_middle(value, 420))
-        .unwrap_or_else(|| "unknown".to_string());
-    format!(
-        "[Neko Route archived an older tool result]\nTool: {}\nArguments: {}\nOriginal size: {} bytes\nArchive hash: sha256:{}\n{}\nThe exact original output is stored locally and can be recalled by Neko Route when relevant.",
-        tool_name.unwrap_or("unknown"),
-        args,
-        original_bytes,
-        hash,
-        summary
-    )
-}
-
-fn summarize_tool_result(
-    content: &str,
-    tool_name: Option<&str>,
-    tool_args: Option<&str>,
-    include_relevant_excerpt: bool,
-) -> String {
-    let mut summary = String::new();
-    summary.push_str(&format!(
-        "Summary for {} output.\n",
-        tool_name.unwrap_or("tool")
-    ));
-    if let Some(args) = tool_args {
-        summary.push_str(&format!(
-            "Arguments summary: {}\n",
-            truncate_middle(args, 360)
-        ));
-    }
-    let interesting = interesting_lines(content, 8);
-    if !interesting.is_empty() {
-        summary.push_str("Important lines:\n");
-        for line in interesting {
-            summary.push_str("- ");
-            summary.push_str(&truncate_middle(&line, 260));
-            summary.push('\n');
-        }
-    }
-    summary.push_str("Output excerpt:\n");
-    summary.push_str(&excerpt_text(content, 900, 900));
-    if include_relevant_excerpt {
-        summary.push_str("\nRelevant match excerpt:\n");
-        summary.push_str(&excerpt_text(content, 1400, 1400));
-    }
-    summary
-}
-
-fn interesting_lines(content: &str, limit: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        let looks_interesting = lower.contains("error")
-            || lower.contains("failed")
-            || lower.contains("panic")
-            || lower.contains("exception")
-            || lower.contains("context window")
-            || lower.contains("warning")
-            || lower.contains(".rs:")
-            || lower.contains(".ts:")
-            || lower.contains(".tsx:")
-            || lower.contains(".py:")
-            || lower.contains(".js:");
-        if looks_interesting {
-            lines.push(trimmed.to_string());
-            if lines.len() >= limit {
-                break;
-            }
-        }
-    }
-    lines
-}
-
-fn current_anthropic_query_text(body: &Value) -> String {
-    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
-        return String::new();
-    };
-    for message in messages.iter().rev() {
-        if message.get("role").and_then(Value::as_str) != Some("user") {
-            continue;
-        }
-        let content = message.get("content").unwrap_or(&Value::Null);
-        let text = value_to_text(content);
-        if !text.trim().is_empty() && !text.contains("[Neko Route archived an older tool result]") {
-            return text;
-        }
-    }
-    String::new()
-}
-
-fn bridge_search_tokens(query: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    for token in query
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-' && ch != '.')
-        .map(|token| token.trim().to_ascii_lowercase())
-        .filter(|token| token.len() >= 4)
-    {
-        if !tokens.iter().any(|existing| existing == &token) {
-            tokens.push(token);
-        }
-        if tokens.len() >= 24 {
-            break;
-        }
-    }
-    tokens
-}
-
-fn content_matches_tokens(content: &str, tokens: &[String]) -> bool {
-    if tokens.is_empty() {
-        return false;
-    }
-    let lower = content.to_ascii_lowercase();
-    tokens.iter().any(|token| lower.contains(token))
-}
-
-fn excerpt_text(content: &str, head_chars: usize, tail_chars: usize) -> String {
-    let total_chars = content.chars().count();
-    if total_chars <= head_chars + tail_chars + 64 {
-        return content.to_string();
-    }
-    let head = content.chars().take(head_chars).collect::<String>();
-    let tail = content
-        .chars()
-        .rev()
-        .take(tail_chars)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    format!(
-        "{head}\n\n... [archived middle omitted: {} chars] ...\n\n{tail}",
-        total_chars.saturating_sub(head_chars + tail_chars)
-    )
-}
-
-fn truncate_middle(content: &str, max_chars: usize) -> String {
-    let total_chars = content.chars().count();
-    if total_chars <= max_chars {
-        return content.to_string();
-    }
-    let half = max_chars.saturating_sub(24) / 2;
-    let head = content.chars().take(half).collect::<String>();
-    let tail = content
-        .chars()
-        .rev()
-        .take(half)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    format!("{head} ... {tail}")
-}
-
-fn compact_json_string(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
 fn json_size(value: &Value) -> usize {
@@ -1826,128 +1334,217 @@ fn sha256_hex(content: &str) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-async fn count_anthropic_input_tokens(
-    client: &Client,
-    base_url: &str,
-    headers: &[(String, String)],
-    body: &Value,
-) -> Result<u64, String> {
-    let count_body = build_anthropic_count_tokens_body(body);
-    let mut request = client
-        .post(anthropic_count_tokens_url(base_url))
-        .json(&count_body)
-        .timeout(Duration::from_secs(5));
-    for (name, value) in headers {
-        request = request.header(name, value);
-    }
-    let response = request.send().await.map_err(|error| error.to_string())?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!(
-            "count_tokens {}: {}",
-            status.as_u16(),
-            redact(&text)
-        ));
-    }
-    let value = serde_json::from_str::<Value>(&text).map_err(|error| error.to_string())?;
-    let input_tokens = value
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "count_tokens response missing input_tokens".to_string())?;
-    Ok(input_tokens.saturating_add(anthropic_count_tokens_local_overhead(body)))
+/// 强 context_key 才能安全关联同一会话；弱 key（provider_model 兜底）会串话。
+fn is_strong_context_key(context_key: &str) -> bool {
+    context_key.starts_with("key:")
 }
 
-pub(crate) fn build_anthropic_count_tokens_body(body: &Value) -> Value {
-    let mut messages = body
-        .get("messages")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
-                .cloned()
-                .map(|mut message| {
-                    strip_cache_control_recursive(&mut message);
-                    message
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if messages.is_empty() {
-        messages.push(json!({ "role": "user", "content": "" }));
+/// 中段截断、保留头尾，中间替换为明确标记。用于单条 tool_result 的硬上限。
+fn truncate_tool_result_with_marker(content: &str, max_chars: usize) -> String {
+    let total = content.chars().count();
+    if total <= max_chars {
+        return content.to_string();
     }
+    let keep = max_chars.max(2);
+    let head_len = keep / 2;
+    let tail_len = keep - head_len;
+    let head: String = content.chars().take(head_len).collect();
+    let tail: String = {
+        let mut tail_chars: Vec<char> = content.chars().rev().take(tail_len).collect();
+        tail_chars.reverse();
+        tail_chars.into_iter().collect()
+    };
+    let dropped = total - head_len - tail_len;
+    format!("{head}\n…[truncated {dropped} chars]…\n{tail}")
+}
+
+/// 遍历最终 body 的所有 tool_result，按字符预算逐条截断。统计写入 diagnostics。
+fn truncate_tool_results_in_body(
+    body: &mut Value,
+    max_chars: usize,
+    diagnostics: &mut ContextBridgeDiagnostics,
+) {
+    if max_chars == 0 {
+        return;
+    }
+    let mut truncated = 0u64;
+    let mut truncated_bytes = 0u64;
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages.iter_mut() {
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            if part.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            // 本项目生成的 tool_result content 是 String。
+            let Some(text) = part.get("content").and_then(Value::as_str) else {
+                continue;
+            };
+            if text.chars().count() <= max_chars {
+                continue;
+            }
+            let before = text.len();
+            let truncated_text = truncate_tool_result_with_marker(text, max_chars);
+            truncated += 1;
+            truncated_bytes += before.saturating_sub(truncated_text.len()) as u64;
+            part["content"] = Value::String(truncated_text);
+        }
+    }
+    diagnostics.tool_results_truncated = truncated;
+    diagnostics.tool_results_truncated_bytes = truncated_bytes;
+}
+
+/// 构造官方 context_management 字段：固定启用 clear_tool_uses + compaction（系统内部强制）。
+fn build_context_management() -> Value {
     json!({
-        "model": body.get("model").cloned().unwrap_or(Value::Null),
-        "messages": messages,
-        "tools": [],
-        "thinking": { "type": "enabled", "budget_tokens": 1024 }
+        "edits": [
+            {
+                "type": "clear_tool_uses_20250919",
+                "trigger": {"type": "input_tokens", "value": CONTEXT_EDITING_TRIGGER_TOKENS},
+                "keep": {"type": "tool_uses", "value": CONTEXT_EDITING_KEEP_TOOL_USES},
+                "clear_tool_inputs": false,
+            },
+            {
+                "type": "compact_20260112",
+                "trigger": {"type": "input_tokens", "value": COMPACTION_TRIGGER_TOKENS},
+            }
+        ]
     })
 }
 
-fn anthropic_count_tokens_local_overhead(body: &Value) -> u64 {
-    ["system", "tools", "metadata"]
-        .iter()
-        .filter_map(|key| body.get(*key))
-        .map(|value| (json_size(value) as u64).div_ceil(4))
-        .sum()
+fn context_management_edit_names(context_management: &Value) -> String {
+    context_management
+        .get("edits")
+        .and_then(Value::as_array)
+        .map(|edits| {
+            edits
+                .iter()
+                .filter_map(|edit| edit.get("type").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
 }
 
-fn estimate_anthropic_input_tokens_from_body(body: &Value) -> u64 {
-    (json_size(body) as u64).div_ceil(4)
+/// 从上游响应内容里提取 compaction 摘要文本（若有）。
+fn extract_compaction_summary(value: &Value) -> Option<String> {
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+        .and_then(|item| item.get("content").and_then(Value::as_str))
+        .map(str::to_string)
+        .filter(|summary| !summary.trim().is_empty())
 }
 
-fn strip_cache_control_recursive(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            object.remove("cache_control");
-            for value in object.values_mut() {
-                strip_cache_control_recursive(value);
-            }
-        }
-        Value::Array(items) => {
-            for value in items {
-                strip_cache_control_recursive(value);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn context_token_target(context_window: u64) -> u64 {
-    context_window.saturating_mul(CONTEXT_BRIDGE_TOKEN_TARGET_PERCENT) / 100
-}
-
-fn context_body_target_bytes(context_window: u64) -> u64 {
-    context_token_target(context_window).saturating_mul(4)
-}
-
-fn target_body_bytes_from_token_ratio(
-    original_body_bytes: u64,
-    raw_input_tokens: u64,
-    target_input_tokens: u64,
-) -> Option<u64> {
-    if raw_input_tokens == 0 {
+/// 把上游响应里的 context_management.applied_edits 汇总成可读日志串。
+fn extract_applied_edits(value: &Value) -> Option<String> {
+    let applied = value
+        .pointer("/context_management/applied_edits")
+        .and_then(Value::as_array)?;
+    if applied.is_empty() {
         return None;
     }
-    let target = (original_body_bytes as u128).saturating_mul(target_input_tokens as u128)
-        / raw_input_tokens as u128;
-    Some(target.max(4096).min(u64::MAX as u128) as u64)
+    let summary = applied
+        .iter()
+        .map(|edit| {
+            let kind = edit.get("type").and_then(Value::as_str).unwrap_or("?");
+            let tool_uses = edit
+                .get("cleared_tool_uses")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let tokens = edit
+                .get("cleared_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            format!("{kind}(tool_uses={tool_uses},tokens={tokens})")
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    Some(summary)
 }
 
-fn should_precompress_from_pressure_sample(
-    sample: Option<&ClaudeContextPressureSample>,
-    current_body_bytes: u64,
-) -> bool {
-    let Some(sample) = sample else {
-        return false;
-    };
-    if !sample.requires_precompression || sample.context_full_body_bytes == 0 {
-        return false;
+/// 把上一轮的 compaction 摘要作为 compaction 块注入首条非 system message 之前。
+fn inject_compaction_block(body: &mut Value, summary: &str) {
+    let block = json!({
+        "role": "user",
+        "content": [{ "type": "compaction", "content": summary }]
+    });
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        let insert_at = messages
+            .iter()
+            .position(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+            .unwrap_or(0);
+        messages.insert(insert_at, block);
     }
-    (current_body_bytes as u128) * 100
-        >= (sample.context_full_body_bytes as u128)
-            * (CONTEXT_BRIDGE_PRECOMPRESSION_THRESHOLD_PERCENT as u128)
+}
+
+/// 固定给 anthropic-beta header 追加 context-management + compact（去重，系统内部强制）。
+fn append_anthropic_betas(headers: &mut Vec<(String, String)>) {
+    let extra = [CONTEXT_MANAGEMENT_BETA, COMPACT_BETA];
+    if let Some((_, value)) = headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+    {
+        let mut present: Vec<String> = value
+            .split(',')
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect();
+        for beta in &extra {
+            if !present.iter().any(|item| item == beta) {
+                present.push((*beta).to_string());
+            }
+        }
+        *value = present.join(",");
+    } else {
+        headers.push(("anthropic-beta".to_string(), extra.join(",")));
+    }
+}
+
+/// 发送前对最终 body 的统一收尾：逐条截断 tool_result，并注入官方治理字段。
+/// `inject_official` 为 false（自研兜底路径）时只做截断，不注入 context_management/compaction。
+fn finalize_outgoing_body(
+    body: &mut Value,
+    diagnostics: &mut ContextBridgeDiagnostics,
+    compaction_summary: Option<&str>,
+    context_key: &str,
+    inject_official: bool,
+) {
+    truncate_tool_results_in_body(body, TOOL_RESULT_TRUNCATE_CHARS, diagnostics);
+    if diagnostics.tool_results_truncated > 0 {
+        eprintln!(
+            "[neko-route][trunc] tool_results_truncated={} bytes={}",
+            diagnostics.tool_results_truncated, diagnostics.tool_results_truncated_bytes
+        );
+    }
+    if !inject_official {
+        return;
+    }
+    if is_strong_context_key(context_key) {
+        if let Some(summary) = compaction_summary
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+        {
+            inject_compaction_block(body, summary);
+            diagnostics.compaction_injected = true;
+            eprintln!("[neko-route][compact] injected prev summary key={context_key}");
+        }
+    }
+    let context_management = build_context_management();
+    let names = context_management_edit_names(&context_management);
+    if !names.is_empty() {
+        eprintln!("[neko-route][ctx-edit] injected edits=[{names}]");
+    }
+    diagnostics.context_management_edits = Some(names);
+    body["context_management"] = context_management;
+    diagnostics.context_management = true;
 }
 
 fn claude_context_key(request: &Value) -> String {
@@ -2034,19 +1631,18 @@ async fn forward_anthropic(
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let (upstream_model, one_million_context) =
         anthropic_model_for_request(&matched.upstream_model, matched.model.context_window);
-    let original_anthropic_body = build_anthropic_body(&body, &upstream_model, stream);
+    let mut anthropic_body = build_anthropic_body(&body, &upstream_model, stream);
     let client = client_for_provider(state, &matched.provider)?;
     let (base_url, headers) = anthropic_upstream(state, &client, &matched.provider).await?;
     let url = anthropic_messages_url(&base_url, one_million_context);
-    let message_headers = claude_code_mirror_headers(headers.clone(), &body);
-    let count_headers = claude_code_count_tokens_headers(headers, &body);
+    let mut message_headers = claude_code_mirror_headers(headers.clone(), &body);
+    append_anthropic_betas(&mut message_headers);
 
-    let original_body_bytes = json_size(&original_anthropic_body) as u64;
-    let original_tool_result_bytes =
-        collect_anthropic_tool_result_positions(&original_anthropic_body)
-            .iter()
-            .map(|position| position.content_bytes)
-            .sum::<usize>() as u64;
+    let original_body_bytes = json_size(&anthropic_body) as u64;
+    let original_tool_result_bytes = collect_anthropic_tool_result_positions(&anthropic_body)
+        .iter()
+        .map(|position| position.content_bytes)
+        .sum::<usize>() as u64;
     let context_key = claude_context_key(&body);
     let previous_pressure = state
         .store
@@ -2056,236 +1652,25 @@ async fn forward_anthropic(
             context_key.clone(),
         )
         .await;
-    let target_input_tokens = context_token_target(matched.model.context_window);
-    let body_size_target = context_body_target_bytes(matched.model.context_window);
-    let mut anthropic_body = original_anthropic_body.clone();
     let mut context_bridge = context_bridge_diagnostics(
         &anthropic_body,
         &body,
         original_body_bytes,
         original_tool_result_bytes,
     );
-    context_bridge.context_management = anthropic_body.get("context_management").is_some();
-    context_bridge.target_input_tokens = Some(target_input_tokens);
-    if let Some(sample) = &previous_pressure {
-        context_bridge.previous_success_input_tokens = Some(sample.input_tokens);
-        context_bridge.previous_success_body_bytes = Some(sample.body_bytes);
-    }
-    let mut should_compress = false;
-    let mut target_body_bytes = None;
-    let mut compression_reason = None::<String>;
-    let mut raw_precheck_input_tokens = None::<u64>;
-    let mut count_tokens_error = None::<String>;
 
-    match count_anthropic_input_tokens(&client, &base_url, &count_headers, &original_anthropic_body)
-        .await
-    {
-        Ok(input_tokens) => {
-            raw_precheck_input_tokens = Some(input_tokens);
-            context_bridge.raw_precheck_input_tokens = Some(input_tokens);
-            context_bridge.final_input_tokens = Some(input_tokens);
-            context_bridge.count_tokens_input_tokens = Some(input_tokens);
-            context_bridge.estimate_source = Some("count_tokens".into());
-            context_bridge.estimate_confidence = Some("high".into());
-            if input_tokens > target_input_tokens {
-                should_compress = true;
-                target_body_bytes = target_body_bytes_from_token_ratio(
-                    original_body_bytes,
-                    input_tokens,
-                    target_input_tokens,
-                );
-                compression_reason = Some(format!(
-                    "token_precheck_over_budget:{input_tokens}>{target_input_tokens}"
-                ));
-            }
-        }
-        Err(error) => {
-            count_tokens_error = Some(error);
-            let estimated = estimate_anthropic_input_tokens_from_body(&original_anthropic_body);
-            context_bridge.estimated_input_tokens = Some(estimated);
-            context_bridge.estimate_source = Some("body_size_chars".into());
-            context_bridge.estimate_confidence = Some("low".into());
-            if estimated > target_input_tokens || original_body_bytes > body_size_target {
-                should_compress = true;
-                target_body_bytes = Some(body_size_target);
-                compression_reason = Some(format!(
-                    "body_size_fallback:estimated={estimated} target={target_input_tokens} bytes={original_body_bytes}>{body_size_target}"
-                ));
-            }
-        }
-    }
-
-    let should_precompress =
-        should_precompress_from_pressure_sample(previous_pressure.as_ref(), original_body_bytes);
-    if should_precompress {
-        let previous_compression_stage = previous_pressure
+    finalize_outgoing_body(
+        &mut anthropic_body,
+        &mut context_bridge,
+        previous_pressure
             .as_ref()
-            .and_then(|sample| sample.compression_stage.as_deref())
-            .unwrap_or("context_full_retry_preserve_6");
-        let precompression_reason =
-            format!("previous_context_full_precompression:{previous_compression_stage}");
-        let mut precompressed_body = original_anthropic_body.clone();
-        let mut precompressed_bridge = bridge_anthropic_context(
-            state,
-            &mut precompressed_body,
-            &body,
-            &request_id,
-            requested_model,
-            CONTEXT_BRIDGE_FALLBACK_KEEP_TOOL_RESULTS,
-            Some(0),
-            precompression_reason,
-        )
-        .await;
-        if precompressed_bridge.archived_tool_results > 0 {
-            anthropic_body = precompressed_body;
-            precompressed_bridge.protection_triggered = true;
-            precompressed_bridge.target_input_tokens = Some(target_input_tokens);
-            precompressed_bridge.previous_success_input_tokens =
-                previous_pressure.as_ref().map(|sample| sample.input_tokens);
-            precompressed_bridge.previous_success_body_bytes =
-                previous_pressure.as_ref().map(|sample| sample.body_bytes);
-            precompressed_bridge.raw_precheck_input_tokens = raw_precheck_input_tokens;
-            precompressed_bridge.count_tokens_input_tokens = raw_precheck_input_tokens;
-            precompressed_bridge.count_tokens_error = count_tokens_error.clone();
-            precompressed_bridge.final_input_tokens = None;
-            precompressed_bridge.estimated_input_tokens =
-                Some(estimate_anthropic_input_tokens_from_body(&anthropic_body));
-            precompressed_bridge.estimate_source =
-                Some("previous_context_full_precompression".into());
-            precompressed_bridge.estimate_confidence = Some("medium".into());
-            precompressed_bridge.context_management = false;
-            precompressed_bridge.final_body_bytes = json_size(&anthropic_body) as u64;
-            precompressed_bridge.compression_stage = Some("precompress_preserve_6".into());
-            context_bridge = precompressed_bridge;
-            should_compress = false;
-        }
-    }
-
-    if should_compress {
-        let reason = compression_reason
-            .clone()
-            .unwrap_or_else(|| "over_budget".to_string());
-        let pre_bridge_estimated_input_tokens = context_bridge.estimated_input_tokens;
-        let pre_bridge_estimate_source = context_bridge.estimate_source.clone();
-        let pre_bridge_estimate_confidence = context_bridge.estimate_confidence.clone();
-        anthropic_body = original_anthropic_body.clone();
-        context_bridge = bridge_anthropic_context(
-            state,
-            &mut anthropic_body,
-            &body,
-            &request_id,
-            requested_model,
-            CONTEXT_BRIDGE_KEEP_TOOL_RESULTS,
-            target_body_bytes,
-            reason,
-        )
-        .await;
-        context_bridge.protection_triggered = true;
-        context_bridge.target_input_tokens = Some(target_input_tokens);
-        if let Some(sample) = &previous_pressure {
-            context_bridge.previous_success_input_tokens = Some(sample.input_tokens);
-            context_bridge.previous_success_body_bytes = Some(sample.body_bytes);
-        }
-        if context_bridge.estimated_input_tokens.is_none() {
-            context_bridge.estimated_input_tokens =
-                pre_bridge_estimated_input_tokens.or(raw_precheck_input_tokens);
-        }
-        context_bridge.estimate_source = pre_bridge_estimate_source;
-        context_bridge.estimate_confidence = pre_bridge_estimate_confidence;
-        context_bridge.compression_stage = Some("preserve_12".into());
-        context_bridge.raw_precheck_input_tokens = raw_precheck_input_tokens;
-        context_bridge.context_management = anthropic_body.get("context_management").is_some();
-        context_bridge.final_body_bytes = json_size(&anthropic_body) as u64;
-        match count_anthropic_input_tokens(&client, &base_url, &count_headers, &anthropic_body)
-            .await
-        {
-            Ok(input_tokens) => {
-                context_bridge.final_input_tokens = Some(input_tokens);
-                context_bridge.count_tokens_input_tokens = Some(input_tokens);
-                if input_tokens > target_input_tokens && context_bridge.archived_tool_results > 0 {
-                    let reason =
-                        format!("token_fallback_over_budget:{input_tokens}>{target_input_tokens}");
-                    let pre_bridge_estimated_input_tokens = context_bridge.estimated_input_tokens;
-                    let pre_bridge_estimate_source = context_bridge.estimate_source.clone();
-                    let pre_bridge_estimate_confidence = context_bridge.estimate_confidence.clone();
-                    anthropic_body = original_anthropic_body.clone();
-                    context_bridge = bridge_anthropic_context(
-                        state,
-                        &mut anthropic_body,
-                        &body,
-                        &request_id,
-                        requested_model,
-                        CONTEXT_BRIDGE_FALLBACK_KEEP_TOOL_RESULTS,
-                        target_body_bytes,
-                        reason,
-                    )
-                    .await;
-                    context_bridge.protection_triggered = true;
-                    context_bridge.target_input_tokens = Some(target_input_tokens);
-                    context_bridge.compression_stage = Some("preserve_6".into());
-                    if let Some(sample) = &previous_pressure {
-                        context_bridge.previous_success_input_tokens = Some(sample.input_tokens);
-                        context_bridge.previous_success_body_bytes = Some(sample.body_bytes);
-                    }
-                    context_bridge.estimated_input_tokens = pre_bridge_estimated_input_tokens;
-                    context_bridge.estimate_source = pre_bridge_estimate_source;
-                    context_bridge.estimate_confidence = pre_bridge_estimate_confidence;
-                    context_bridge.raw_precheck_input_tokens = raw_precheck_input_tokens;
-                    context_bridge.context_management =
-                        anthropic_body.get("context_management").is_some();
-                    context_bridge.final_body_bytes = json_size(&anthropic_body) as u64;
-                    match count_anthropic_input_tokens(
-                        &client,
-                        &base_url,
-                        &count_headers,
-                        &anthropic_body,
-                    )
-                    .await
-                    {
-                        Ok(input_tokens) => {
-                            context_bridge.final_input_tokens = Some(input_tokens);
-                            context_bridge.count_tokens_input_tokens = Some(input_tokens);
-                        }
-                        Err(error) => {
-                            context_bridge.count_tokens_error = Some(error);
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                context_bridge.count_tokens_error = Some(error);
-            }
-        }
-    } else if let Some(error) = count_tokens_error.as_ref() {
-        context_bridge.count_tokens_error = Some(error.clone());
-    }
-
-    if should_compress
-        && context_bridge.archived_tool_results == 0
-        && (context_bridge
-            .final_input_tokens
-            .or(context_bridge.raw_precheck_input_tokens)
-            .or(context_bridge.estimated_input_tokens)
-            .map(|tokens| tokens > target_input_tokens)
-            .unwrap_or(false)
-            || (context_bridge.final_input_tokens.is_none()
-                && context_bridge.raw_precheck_input_tokens.is_none()
-                && context_bridge
-                    .estimated_input_tokens
-                    .map(|tokens| tokens > target_input_tokens)
-                    .unwrap_or(false)))
-    {
-        context_bridge.protection_failure_reason = Some("no_compressible_old_tool_results".into());
-        return Err(RouteError::new(
-            StatusCode::BAD_REQUEST,
-            "context_length_exceeded",
-            context_full_error_message(),
-        )
-        .with_match(matched)
-        .with_context_bridge(context_bridge));
-    }
-
-    let mut upstream = post_json_with_retries(
+            .and_then(|sample| sample.compaction_summary.as_deref()),
+        &context_key,
+        true,
+    );
+    context_bridge.context_management = anthropic_body.get("context_management").is_some();
+    context_bridge.final_body_bytes = json_size(&anthropic_body) as u64;
+    let upstream = post_json_with_retries(
         &client,
         &url,
         message_headers.clone(),
@@ -2294,65 +1679,9 @@ async fn forward_anthropic(
         matched.retry_count,
     )
     .await?;
-    let mut context_full_retry_used = false;
-    loop {
-        if upstream.status().is_success() {
-            break;
-        }
+    if !upstream.status().is_success() {
         let status = upstream.status();
         let text = upstream.text().await.unwrap_or_default();
-        if is_context_window_full_error(&text)
-            && !context_full_retry_used
-            && !context_bridge.protection_triggered
-        {
-            context_full_retry_used = true;
-            let mut retry_body = original_anthropic_body.clone();
-            let mut retry_bridge = bridge_anthropic_context(
-                state,
-                &mut retry_body,
-                &body,
-                &request_id,
-                requested_model,
-                CONTEXT_BRIDGE_FALLBACK_KEEP_TOOL_RESULTS,
-                Some(0),
-                "upstream_context_full_retry",
-            )
-            .await;
-            retry_bridge.protection_triggered = true;
-            retry_bridge.target_input_tokens = Some(target_input_tokens);
-            retry_bridge.compression_stage = Some("context_full_retry_preserve_6".into());
-            retry_bridge.raw_precheck_input_tokens = raw_precheck_input_tokens;
-            retry_bridge.count_tokens_error = count_tokens_error.clone();
-            if let Some(sample) = &previous_pressure {
-                retry_bridge.previous_success_input_tokens = Some(sample.input_tokens);
-                retry_bridge.previous_success_body_bytes = Some(sample.body_bytes);
-            }
-            retry_bridge.context_management = false;
-            retry_bridge.final_body_bytes = json_size(&retry_body) as u64;
-            context_bridge = retry_bridge;
-            if context_bridge.archived_tool_results == 0 {
-                context_bridge.protection_failure_reason =
-                    Some("no_compressible_old_tool_results".into());
-                return Err(RouteError::new(
-                    StatusCode::BAD_REQUEST,
-                    "context_length_exceeded",
-                    context_full_error_message(),
-                )
-                .with_match(matched)
-                .with_context_bridge(context_bridge));
-            }
-            anthropic_body = retry_body;
-            upstream = post_json_with_retries(
-                &client,
-                &url,
-                message_headers.clone(),
-                anthropic_body.clone(),
-                matched.timeout_ms,
-                matched.retry_count,
-            )
-            .await?;
-            continue;
-        }
         if is_context_window_full_error(&text) {
             return Err(RouteError::new(
                 StatusCode::BAD_REQUEST,
@@ -2365,21 +1694,6 @@ async fn forward_anthropic(
         return Err(upstream_error_from_text(status, text)
             .with_match(matched)
             .with_context_bridge(context_bridge));
-    }
-    if context_full_retry_used
-        && context_bridge.protection_triggered
-        && context_bridge.archived_tool_results > 0
-    {
-        state
-            .store
-            .mark_claude_context_precompression(
-                matched.provider.id.clone(),
-                matched.model.id.clone(),
-                context_key.clone(),
-                original_body_bytes,
-                context_bridge.compression_stage.clone(),
-            )
-            .await;
     }
     if stream {
         let pressure_context = ClaudePressureContext {
@@ -2401,6 +1715,29 @@ async fn forward_anthropic(
         ))
     } else {
         let value = upstream_json(upstream).await?;
+        if is_strong_context_key(&context_key) {
+            if let Some(summary) = extract_compaction_summary(&value) {
+                context_bridge.compaction_persisted = true;
+                eprintln!(
+                    "[neko-route][compact] persisted summary_len={} key={}",
+                    summary.chars().count(),
+                    context_key
+                );
+                state
+                    .store
+                    .upsert_claude_compaction(
+                        matched.provider.id.clone(),
+                        matched.model.id.clone(),
+                        context_key.clone(),
+                        summary,
+                    )
+                    .await;
+            }
+        }
+        if let Some(applied) = extract_applied_edits(&value) {
+            eprintln!("[neko-route][ctx-edit] applied {applied}");
+            context_bridge.applied_edits = Some(applied);
+        }
         let usage = value
             .get("usage")
             .map(|u| parse_usage(ProviderProtocol::AnthropicMessages, u));
@@ -3540,6 +2877,8 @@ fn converted_anthropic_sse(
         let mut text_output_index: Option<usize> = None;
         let mut tool_calls: Vec<StreamingToolCall> = Vec::new();
         let mut thinking_blocks: HashMap<usize, StreamingAnthropicThinking> = HashMap::new();
+        let mut compaction_block_indices: HashSet<usize> = HashSet::new();
+        let mut compaction_text = String::new();
         let mut pending = String::new();
         let mut anthropic_usage = serde_json::Map::new();
         let mut saw_message_stop = false;
@@ -3633,6 +2972,20 @@ fn converted_anthropic_sse(
                         progress.observe_usage(usage).await;
                     }
                     match value.get("type").and_then(Value::as_str) {
+                        Some("content_block_start")
+                            if value.pointer("/content_block/type").and_then(Value::as_str)
+                                == Some("compaction") =>
+                        {
+                            let block_index =
+                                value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                            compaction_block_indices.insert(block_index);
+                            if let Some(text) = value
+                                .pointer("/content_block/content")
+                                .and_then(Value::as_str)
+                            {
+                                compaction_text.push_str(text);
+                            }
+                        }
                         Some("content_block_start")
                             if value.pointer("/content_block/type").and_then(Value::as_str)
                                 == Some("thinking") =>
@@ -3732,6 +3085,12 @@ fn converted_anthropic_sse(
                         {
                             let delta = value.pointer("/delta/text").and_then(Value::as_str).unwrap_or_default();
                             if delta.is_empty() {
+                                continue;
+                            }
+                            let block_index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                            if compaction_block_indices.contains(&block_index) {
+                                // compaction 块的增量：累加但绝不外吐给 Codex。
+                                compaction_text.push_str(delta);
                                 continue;
                             }
                             if !response_started {
@@ -3941,6 +3300,25 @@ fn converted_anthropic_sse(
         progress.finish(captured_usage).await;
         if saw_message_stop {
             record_claude_pressure_sample(&store, pressure_context.as_ref(), captured_usage.as_ref()).await;
+            if !compaction_text.trim().is_empty() {
+                if let Some(ctx) = pressure_context.as_ref() {
+                    if is_strong_context_key(&ctx.context_key) {
+                        eprintln!(
+                            "[neko-route][compact] persisted summary_len={} key={}",
+                            compaction_text.chars().count(),
+                            ctx.context_key
+                        );
+                        store
+                            .upsert_claude_compaction(
+                                ctx.provider_id.clone(),
+                                ctx.model.clone(),
+                                ctx.context_key.clone(),
+                                compaction_text.clone(),
+                            )
+                            .await;
+                    }
+                }
+            }
         }
         store.update_request_stream(
             request_id.clone(),
@@ -4347,7 +3725,8 @@ pub(crate) fn build_anthropic_body(request: &Value, upstream_model: &str, stream
         .get("max_output_tokens")
         .or_else(|| request.get("max_tokens"))
         .and_then(Value::as_u64)
-        .unwrap_or(1024);
+        .unwrap_or(1024)
+        .max(ANTHROPIC_THINKING_MIN_MAX_TOKENS);
 
     let mut body = json!({
         "model": upstream_model,
@@ -4359,13 +3738,19 @@ pub(crate) fn build_anthropic_body(request: &Value, upstream_model: &str, stream
     add_claude_desktop_metadata(&mut body, request);
     add_claude_desktop_latest_user_cache_control(&mut body);
 
-    let tools = anthropic_tools_from_request(request);
+    let mut tools = anthropic_tools_from_request(request);
     if !tools.is_empty() {
+        // 给最后一个 tool 加 cache_control 断点：tools 在多轮间稳定，提升缓存命中（任务二D）。
+        if let Some(object) = tools.last_mut().and_then(Value::as_object_mut) {
+            object.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+        }
         body["tools"] = Value::Array(tools);
     }
 
+    // effort 跟随 Codex 请求的推理档位；Codex 未指定时保留 Claude Code 默认的 max。
+    let effort = map_reasoning_effort(request).unwrap_or("max");
     body["thinking"] = json!({ "type": "adaptive" });
-    body["output_config"] = json!({ "effort": "max" });
+    body["output_config"] = json!({ "effort": effort });
     body["max_tokens"] = json!(max_tokens);
     body
 }
@@ -4636,7 +4021,19 @@ fn build_chat_completions_body_with_profile(
             body[key] = value.clone();
         }
     }
-    if let Some(stream_options) = request.get("stream_options") {
+    if stream {
+        // Codex 走 Responses 协议、不会发 stream_options，而 OpenAI Chat Completions
+        // 流式默认不返回 usage，必须显式 include_usage=true 才会在末尾 chunk 带 usage，
+        // 否则请求日志/用量统计的 token 恒为 0。尊重用户已显式设置的值，仅在缺键时补。
+        let mut opts = request
+            .get("stream_options")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        opts.entry("include_usage".to_string())
+            .or_insert(json!(true));
+        body["stream_options"] = Value::Object(opts);
+    } else if let Some(stream_options) = request.get("stream_options") {
         body["stream_options"] = stream_options.clone();
     }
     if let Some(response_format) = response_format.response_format {
@@ -6169,6 +5566,9 @@ fn anthropic_output_items(value: &Value) -> Vec<Value> {
                         "completed",
                     ));
                 }
+                Some("compaction") => {
+                    // compaction 块仅用于上下文衔接，绝不外吐给 Codex（forward 层已提取持久化）。
+                }
                 _ => {}
             }
         }
@@ -6326,13 +5726,11 @@ fn is_public_openai_api_key(auth: &str) -> bool {
 mod tests {
     use super::{
         anthropic_messages_url, anthropic_model_for_request, anthropic_output_items,
-        anthropic_response_json, anthropic_thinking_content_from_input_item,
-        archived_tool_result_card, bridge_anthropic_context_body, build_anthropic_body,
-        build_anthropic_count_tokens_body, build_chat_completions_body,
-        build_chat_completions_body_with_profile, chat_body_without_response_format,
-        chat_completion_output_items, chat_completion_response_json,
-        chat_completions_compatibility_profile, chat_reasoning_content_from_input_item,
-        chat_tool_call_deltas, classify_raw_stream_finish, claude_code_count_tokens_headers,
+        anthropic_response_json, anthropic_thinking_content_from_input_item, build_anthropic_body,
+        build_chat_completions_body, build_chat_completions_body_with_profile,
+        chat_body_without_response_format, chat_completion_output_items,
+        chat_completion_response_json, chat_completions_compatibility_profile,
+        chat_reasoning_content_from_input_item, chat_tool_call_deltas, classify_raw_stream_finish,
         claude_code_mirror_headers, collect_anthropic_tool_result_positions,
         context_bridge_diagnostics, context_full_error_message, converted_anthropic_sse,
         converted_chat_sse, endpoint, event_data_lines, extract_stream_delta, find_sse_boundary,
@@ -6341,18 +5739,23 @@ mod tests {
         official_responses_endpoint, post_bytes_with_retries, proxy_lan_models, proxy_raw,
         proxy_request_headers, response_stream_done_events, response_stream_start_events,
         responses_proxy_body, responses_proxy_url, route_response,
-        should_precompress_from_pressure_sample, should_retry_chat_without_response_format,
-        should_skip_proxy_request_header, summarize_tool_result, validate_lan_authorization,
-        ChatCompletionsCompatibilityProfile, RawProxyContext, RawSseObserver, ResponsesAuthMode,
-        RouteError, ServerState, CLAUDE_DESKTOP_COUNT_TOKENS_BETA, CLAUDE_DESKTOP_MESSAGES_BETA,
+        should_retry_chat_without_response_format, should_skip_proxy_request_header,
+        validate_lan_authorization, ChatCompletionsCompatibilityProfile, RawProxyContext,
+        RawSseObserver, ResponsesAuthMode, RouteError, ServerState, CLAUDE_DESKTOP_MESSAGES_BETA,
         RESPONSES_BODY_LIMIT_BYTES,
+    };
+    use super::{
+        append_anthropic_betas, build_context_management, context_management_edit_names,
+        extract_applied_edits, extract_compaction_summary, inject_compaction_block,
+        is_strong_context_key, truncate_tool_result_with_marker, truncate_tool_results_in_body,
     };
     use crate::{
         router::{match_route, RouteMatch},
         store::AppStore,
         types::{
-            default_config, ClaudeContextPressureSample, CodexInjectionMode, ContextArtifact,
-            ModelEntry, Provider, ProviderKind, ProviderProtocol, RequestRecord, TokenUsage,
+            default_config, ClaudeContextPressureSample, CodexInjectionMode,
+            ContextBridgeDiagnostics, ModelEntry, Provider, ProviderKind, ProviderProtocol,
+            RequestRecord, TokenUsage,
         },
     };
     use axum::{
@@ -6371,6 +5774,141 @@ mod tests {
             Arc, Mutex,
         },
     };
+
+    #[test]
+    fn truncate_tool_result_with_marker_keeps_head_tail() {
+        assert_eq!(truncate_tool_result_with_marker("hello", 100), "hello");
+        let long = "a".repeat(500) + &"b".repeat(500);
+        let out = truncate_tool_result_with_marker(&long, 100);
+        assert!(out.contains("[truncated"));
+        assert!(out.starts_with('a'));
+        assert!(out.ends_with('b'));
+        assert!(out.chars().count() < 1000);
+    }
+
+    #[test]
+    fn truncate_tool_results_in_body_truncates_large_results() {
+        let mut body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": "x".repeat(5000)
+                }]
+            }]
+        });
+        let mut diag = ContextBridgeDiagnostics::default();
+        truncate_tool_results_in_body(&mut body, 1000, &mut diag);
+        assert_eq!(diag.tool_results_truncated, 1);
+        let content = body["messages"][0]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(content.contains("[truncated"));
+        assert!(content.chars().count() < 5000);
+    }
+
+    #[test]
+    fn build_context_management_emits_edits() {
+        let cm = build_context_management();
+        let edits = cm["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0]["type"], "clear_tool_uses_20250919");
+        assert_eq!(edits[0]["trigger"]["value"], 100_000);
+        assert_eq!(edits[0]["keep"]["value"], 3);
+        assert_eq!(edits[1]["type"], "compact_20260112");
+        assert_eq!(edits[1]["trigger"]["value"], 150_000);
+    }
+
+    #[test]
+    fn context_management_edit_names_lists_types() {
+        let cm = json!({"edits": [
+            {"type": "clear_tool_uses_20250919"},
+            {"type": "compact_20260112"}
+        ]});
+        assert_eq!(
+            context_management_edit_names(&cm),
+            "clear_tool_uses_20250919,compact_20260112"
+        );
+    }
+
+    #[test]
+    fn append_anthropic_betas_merges_and_dedupes() {
+        let mut headers = vec![(
+            "anthropic-beta".to_string(),
+            "claude-code-20250219".to_string(),
+        )];
+        append_anthropic_betas(&mut headers);
+        let beta = headers[0].1.clone();
+        assert!(beta.contains("context-management-2025-06-27"));
+        assert!(beta.contains("compact-2026-01-12"));
+        append_anthropic_betas(&mut headers);
+        assert_eq!(
+            headers[0]
+                .1
+                .matches("context-management-2025-06-27")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn extract_compaction_summary_finds_block() {
+        let value = json!({"content": [
+            {"type": "text", "text": "hi"},
+            {"type": "compaction", "content": "summary here"}
+        ]});
+        assert_eq!(
+            extract_compaction_summary(&value).as_deref(),
+            Some("summary here")
+        );
+        let none = json!({"content": [{"type": "text", "text": "hi"}]});
+        assert!(extract_compaction_summary(&none).is_none());
+    }
+
+    #[test]
+    fn anthropic_output_items_filters_compaction() {
+        let value = json!({"content": [
+            {"type": "compaction", "content": "secret summary"},
+            {"type": "text", "text": "visible"}
+        ]});
+        let items = anthropic_output_items(&value);
+        let joined = serde_json::to_string(&items).unwrap();
+        assert!(!joined.contains("secret summary"));
+        assert!(joined.contains("visible"));
+    }
+
+    #[test]
+    fn extract_applied_edits_summarizes() {
+        let value = json!({"context_management": {"applied_edits": [
+            {"type": "clear_tool_uses_20250919", "cleared_tool_uses": 4, "cleared_input_tokens": 1000}
+        ]}});
+        let summary = extract_applied_edits(&value).unwrap();
+        assert!(summary.contains("clear_tool_uses_20250919"));
+        assert!(summary.contains("tool_uses=4"));
+        assert!(summary.contains("tokens=1000"));
+        assert!(extract_applied_edits(&json!({})).is_none());
+    }
+
+    #[test]
+    fn inject_compaction_block_inserts_before_first_non_system() {
+        let mut body = json!({"messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"}
+        ]});
+        inject_compaction_block(&mut body, "prev summary");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["content"][0]["type"], "compaction");
+        assert_eq!(messages[1]["content"][0]["content"], "prev summary");
+    }
+
+    #[test]
+    fn is_strong_context_key_checks_prefix() {
+        assert!(is_strong_context_key("key:abc123"));
+        assert!(!is_strong_context_key("provider_model"));
+    }
 
     #[tokio::test]
     async fn responses_route_accepts_bodies_above_axum_default_limit() {
@@ -6563,581 +6101,6 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
-    async fn anthropic_retries_with_context_bridge_when_upstream_context_is_full() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let message_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let beta_headers = Arc::new(Mutex::new(Vec::<String>::new()));
-        let app = axum::Router::new()
-            .route(
-                "/v1/messages/count_tokens",
-                axum::routing::post(
-                    |headers: HeaderMap, axum::Json(body): axum::Json<Value>| async move {
-                        let beta = headers
-                            .get("anthropic-beta")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default();
-                        assert_eq!(beta, CLAUDE_DESKTOP_COUNT_TOKENS_BETA);
-                        assert_eq!(
-                            headers
-                                .get(header::AUTHORIZATION)
-                                .and_then(|value| value.to_str().ok()),
-                            Some("Bearer sk-test")
-                        );
-                        assert!(headers.get("x-api-key").is_none());
-                        assert!(headers.get("x-stainless-timeout").is_none());
-                        assert!(body.get("context_management").is_none());
-                        assert!(body.get("system").is_none());
-                        assert_eq!(body["tools"].as_array().unwrap().len(), 0);
-                        assert_eq!(body["thinking"]["type"], "enabled");
-                        assert_eq!(body["thinking"]["budget_tokens"], 1024);
-                        axum::Json(json!({ "input_tokens": 50_000 })).into_response()
-                    },
-                ),
-            )
-            .route(
-                "/v1/messages",
-                axum::routing::post({
-                    let attempts = attempts.clone();
-                    let message_bodies = message_bodies.clone();
-                    let beta_headers = beta_headers.clone();
-                    move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
-                        let attempts = attempts.clone();
-                        let message_bodies = message_bodies.clone();
-                        let beta_headers = beta_headers.clone();
-                        async move {
-                            let beta = headers
-                                .get("anthropic-beta")
-                                .and_then(|value| value.to_str().ok())
-                                .unwrap_or_default()
-                                .to_string();
-                            assert_eq!(
-                                headers
-                                    .get(header::AUTHORIZATION)
-                                    .and_then(|value| value.to_str().ok()),
-                                Some("Bearer sk-test")
-                            );
-                            assert!(headers.get("x-api-key").is_none());
-                            assert_eq!(
-                                headers
-                                    .get("x-stainless-timeout")
-                                    .and_then(|value| value.to_str().ok()),
-                                Some("900")
-                            );
-                            beta_headers.lock().unwrap().push(beta);
-                            message_bodies.lock().unwrap().push(body.clone());
-                            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-                            if attempt == 0 {
-                                assert!(body.get("context_management").is_none());
-                                assert!(!body
-                                    .to_string()
-                                    .contains("Neko Route archived an older tool result"));
-                                return (
-                                    StatusCode::BAD_REQUEST,
-                                    axum::Json(json!({
-                                        "error": {
-                                            "message": "Context window is full. Reduce conversation history."
-                                        }
-                                    })),
-                                )
-                                    .into_response();
-                            }
-                            assert!(body.get("context_management").is_none());
-                            assert!(body
-                                .to_string()
-                                .contains("Neko Route archived an older tool result"));
-                            axum::Json(json!({
-                                "id": "msg_test",
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{ "type": "text", "text": "OK" }],
-                                "usage": { "input_tokens": 12, "output_tokens": 1 }
-                            }))
-                            .into_response()
-                        }
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        tokio::task::yield_now().await;
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = AppStore::load(temp.path().to_path_buf()).unwrap();
-        let mut config = default_config();
-        config.providers.push(Provider {
-            id: "anthropic-relay".into(),
-            name: "Anthropic Relay".into(),
-            kind: ProviderKind::Custom,
-            protocol: ProviderProtocol::AnthropicMessages,
-            base_url: format!("http://127.0.0.1:{port}/v1"),
-            key_ref: Some("provider:anthropic-relay".into()),
-            http_proxy: Default::default(),
-        });
-        config.models.push(ModelEntry {
-            id: "claude-relay-opus".into(),
-            display_name: "Claude Relay Opus".into(),
-            description: "Relay".into(),
-            context_window: 200_000,
-            enabled: true,
-            provider_id: "anthropic-relay".into(),
-            upstream_model: Some("claude-opus-4-8".into()),
-            timeout_ms: 0,
-            retry_count: 0,
-            reasoning_enabled: true,
-            default_reasoning_level: "max".into(),
-            supported_reasoning_levels: vec![
-                "low".into(),
-                "medium".into(),
-                "high".into(),
-                "max".into(),
-            ],
-            codex_alias: None,
-        });
-        store.replace_config(config).await.unwrap();
-        store
-            .key_store()
-            .set_secret("provider:anthropic-relay", "sk-test")
-            .unwrap();
-        let state = ServerState {
-            store,
-            client: Client::new(),
-        };
-        let store_for_assert = state.store.clone();
-        let request = json!({
-            "model": "claude-relay-opus",
-            "input": (0..10).flat_map(|index| {
-                vec![
-                    json!({
-                        "type": "function_call",
-                        "call_id": format!("toolu_{index}"),
-                        "name": "exec_command",
-                        "arguments": "{\"cmd\":\"large\"}"
-                    }),
-                    json!({
-                        "type": "function_call_output",
-                        "call_id": format!("toolu_{index}"),
-                        "output": format!("tool output {index}\n{}", "x".repeat(12_000))
-                    })
-                ]
-            }).chain(std::iter::once(json!({
-                "role": "user",
-                "content": "hello"
-            }))).collect::<Vec<_>>(),
-            "stream": false
-        });
-        let body_bytes = Bytes::from(serde_json::to_vec(&request).unwrap());
-
-        let (response, matched, usage, context_bridge) = route_response(
-            state,
-            HeaderMap::new(),
-            request,
-            body_bytes,
-            "ctx-retry".into(),
-        )
-        .await
-        .unwrap();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let value: Value = serde_json::from_slice(&body).unwrap();
-
-        assert_eq!(matched.route_reason, "direct");
-        assert_eq!(value["output_text"], "OK");
-        assert_eq!(usage.unwrap().input_tokens, 12);
-        let context_bridge = context_bridge.unwrap();
-        assert!(!context_bridge.context_management);
-        assert!(context_bridge.protection_triggered);
-        assert_eq!(
-            context_bridge.compression_stage.as_deref(),
-            Some("context_full_retry_preserve_6")
-        );
-        assert!(context_bridge.archived_tool_results > 0);
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        let bodies = message_bodies.lock().unwrap();
-        assert!(bodies[0].get("context_management").is_none());
-        assert!(bodies[1].get("context_management").is_none());
-        for beta in beta_headers.lock().unwrap().iter() {
-            assert_eq!(beta, CLAUDE_DESKTOP_MESSAGES_BETA);
-        }
-        let pressure = store_for_assert
-            .claude_context_pressure(
-                "anthropic-relay".into(),
-                "claude-relay-opus".into(),
-                "provider_model".into(),
-            )
-            .await
-            .unwrap();
-        assert!(pressure.requires_precompression);
-        assert!(pressure.context_full_body_bytes > 0);
-        assert_eq!(
-            pressure.compression_stage.as_deref(),
-            Some("context_full_retry_preserve_6")
-        );
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn anthropic_precompresses_before_messages_when_pressure_requires_it() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let message_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let app = axum::Router::new()
-            .route(
-                "/v1/messages/count_tokens",
-                axum::routing::post(|| async { axum::Json(json!({ "input_tokens": 50_000 })) }),
-            )
-            .route(
-                "/v1/messages",
-                axum::routing::post({
-                    let attempts = attempts.clone();
-                    let message_bodies = message_bodies.clone();
-                    move |axum::Json(body): axum::Json<Value>| {
-                        let attempts = attempts.clone();
-                        let message_bodies = message_bodies.clone();
-                        async move {
-                            attempts.fetch_add(1, Ordering::SeqCst);
-                            message_bodies.lock().unwrap().push(body.clone());
-                            assert!(body
-                                .to_string()
-                                .contains("Neko Route archived an older tool result"));
-                            axum::Json(json!({
-                                "id": "msg_test",
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{ "type": "text", "text": "OK" }],
-                                "usage": { "input_tokens": 12, "output_tokens": 1 }
-                            }))
-                            .into_response()
-                        }
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        tokio::task::yield_now().await;
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = AppStore::load(temp.path().to_path_buf()).unwrap();
-        let mut config = default_config();
-        config.providers.push(Provider {
-            id: "anthropic-relay".into(),
-            name: "Anthropic Relay".into(),
-            kind: ProviderKind::Custom,
-            protocol: ProviderProtocol::AnthropicMessages,
-            base_url: format!("http://127.0.0.1:{port}/v1"),
-            key_ref: Some("provider:anthropic-relay".into()),
-            http_proxy: Default::default(),
-        });
-        config.models.push(ModelEntry {
-            id: "claude-relay-opus".into(),
-            display_name: "Claude Relay Opus".into(),
-            description: "Relay".into(),
-            context_window: 200_000,
-            enabled: true,
-            provider_id: "anthropic-relay".into(),
-            upstream_model: Some("claude-opus-4-8".into()),
-            timeout_ms: 0,
-            retry_count: 0,
-            reasoning_enabled: true,
-            default_reasoning_level: "max".into(),
-            supported_reasoning_levels: vec![
-                "low".into(),
-                "medium".into(),
-                "high".into(),
-                "max".into(),
-            ],
-            codex_alias: None,
-        });
-        store.replace_config(config).await.unwrap();
-        store
-            .key_store()
-            .set_secret("provider:anthropic-relay", "sk-test")
-            .unwrap();
-        store
-            .mark_claude_context_precompression(
-                "anthropic-relay".into(),
-                "claude-relay-opus".into(),
-                "provider_model".into(),
-                64_000,
-                Some("context_full_retry_preserve_6".into()),
-            )
-            .await;
-        let state = ServerState {
-            store,
-            client: Client::new(),
-        };
-        let request = json!({
-            "model": "claude-relay-opus",
-            "input": (0..10).flat_map(|index| {
-                vec![
-                    json!({
-                        "type": "function_call",
-                        "call_id": format!("toolu_{index}"),
-                        "name": "exec_command",
-                        "arguments": "{\"cmd\":\"large\"}"
-                    }),
-                    json!({
-                        "type": "function_call_output",
-                        "call_id": format!("toolu_{index}"),
-                        "output": format!("tool output {index}\n{}", "x".repeat(12_000))
-                    })
-                ]
-            }).chain(std::iter::once(json!({
-                "role": "user",
-                "content": "hello"
-            }))).collect::<Vec<_>>(),
-            "stream": false
-        });
-        let body_bytes = Bytes::from(serde_json::to_vec(&request).unwrap());
-
-        let (_response, _matched, usage, context_bridge) = route_response(
-            state,
-            HeaderMap::new(),
-            request,
-            body_bytes,
-            "ctx-precompress".into(),
-        )
-        .await
-        .unwrap();
-        let context_bridge = context_bridge.unwrap();
-
-        assert_eq!(usage.unwrap().input_tokens, 12);
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(message_bodies.lock().unwrap().len(), 1);
-        assert!(context_bridge.protection_triggered);
-        assert_eq!(
-            context_bridge.compression_stage.as_deref(),
-            Some("precompress_preserve_6")
-        );
-        assert!(context_bridge.archived_tool_results > 0);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn anthropic_count_tokens_failure_uses_current_body_estimate_not_previous_ratio() {
-        let message_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let app = axum::Router::new()
-            .route(
-                "/v1/messages/count_tokens",
-                axum::routing::post(|| async {
-                    (
-                        StatusCode::NOT_FOUND,
-                        axum::Json(json!({"error": {"message": "count_tokens not found"}})),
-                    )
-                        .into_response()
-                }),
-            )
-            .route(
-                "/v1/messages",
-                axum::routing::post({
-                    let message_bodies = message_bodies.clone();
-                    move |axum::Json(body): axum::Json<Value>| {
-                        let message_bodies = message_bodies.clone();
-                        async move {
-                            message_bodies.lock().unwrap().push(body.clone());
-                            assert!(body.get("context_management").is_none());
-                            assert!(!body
-                                .to_string()
-                                .contains("Neko Route archived an older tool result"));
-                            axum::Json(json!({
-                                "id": "msg_pressure",
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{ "type": "text", "text": "OK" }],
-                                "usage": { "input_tokens": 700000, "output_tokens": 1 }
-                            }))
-                            .into_response()
-                        }
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        tokio::task::yield_now().await;
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = AppStore::load(temp.path().to_path_buf()).unwrap();
-        let mut config = default_config();
-        config.providers.push(Provider {
-            id: "anthropic-relay".into(),
-            name: "Anthropic Relay".into(),
-            kind: ProviderKind::Custom,
-            protocol: ProviderProtocol::AnthropicMessages,
-            base_url: format!("http://127.0.0.1:{port}/v1"),
-            key_ref: Some("provider:anthropic-relay".into()),
-            http_proxy: Default::default(),
-        });
-        config.models.push(ModelEntry {
-            id: "claude-relay-opus".into(),
-            display_name: "Claude Relay Opus".into(),
-            description: "Relay".into(),
-            context_window: 1_000_000,
-            enabled: true,
-            provider_id: "anthropic-relay".into(),
-            upstream_model: Some("claude-opus-4-8".into()),
-            timeout_ms: 0,
-            retry_count: 0,
-            reasoning_enabled: true,
-            default_reasoning_level: "max".into(),
-            supported_reasoning_levels: vec![
-                "low".into(),
-                "medium".into(),
-                "high".into(),
-                "max".into(),
-            ],
-            codex_alias: None,
-        });
-        store.replace_config(config).await.unwrap();
-        store
-            .key_store()
-            .set_secret("provider:anthropic-relay", "sk-test")
-            .unwrap();
-        store
-            .upsert_claude_context_pressure(
-                "anthropic-relay".into(),
-                "claude-relay-opus".into(),
-                "provider_model".into(),
-                969_000,
-                1_000_000,
-            )
-            .await;
-        let state = ServerState {
-            store,
-            client: Client::new(),
-        };
-        let mut input = Vec::new();
-        for index in 0..24 {
-            input.push(json!({
-                "type": "function_call",
-                "call_id": format!("toolu_{index}"),
-                "name": "exec_command",
-                "arguments": "{}"
-            }));
-            input.push(json!({
-                "type": "function_call_output",
-                "call_id": format!("toolu_{index}"),
-                "output": format!("tool output {index}\n{}", "x".repeat(12_000))
-            }));
-        }
-        input.push(json!({"role": "user", "content": "continue"}));
-        let request = json!({
-            "model": "claude-relay-opus",
-            "input": input,
-            "stream": false
-        });
-        let body_bytes = Bytes::from(serde_json::to_vec(&request).unwrap());
-
-        let (_response, _matched, usage, context_bridge) = route_response(
-            state,
-            HeaderMap::new(),
-            request,
-            body_bytes,
-            "pressure-sample".into(),
-        )
-        .await
-        .unwrap();
-        let context_bridge = context_bridge.unwrap();
-
-        assert_eq!(usage.unwrap().input_tokens, 700_000);
-        assert!(!context_bridge.protection_triggered);
-        assert_eq!(
-            context_bridge.estimate_source.as_deref(),
-            Some("body_size_chars")
-        );
-        assert_eq!(context_bridge.previous_success_input_tokens, Some(969_000));
-        assert_eq!(context_bridge.archived_tool_results, 0);
-        assert_eq!(message_bodies.lock().unwrap().len(), 1);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn anthropic_context_window_full_returns_clean_error_with_diagnostics() {
-        let app = axum::Router::new()
-            .route(
-                "/v1/messages/count_tokens",
-                axum::routing::post(|| async { axum::Json(json!({ "input_tokens": 12000 })) }),
-            )
-            .route(
-                "/v1/messages",
-                axum::routing::post(|| async {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        axum::Json(json!({
-                            "error": {
-                                "message": "Context window is full. Reduce conversation history, system prompt, or tools."
-                            }
-                        })),
-                    )
-                        .into_response()
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        tokio::task::yield_now().await;
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = AppStore::load(temp.path().to_path_buf()).unwrap();
-        let mut config = default_config();
-        config.providers.push(Provider {
-            id: "anthropic-relay".into(),
-            name: "Anthropic Relay".into(),
-            kind: ProviderKind::Custom,
-            protocol: ProviderProtocol::AnthropicMessages,
-            base_url: format!("http://127.0.0.1:{port}/v1"),
-            key_ref: Some("provider:anthropic-relay".into()),
-            http_proxy: Default::default(),
-        });
-        let mut model = config.models[1].clone();
-        model.id = "claude-relay-opus".into();
-        model.provider_id = "anthropic-relay".into();
-        model.upstream_model = Some("claude-opus-4-8".into());
-        config.models.push(model);
-        store.replace_config(config).await.unwrap();
-        store
-            .key_store()
-            .set_secret("provider:anthropic-relay", "sk-test")
-            .unwrap();
-        let state = ServerState {
-            store,
-            client: Client::new(),
-        };
-        let request = json!({
-            "model": "claude-relay-opus",
-            "input": "hello",
-            "stream": false
-        });
-        let body_bytes = Bytes::from(serde_json::to_vec(&request).unwrap());
-
-        let error = route_response(
-            state,
-            HeaderMap::new(),
-            request,
-            body_bytes,
-            "ctx-full".into(),
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(error.code, "context_length_exceeded");
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert_eq!(error.message, context_full_error_message());
-        assert!(error.context_bridge.is_some());
-        assert!(!error.message.contains("\\\"error\\\""));
-        server.abort();
-    }
-
     #[test]
     fn anthropic_body_uses_desktop_system_blocks_and_mid_conversation_system_messages() {
         let request = json!({
@@ -7257,37 +6220,6 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_count_tokens_body_removes_final_request_only_fields_and_cache() {
-        let request = json!({
-            "model": "claude-opus-4-8",
-            "instructions": "main instructions",
-            "tools": [{
-                "type": "function",
-                "name": "exec_command",
-                "description": "Run command",
-                "parameters": { "type": "object", "properties": {} }
-            }],
-            "input": [
-                {"role": "user", "content": "current question"}
-            ],
-            "stream": false
-        });
-
-        let body = build_anthropic_body(&request, "claude-opus-4-8", false);
-        let count_body = build_anthropic_count_tokens_body(&body);
-
-        assert!(count_body.get("system").is_none());
-        assert!(count_body.get("metadata").is_none());
-        assert!(count_body.get("output_config").is_none());
-        assert!(count_body.get("max_tokens").is_none());
-        assert!(count_body.get("stream").is_none());
-        assert_eq!(count_body["tools"].as_array().unwrap().len(), 0);
-        assert_eq!(count_body["thinking"]["type"], "enabled");
-        assert_eq!(count_body["thinking"]["budget_tokens"], 1024);
-        assert!(!count_body.to_string().contains("cache_control"));
-    }
-
-    #[test]
     fn anthropic_body_can_cache_latest_tool_result() {
         let request = json!({
             "model": "claude-opus-4-8",
@@ -7353,30 +6285,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_precompression_hint_uses_eighty_percent_body_threshold() {
-        let sample = ClaudeContextPressureSample {
-            input_tokens: 900_000,
-            body_bytes: 1_000_000,
-            requires_precompression: true,
-            context_full_body_bytes: 1_000,
-            compression_stage: Some("context_full_retry_preserve_6".into()),
-        };
-
-        assert!(!should_precompress_from_pressure_sample(Some(&sample), 799));
-        assert!(should_precompress_from_pressure_sample(Some(&sample), 800));
-
-        let disabled = ClaudeContextPressureSample {
-            requires_precompression: false,
-            ..sample
-        };
-        assert!(!should_precompress_from_pressure_sample(
-            Some(&disabled),
-            1_000
-        ));
-        assert!(!should_precompress_from_pressure_sample(None, 1_000));
-    }
-
-    #[test]
     fn chat_completions_uses_openai_reasoning_effort_only() {
         let request = json!({
             "model": "deepseek-v4-pro",
@@ -7413,9 +6321,9 @@ mod tests {
         let body = build_anthropic_body(&request, "claude-opus-4-8", false);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert!(body["thinking"].get("budget_tokens").is_none());
-        assert_eq!(body["output_config"]["effort"], "max");
+        assert_eq!(body["output_config"]["effort"], "high");
         assert!(body.get("reasoning_effort").is_none());
-        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["max_tokens"], 32000);
         assert!(body.get("context_management").is_none());
     }
 
@@ -7482,32 +6390,6 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_count_tokens_headers_use_desktop_count_profile() {
-        let request = json!({
-            "metadata": {
-                "user_id": "{\"session_id\":\"session-from-metadata\"}"
-            }
-        });
-        let headers = claude_code_count_tokens_headers(
-            vec![("x-api-key".into(), "sk-test".into())],
-            &request,
-        );
-        let get = |name: &str| {
-            headers
-                .iter()
-                .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value.as_str())
-                .unwrap()
-        };
-
-        assert_eq!(get("authorization"), "Bearer sk-test");
-        assert_eq!(get("anthropic-beta"), CLAUDE_DESKTOP_COUNT_TOKENS_BETA);
-        assert!(headers
-            .iter()
-            .all(|(name, _)| !name.eq_ignore_ascii_case("x-stainless-timeout")));
-    }
-
-    #[test]
     fn anthropic_messages_url_always_adds_beta_query() {
         assert_eq!(
             anthropic_messages_url("https://relay.example/v1", true),
@@ -7517,164 +6399,6 @@ mod tests {
             anthropic_messages_url("https://relay.example/v1", false),
             "https://relay.example/v1/messages?beta=true"
         );
-    }
-
-    #[test]
-    fn context_bridge_passes_through_when_no_budget_is_requested() {
-        let mut messages = Vec::new();
-        for index in 0..42 {
-            messages.push(json!({
-                "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": format!("toolu_{index}"),
-                    "name": "exec_command",
-                    "input": { "cmd": format!("run-{index}") }
-                }]
-            }));
-            messages.push(json!({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": format!("toolu_{index}"),
-                    "content": format!("tool output {index}\npath: /tmp/file-{index}.txt\n{}", "x".repeat(12_000))
-                }]
-            }));
-        }
-        messages.push(json!({
-            "role": "user",
-            "content": "continue from the last test result"
-        }));
-        let mut body = json!({
-            "model": "claude-opus-4-8",
-            "messages": messages,
-            "stream": false
-        });
-        let original_request = json!({});
-
-        let (diagnostics, artifacts) = bridge_anthropic_context_body(
-            &mut body,
-            &original_request,
-            "req_bridge",
-            "claude-opus-4-8",
-            8,
-            Some(u64::MAX),
-            &[],
-            None,
-        );
-        let positions = collect_anthropic_tool_result_positions(&body);
-
-        assert_eq!(diagnostics.tool_result_count, 42);
-        assert_eq!(diagnostics.archived_tool_results, 0);
-        assert_eq!(diagnostics.kept_tool_results, 42);
-        assert!(artifacts.is_empty());
-        assert_eq!(diagnostics.strategy, "pass_through");
-        assert!(positions[0].content.contains("tool output 0"));
-        assert!(positions[41].content.contains("tool output 41"));
-    }
-
-    #[test]
-    fn context_bridge_archives_old_tool_results_only_when_over_budget() {
-        let mut messages = Vec::new();
-        for index in 0..42 {
-            messages.push(json!({
-                "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": format!("toolu_{index}"),
-                    "name": "exec_command",
-                    "input": { "cmd": format!("run-{index}") }
-                }]
-            }));
-            messages.push(json!({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": format!("toolu_{index}"),
-                    "content": format!("tool output {index}\npath: /tmp/file-{index}.txt\n{}", "x".repeat(12_000))
-                }]
-            }));
-        }
-        messages.push(json!({
-            "role": "user",
-            "content": "continue from the last test result"
-        }));
-        let mut body = json!({
-            "model": "claude-opus-4-8",
-            "messages": messages,
-            "stream": false
-        });
-        let target = (json_size(&body) as u64).saturating_sub(180_000);
-        let original_request = json!({});
-
-        let (diagnostics, artifacts) = bridge_anthropic_context_body(
-            &mut body,
-            &original_request,
-            "req_bridge",
-            "claude-opus-4-8",
-            8,
-            Some(target),
-            &[],
-            Some("test_over_budget".into()),
-        );
-        let positions = collect_anthropic_tool_result_positions(&body);
-
-        assert_eq!(diagnostics.tool_result_count, 42);
-        assert!(diagnostics.archived_tool_results > 0);
-        assert!(diagnostics.archived_tool_results < 34);
-        assert_eq!(
-            diagnostics.kept_tool_results,
-            42 - diagnostics.archived_tool_results
-        );
-        assert_eq!(artifacts.len() as u64, diagnostics.archived_tool_results);
-        assert!(diagnostics.final_body_bytes <= target);
-        assert!(artifacts[0].content_text.contains("tool output 0"));
-        assert!(artifacts[0].summary.contains("/tmp/file-0.txt"));
-        assert!(positions[0]
-            .content
-            .contains("Neko Route archived an older tool result"));
-        assert!(positions[34].content.contains("tool output 34"));
-        assert!(positions[41].content.contains("tool output 41"));
-    }
-
-    #[test]
-    fn context_bridge_recalls_relevant_archived_artifacts() {
-        let artifact = ContextArtifact {
-            hash: "abc123".into(),
-            created_at: Utc::now(),
-            request_id: "old_req".into(),
-            model: "gpt-5.4".into(),
-            tool_name: Some("exec_command".into()),
-            tool_args: Some("{\"cmd\":\"pressure test\"}".into()),
-            content_bytes: 128,
-            content_text: "needle-token pressure test completed at 512K".into(),
-            summary: "pressure test summary needle-token".into(),
-        };
-        let mut body = json!({
-            "model": "claude-opus-4-8",
-            "messages": [{
-                "role": "user",
-                "content": "what happened with needle-token?"
-            }],
-            "stream": false
-        });
-
-        let (diagnostics, artifacts) = bridge_anthropic_context_body(
-            &mut body,
-            &json!({}),
-            "req_recall",
-            "claude-opus-4-8",
-            8,
-            Some(0),
-            &[artifact],
-            Some("test_recall".into()),
-        );
-
-        assert!(artifacts.is_empty());
-        assert_eq!(diagnostics.recalled_artifacts, 1);
-        assert_eq!(diagnostics.archived_tool_results, 0);
-        assert!(body["system"].to_string().contains("needle-token"));
-        assert!(body["system"].to_string().contains("sha256:abc123"));
     }
 
     #[test]
@@ -7732,16 +6456,6 @@ mod tests {
     }
 
     #[test]
-    fn context_bridge_summary_is_never_only_single_dot() {
-        let summary = summarize_tool_result(".", Some("exec_command"), Some("{}"), false);
-        let card = archived_tool_result_card("abc", &summary, 1, Some("exec_command"), Some("{}"));
-
-        assert_ne!(summary.trim(), ".");
-        assert_ne!(card.trim(), ".");
-        assert!(card.contains("Neko Route archived an older tool result"));
-    }
-
-    #[test]
     fn anthropic_messages_no_longer_use_classic_relay_thinking() {
         let request = json!({
             "model": "claude-3-5-sonnet",
@@ -7754,9 +6468,9 @@ mod tests {
 
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert!(body["thinking"].get("budget_tokens").is_none());
-        assert_eq!(body["output_config"]["effort"], "max");
+        assert_eq!(body["output_config"]["effort"], "high");
         assert!(body.get("reasoning_effort").is_none());
-        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["max_tokens"], 32000);
     }
 
     #[test]
@@ -7770,20 +6484,46 @@ mod tests {
 
     #[test]
     fn anthropic_messages_keep_requested_max_tokens() {
+        // Codex 发的 max_output_tokens 高于思考下限时应被尊重（保留大值）。
         let request = json!({
             "model": "claude-opus-4-8",
             "input": "hi",
             "reasoning": { "effort": "high" },
-            "max_output_tokens": 1024,
+            "max_output_tokens": 64000,
             "stream": false
         });
         let body = build_anthropic_body(&request, "claude-opus-4-8", false);
 
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert!(body["thinking"].get("budget_tokens").is_none());
-        assert_eq!(body["output_config"]["effort"], "max");
+        assert_eq!(body["output_config"]["effort"], "high");
         assert!(body.get("reasoning_effort").is_none());
-        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["max_tokens"], 64000);
+    }
+
+    #[test]
+    fn anthropic_body_effort_follows_codex_reasoning_tiers() {
+        for (sent, expected) in [("low", "low"), ("medium", "medium"), ("xhigh", "xhigh")] {
+            let request = json!({
+                "model": "claude-opus-4-8",
+                "input": "hi",
+                "reasoning": { "effort": sent },
+                "stream": false
+            });
+            let body = build_anthropic_body(&request, "claude-opus-4-8", false);
+            assert_eq!(body["output_config"]["effort"], expected);
+            // 思考下限对任意档位都生效。
+            assert_eq!(body["max_tokens"], 32000);
+        }
+    }
+
+    #[test]
+    fn anthropic_body_raises_max_tokens_floor_when_codex_omits() {
+        let request = json!({ "model": "claude-opus-4-8", "input": "hi", "stream": false });
+        let body = build_anthropic_body(&request, "claude-opus-4-8", false);
+        assert_eq!(body["max_tokens"], 32000);
+        // Codex 未指定推理档位时保留 Claude Code 默认的 max。
+        assert_eq!(body["output_config"]["effort"], "max");
     }
 
     #[test]
@@ -8195,6 +6935,28 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "system");
         assert_eq!(body["messages"][2]["role"], "user");
+    }
+
+    #[test]
+    fn chat_body_injects_include_usage_for_streaming() {
+        let request = json!({ "model": "gpt-test", "input": "hi" });
+
+        // 流式且请求未带 stream_options：自动补 include_usage=true，否则流式 usage 恒缺失。
+        let streaming = build_chat_completions_body(&request, "upstream-chat", true);
+        assert_eq!(streaming["stream_options"]["include_usage"], true);
+
+        // 非流式：不附加 stream_options。
+        let non_streaming = build_chat_completions_body(&request, "upstream-chat", false);
+        assert!(non_streaming.get("stream_options").is_none());
+
+        // 用户显式关闭 include_usage 时予以尊重，不被覆盖。
+        let explicit_off = json!({
+            "model": "gpt-test",
+            "input": "hi",
+            "stream_options": { "include_usage": false }
+        });
+        let body = build_chat_completions_body(&explicit_off, "upstream-chat", true);
+        assert_eq!(body["stream_options"]["include_usage"], false);
     }
 
     #[test]
@@ -8830,7 +7592,8 @@ mod tests {
         let body = build_anthropic_body(&request, "claude-upstream", false);
 
         assert_eq!(body["tools"][0]["name"], "exec_command");
-        assert!(body["tools"][0].get("cache_control").is_none());
+        // 最后一个 tool（此处仅一个）带 cache_control 断点（任务二D）。
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["messages"][0]["role"], "assistant");
         assert_eq!(body["messages"][0]["content"][0]["type"], "tool_use");
         assert_eq!(body["messages"][0]["content"][0]["input"]["cmd"], "pwd");

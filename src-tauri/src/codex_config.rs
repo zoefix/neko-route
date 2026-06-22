@@ -2,7 +2,7 @@ use crate::{
     catalog,
     catalog::CatalogModel,
     codex_alias,
-    types::{AppConfig, CodexInjectionMode, ProviderProtocol, Settings},
+    types::{AppConfig, CodexInjectionMode, Settings},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,11 @@ use std::{
     path::{Path, PathBuf},
 };
 use toml_edit::{value, DocumentMut, Item, Table};
+
+/// Codex's catalog menu exposes a single context window for every model entry.
+/// Pin it to 1M (and auto-compact to 90% of that) so selecting a smaller
+/// default model never caps the usable context of the other models.
+const CODEX_CONTEXT_WINDOW: u64 = 1_000_000;
 
 const RESTORE_FILE_NAME: &str = "neko-route-restore.json";
 
@@ -137,15 +142,7 @@ pub fn inject_lan_share_config_into(
     } else {
         document.as_table_mut().remove("model_reasoning_effort");
     }
-    let context_window_value = i64::try_from(selected.context_window)
-        .map_err(|_| "Codex model context window is too large".to_string())?;
-    let auto_compact_value = i64::try_from(catalog::auto_compact_token_limit_for_protocol(
-        selected.context_window,
-        selected.provider_protocol.as_ref(),
-    ))
-    .map_err(|_| "Codex auto compact token limit is too large".to_string())?;
-    document["model_context_window"] = value(context_window_value);
-    document["model_auto_compact_token_limit"] = value(auto_compact_value);
+    write_fixed_context_window(&mut document)?;
 
     ensure_neko_route_provider(&mut document, settings, false)?;
 
@@ -319,22 +316,7 @@ pub fn inject_into_with_model_filter(
     } else {
         document.as_table_mut().remove("model_reasoning_effort");
     }
-    if let Some((context_window, protocol)) = selected_model_context(config, selected_model) {
-        let context_window_value = i64::try_from(context_window)
-            .map_err(|_| "Codex model context window is too large".to_string())?;
-        let auto_compact_value = i64::try_from(catalog::auto_compact_token_limit_for_protocol(
-            context_window,
-            protocol.as_ref(),
-        ))
-        .map_err(|_| "Codex auto compact token limit is too large".to_string())?;
-        document["model_context_window"] = value(context_window_value);
-        document["model_auto_compact_token_limit"] = value(auto_compact_value);
-    } else {
-        document.as_table_mut().remove("model_context_window");
-        document
-            .as_table_mut()
-            .remove("model_auto_compact_token_limit");
-    }
+    write_fixed_context_window(&mut document)?;
 
     ensure_neko_route_provider(&mut document, &config.settings, !third_party)?;
 
@@ -514,21 +496,14 @@ fn default_reasoning_effort(config: &AppConfig, default_model: Option<&str>) -> 
     }
 }
 
-fn selected_model_context(
-    config: &AppConfig,
-    selected_model: Option<&str>,
-) -> Option<(u64, Option<ProviderProtocol>)> {
-    let selected_model = selected_model?;
-    let model = config
-        .models
-        .iter()
-        .find(|entry| entry.enabled && entry.id == selected_model)?;
-    let protocol = config
-        .providers
-        .iter()
-        .find(|provider| provider.id == model.provider_id)
-        .map(|provider| provider.protocol.clone());
-    Some((model.context_window, protocol))
+fn write_fixed_context_window(document: &mut DocumentMut) -> Result<(), String> {
+    let context_window_value = i64::try_from(CODEX_CONTEXT_WINDOW)
+        .map_err(|_| "Codex model context window is too large".to_string())?;
+    let auto_compact_value = i64::try_from(catalog::auto_compact_token_limit(CODEX_CONTEXT_WINDOW))
+        .map_err(|_| "Codex auto compact token limit is too large".to_string())?;
+    document["model_context_window"] = value(context_window_value);
+    document["model_auto_compact_token_limit"] = value(auto_compact_value);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -585,16 +560,16 @@ mod tests {
         assert!(config.contains("model = \"claude-opus-4-8\""));
         assert!(config.contains("model_reasoning_effort = \"max\""));
         assert!(config.contains("model_reasoning_summary = \"none\""));
-        assert!(config.contains("model_context_window = 200000"));
-        assert!(config.contains("model_auto_compact_token_limit = 180000"));
+        assert!(config.contains("model_context_window = 1000000"));
+        assert!(config.contains("model_auto_compact_token_limit = 900000"));
     }
 
     #[test]
-    fn inject_overwrites_context_and_auto_compact_for_new_default_model() {
+    fn inject_pins_context_window_to_one_million_regardless_of_default_model() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.toml"),
-            "model = \"gpt-5.5\"\nmodel_context_window = 1000000\nmodel_auto_compact_token_limit = 900000\n",
+            "model = \"gpt-5.5\"\nmodel_context_window = 200000\nmodel_auto_compact_token_limit = 180000\n",
         )
         .unwrap();
         let mut config = default_config();
@@ -609,26 +584,27 @@ mod tests {
         let config_toml = fs::read_to_string(&result.config_path).unwrap();
 
         assert!(config_toml.contains("model = \"claude-opus-4-8\""));
-        assert!(config_toml.contains("model_context_window = 258000"));
-        assert!(config_toml.contains("model_auto_compact_token_limit = 232200"));
-        assert!(!config_toml.contains("model_context_window = 1000000"));
-        assert!(!config_toml.contains("model_auto_compact_token_limit = 900000"));
+        // The pinned window must not follow the selected model's smaller context.
+        assert!(config_toml.contains("model_context_window = 1000000"));
+        assert!(config_toml.contains("model_auto_compact_token_limit = 900000"));
+        assert!(!config_toml.contains("model_context_window = 258000"));
+        assert!(!config_toml.contains("model_context_window = 200000"));
     }
 
     #[test]
-    fn inject_removes_stale_context_when_no_default_model_is_available() {
+    fn inject_writes_fixed_context_window_when_no_default_model_is_available() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.toml"),
-            "model_context_window = 1000000\nmodel_auto_compact_token_limit = 900000\n",
+            "model_context_window = 200000\nmodel_auto_compact_token_limit = 180000\n",
         )
         .unwrap();
 
         let result = inject_into(&default_config(), dir.path(), None).unwrap();
         let config_toml = fs::read_to_string(&result.config_path).unwrap();
 
-        assert!(!config_toml.contains("model_context_window"));
-        assert!(!config_toml.contains("model_auto_compact_token_limit"));
+        assert!(config_toml.contains("model_context_window = 1000000"));
+        assert!(config_toml.contains("model_auto_compact_token_limit = 900000"));
     }
 
     #[test]
@@ -696,8 +672,8 @@ mod tests {
 
         assert!(config_toml.contains("requires_openai_auth = false"));
         assert!(config_toml.contains("model = \"gpt-5.5\""));
-        assert!(config_toml.contains("model_context_window = 200000"));
-        assert!(config_toml.contains("model_auto_compact_token_limit = 180000"));
+        assert!(config_toml.contains("model_context_window = 1000000"));
+        assert!(config_toml.contains("model_auto_compact_token_limit = 900000"));
         assert!(catalog.contains("\"slug\": \"gpt-5.5\""));
         assert!(catalog.contains("\"display_name\": \"Claude Opus 4.8\""));
         assert!(!catalog.contains("\"slug\": \"claude-opus-4-8\""));
@@ -729,8 +705,8 @@ mod tests {
         assert!(config_toml.contains("requires_openai_auth = false"));
         assert!(config_toml.contains("base_url = \"http://127.0.0.1:9898/v1\""));
         assert!(config_toml.contains("model = \"gpt-5.5\""));
-        assert!(config_toml.contains("model_context_window = 258000"));
-        assert!(config_toml.contains("model_auto_compact_token_limit = 232200"));
+        assert!(config_toml.contains("model_context_window = 1000000"));
+        assert!(config_toml.contains("model_auto_compact_token_limit = 900000"));
         assert!(catalog.contains("\"slug\": \"gpt-5.5\""));
         assert!(catalog.contains("\"display_name\": \"Remote GPT\""));
         assert!(!catalog.contains("\"slug\": \"remote-gpt\""));
@@ -767,8 +743,8 @@ mod tests {
 
         assert!(config_toml.contains("model = \"gpt-5.5\""));
         assert!(config_toml.contains("model_reasoning_effort = \"max\""));
-        assert!(config_toml.contains("model_context_window = 258000"));
-        assert!(config_toml.contains("model_auto_compact_token_limit = 232200"));
+        assert!(config_toml.contains("model_context_window = 1000000"));
+        assert!(config_toml.contains("model_auto_compact_token_limit = 900000"));
     }
 
     #[test]

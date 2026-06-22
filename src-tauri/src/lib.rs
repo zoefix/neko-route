@@ -48,7 +48,7 @@ use std::{env, ffi::OsStr, path::Path};
 use tauri::{
     menu::MenuBuilder,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager,
+    Manager,
 };
 use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
@@ -1363,10 +1363,15 @@ fn pressure_test_request_shape(
                 "stream": false,
                 "max_output_tokens": 128
             });
+            let mut probe_body = server::build_anthropic_body(&request, &upstream_model, false);
+            // 探测只测 input 容量，保留请求里的小输出预算（不适用思考下限）。
+            if let Some(limit) = request.get("max_output_tokens").cloned() {
+                probe_body["max_tokens"] = limit;
+            }
             (
                 server::anthropic_messages_url(base_url, one_million_context),
                 server::claude_code_mirror_headers(headers, &request),
-                server::build_anthropic_body(&request, &upstream_model, false),
+                probe_body,
             )
         }
     }
@@ -1592,10 +1597,15 @@ async fn test_request_parts(
                 "stream": false,
                 "max_output_tokens": 16
             });
+            let mut probe_body = server::build_anthropic_body(&request, &upstream_model, false);
+            // 探测只测 input 容量，保留请求里的小输出预算（不适用思考下限）。
+            if let Some(limit) = request.get("max_output_tokens").cloned() {
+                probe_body["max_tokens"] = limit;
+            }
             Ok((
                 server::anthropic_messages_url(&base_url, one_million_context),
                 server::claude_code_mirror_headers(headers, &request),
-                server::build_anthropic_body(&request, &upstream_model, false),
+                probe_body,
             ))
         }
     }
@@ -3489,9 +3499,6 @@ fn configure_platform_window_frame(window: &tauri::WebviewWindow) {
 
 fn setup_tray(app: &mut tauri::App, exit_requested: Arc<AtomicBool>) -> tauri::Result<()> {
     let menu = MenuBuilder::new(app)
-        .text("add_provider", "添加服务商")
-        .text("add_model", "添加模型")
-        .separator()
         .text("show_main", "显示主窗口")
         .text("quit", "退出")
         .build()?;
@@ -3502,14 +3509,6 @@ fn setup_tray(app: &mut tauri::App, exit_requested: Arc<AtomicBool>) -> tauri::R
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| match event.id().as_ref() {
-            "add_provider" => {
-                show_main_window(app);
-                let _ = app.emit("neko-route://add-provider", ());
-            }
-            "add_model" => {
-                show_main_window(app);
-                let _ = app.emit("neko-route://add-model", ());
-            }
             "show_main" => show_main_window(app),
             "quit" => {
                 menu_exit_requested.store(true, Ordering::SeqCst);

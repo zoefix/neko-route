@@ -171,8 +171,6 @@ impl TokenUsage {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextBridgeDiagnostics {
     #[serde(default)]
-    pub strategy: String,
-    #[serde(default)]
     pub original_body_bytes: u64,
     #[serde(default)]
     pub final_body_bytes: u64,
@@ -181,45 +179,7 @@ pub struct ContextBridgeDiagnostics {
     #[serde(default)]
     pub tool_result_count: u64,
     #[serde(default)]
-    pub kept_tool_results: u64,
-    #[serde(default)]
-    pub archived_tool_results: u64,
-    #[serde(default)]
-    pub archived_bytes: u64,
-    #[serde(default)]
-    pub recalled_artifacts: u64,
-    #[serde(default)]
-    pub recalled_bytes: u64,
-    #[serde(default)]
-    pub count_tokens_input_tokens: Option<u64>,
-    #[serde(default)]
-    pub count_tokens_error: Option<String>,
-    #[serde(default)]
     pub context_management: bool,
-    #[serde(default)]
-    pub raw_precheck_input_tokens: Option<u64>,
-    #[serde(default)]
-    pub final_input_tokens: Option<u64>,
-    #[serde(default)]
-    pub estimated_input_tokens: Option<u64>,
-    #[serde(default)]
-    pub estimate_source: Option<String>,
-    #[serde(default)]
-    pub estimate_confidence: Option<String>,
-    #[serde(default)]
-    pub protection_triggered: bool,
-    #[serde(default)]
-    pub target_input_tokens: Option<u64>,
-    #[serde(default)]
-    pub previous_success_input_tokens: Option<u64>,
-    #[serde(default)]
-    pub previous_success_body_bytes: Option<u64>,
-    #[serde(default)]
-    pub compression_stage: Option<String>,
-    #[serde(default)]
-    pub protection_failure_reason: Option<String>,
-    #[serde(default)]
-    pub compression_reason: Option<String>,
     #[serde(default)]
     pub last_message_role: Option<String>,
     #[serde(default)]
@@ -240,28 +200,23 @@ pub struct ContextBridgeDiagnostics {
     pub latest_tool_result_text_length: u64,
     #[serde(default)]
     pub latest_tool_result_single_dot: bool,
+    #[serde(default)]
+    pub tool_results_truncated: u64,
+    #[serde(default)]
+    pub tool_results_truncated_bytes: u64,
+    #[serde(default)]
+    pub context_management_edits: Option<String>,
+    #[serde(default)]
+    pub applied_edits: Option<String>,
+    #[serde(default)]
+    pub compaction_persisted: bool,
+    #[serde(default)]
+    pub compaction_injected: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ClaudeContextPressureSample {
-    pub input_tokens: u64,
-    pub body_bytes: u64,
-    pub requires_precompression: bool,
-    pub context_full_body_bytes: u64,
-    pub compression_stage: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ContextArtifact {
-    pub hash: String,
-    pub created_at: DateTime<Utc>,
-    pub request_id: String,
-    pub model: String,
-    pub tool_name: Option<String>,
-    pub tool_args: Option<String>,
-    pub content_bytes: u64,
-    pub content_text: String,
-    pub summary: String,
+    pub compaction_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,7 +359,7 @@ pub struct AppSnapshot {
 
 pub fn default_config() -> AppConfig {
     AppConfig {
-        version: 13,
+        version: 14,
         providers: vec![
             Provider {
                 id: "openai-official".into(),

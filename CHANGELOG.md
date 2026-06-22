@@ -8,9 +8,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-06-23
+
+### Fixed
+
+- Official Anthropic (Claude) requests no longer end after the thinking phase with an empty reply; the output-token budget now has a floor and reasoning effort follows the Codex request tier.
+- Chat Completions streaming now reports token usage on strict OpenAI-compatible providers.
+
+### Changed
+
+- Context management now relies solely on Anthropic's official Context Editing and Compaction; the in-house compressor and its user-facing settings were removed, and tool-result governance is fixed internally.
+- Images are now sent inline as base64 instead of through the Files API, fixing uploads on official OAuth channels.
+
 ### Added
 
-- Added Homebrew Cask installation and release automation for macOS.
+- Homebrew Cask installation and release automation for macOS.
 
 ## [0.1.6] - 2026-06-22
 

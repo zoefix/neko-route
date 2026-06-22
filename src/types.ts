@@ -102,31 +102,11 @@ export type TokenUsage = {
 };
 
 export type ContextBridgeDiagnostics = {
-  strategy: string;
   original_body_bytes: number;
   final_body_bytes: number;
   original_tool_result_bytes: number;
   tool_result_count: number;
-  kept_tool_results: number;
-  archived_tool_results: number;
-  archived_bytes: number;
-  recalled_artifacts: number;
-  recalled_bytes: number;
-  count_tokens_input_tokens: number | null;
-  count_tokens_error: string | null;
   context_management: boolean;
-  raw_precheck_input_tokens: number | null;
-  final_input_tokens: number | null;
-  estimated_input_tokens: number | null;
-  estimate_source: string | null;
-  estimate_confidence: string | null;
-  protection_triggered: boolean;
-  target_input_tokens: number | null;
-  previous_success_input_tokens: number | null;
-  previous_success_body_bytes: number | null;
-  compression_stage: string | null;
-  protection_failure_reason: string | null;
-  compression_reason: string | null;
   last_message_role: string | null;
   last_message_content_type: string | null;
   last_message_text_length: number;
@@ -137,6 +117,12 @@ export type ContextBridgeDiagnostics = {
   latest_tool_result_count: number;
   latest_tool_result_text_length: number;
   latest_tool_result_single_dot: boolean;
+  tool_results_truncated: number;
+  tool_results_truncated_bytes: number;
+  context_management_edits: string | null;
+  applied_edits: string | null;
+  compaction_persisted: boolean;
+  compaction_injected: boolean;
 };
 
 export type RequestRecord = {
@@ -372,7 +358,3 @@ export type Page =
   | "logs"
   | "wizard"
   | "about";
-
-export type AppAction =
-  | { type: "add-provider"; nonce: number }
-  | { type: "add-model"; nonce: number };

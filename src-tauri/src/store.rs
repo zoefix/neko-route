@@ -4,9 +4,9 @@ use crate::provider_proxy;
 use crate::request_log::RequestLog;
 use crate::types::{
     default_config, reasoning_defaults_for_protocol, AppConfig, AppSnapshot,
-    ClaudeContextPressureSample, CodexInjectionMode, ContextArtifact, KeyStatus,
-    OfficialAccountQuota, Provider, ProviderKind, ProviderLocalUsage, ProviderUsageStatus,
-    RequestLogPage, RequestRecord, ServerStatus, Settings, TokenStats, TokenUsage,
+    ClaudeContextPressureSample, CodexInjectionMode, KeyStatus, OfficialAccountQuota, Provider,
+    ProviderKind, ProviderLocalUsage, ProviderUsageStatus, RequestLogPage, RequestRecord,
+    ServerStatus, Settings, TokenStats, TokenUsage,
 };
 use crate::{catalog, claude_auth, lan_share, official_auth};
 use serde_json::to_string_pretty;
@@ -19,7 +19,7 @@ use std::{
 };
 use tokio::sync::RwLock;
 
-const CURRENT_CONFIG_VERSION: u32 = 13;
+const CURRENT_CONFIG_VERSION: u32 = 14;
 const DASHBOARD_RECENT_REQUESTS: usize = 6;
 
 struct CodexApplicationPlan {
@@ -226,28 +226,6 @@ impl AppStore {
         .await;
     }
 
-    pub async fn archive_context_artifacts(&self, artifacts: Vec<ContextArtifact>) {
-        if artifacts.is_empty() {
-            return;
-        }
-        let log = self.inner.log.clone();
-        let _ = tokio::task::spawn_blocking(move || log.upsert_context_artifacts(&artifacts)).await;
-    }
-
-    pub async fn search_context_artifacts(
-        &self,
-        query: String,
-        limit: usize,
-    ) -> Vec<ContextArtifact> {
-        if query.trim().is_empty() || limit == 0 {
-            return Vec::new();
-        }
-        let log = self.inner.log.clone();
-        tokio::task::spawn_blocking(move || log.search_context_artifacts(&query, limit))
-            .await
-            .unwrap_or_default()
-    }
-
     pub async fn upsert_claude_context_pressure(
         &self,
         provider_id: String,
@@ -269,27 +247,6 @@ impl AppStore {
         .await;
     }
 
-    pub async fn mark_claude_context_precompression(
-        &self,
-        provider_id: String,
-        model: String,
-        context_key: String,
-        context_full_body_bytes: u64,
-        compression_stage: Option<String>,
-    ) {
-        let log = self.inner.log.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            log.mark_claude_context_precompression(
-                &provider_id,
-                &model,
-                &context_key,
-                context_full_body_bytes,
-                compression_stage.as_deref(),
-            )
-        })
-        .await;
-    }
-
     pub async fn claude_context_pressure(
         &self,
         provider_id: String,
@@ -303,6 +260,20 @@ impl AppStore {
         .await
         .ok()
         .flatten()
+    }
+
+    pub async fn upsert_claude_compaction(
+        &self,
+        provider_id: String,
+        model: String,
+        context_key: String,
+        summary: String,
+    ) {
+        let log = self.inner.log.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            log.upsert_claude_compaction(&provider_id, &model, &context_key, &summary)
+        })
+        .await;
     }
 
     pub async fn clear_requests(&self) {
@@ -1363,7 +1334,7 @@ mod tests {
         let config = normalize_config(default_config());
 
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
-        assert_eq!(CURRENT_CONFIG_VERSION, 13);
+        assert_eq!(CURRENT_CONFIG_VERSION, 14);
         assert!(config.providers.iter().all(|provider| {
             !provider.http_proxy.enabled
                 && provider.http_proxy.url.is_empty()

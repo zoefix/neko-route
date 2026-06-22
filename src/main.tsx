@@ -2,7 +2,6 @@ import React from "react";
 import { createPortal } from "react-dom";
 import ReactDOM from "react-dom/client";
 import { getVersion } from "@tauri-apps/api/app";
-import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
@@ -23,7 +22,7 @@ import {
   IconX as X,
 } from "@tabler/icons-react";
 import { api } from "./api";
-import type { AppAction, AppConfig, AppSnapshot, Page } from "./types";
+import type { AppConfig, AppSnapshot, Page } from "./types";
 import type { MsgKey } from "./messages";
 import { I18nProvider, useI18n } from "./i18n";
 import { ThemeProvider } from "./theme";
@@ -206,7 +205,6 @@ function App() {
   const [page, setPage] = React.useState<Page>("dashboard");
   const [busy, setBusy] = React.useState(false);
   const [toasts, setToasts] = React.useState<Toast[]>([]);
-  const [appAction, setAppAction] = React.useState<AppAction | null>(null);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
   const [appVersion, setAppVersion] = React.useState(packageMeta.version);
   const [updateStatus, setUpdateStatus] = React.useState<UpdateStatus>("idle");
@@ -383,36 +381,6 @@ function App() {
     }
   }, [config?.settings.codex_injection_mode, page]);
 
-  React.useEffect(() => {
-    if (typeof (window as any).__TAURI_INTERNALS__ === "undefined") return;
-    let unlistenProvider: (() => void) | undefined;
-    let unlistenModel: (() => void) | undefined;
-    listen("neko-route://add-provider", () => {
-      if (config?.settings.codex_injection_mode === "lan_share") {
-        setPage("wizard");
-        return;
-      }
-      setPage((current) => (current === "keys" ? current : "keys"));
-      setAppAction({ type: "add-provider", nonce: Date.now() + Math.random() });
-    }).then((dispose) => {
-      unlistenProvider = dispose;
-    }).catch(() => undefined);
-    listen("neko-route://add-model", () => {
-      if (config?.settings.codex_injection_mode === "lan_share") {
-        setPage("wizard");
-        return;
-      }
-      setPage((current) => (current === "models" ? current : "models"));
-      setAppAction({ type: "add-model", nonce: Date.now() + Math.random() });
-    }).then((dispose) => {
-      unlistenModel = dispose;
-    }).catch(() => undefined);
-    return () => {
-      unlistenProvider?.();
-      unlistenModel?.();
-    };
-  }, [config?.settings.codex_injection_mode]);
-
   const commit = React.useCallback<PageProps["commit"]>(
     async (updater, toastKey) => {
       if (!config) return false;
@@ -458,7 +426,6 @@ function App() {
     notifyRaw,
     busy,
     setBusy,
-    appAction,
     appVersion,
     updateStatus,
     availableUpdateVersion: availableUpdate?.version ?? null,

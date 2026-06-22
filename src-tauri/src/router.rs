@@ -35,6 +35,9 @@ pub fn match_route(config: &AppConfig, model_id: &str) -> Result<RouteMatch, Str
     )
 }
 
+/// Provider-scoped resolver used by the model-test commands. Unlike
+/// [`match_route`], this intentionally matches disabled models as well, so the
+/// UI can test a model before enabling it.
 pub fn match_route_for_provider(
     config: &AppConfig,
     model_id: &str,
@@ -51,9 +54,9 @@ pub fn match_route_for_provider(
     let model = config
         .models
         .iter()
-        .find(|model| model.enabled && model.id == requested && model.provider_id == provider_id)
+        .find(|model| model.id == requested && model.provider_id == provider_id)
         .ok_or_else(|| {
-            format!("Model '{requested}' is not enabled under provider '{provider_id}'")
+            format!("Model '{requested}' is not configured under provider '{provider_id}'")
         })?;
     route_match_from_model(config, requested, model, ROUTE_REASON_DIRECT, None)
 }
@@ -278,6 +281,27 @@ mod tests {
     fn provider_scoped_match_does_not_fallback_to_same_named_provider() {
         let config = default_config();
         assert!(match_route_for_provider(&config, "gpt-5.5", "missing-provider").is_err());
+    }
+
+    #[test]
+    fn provider_scoped_match_allows_disabled_model_for_testing() {
+        let mut config = default_config();
+        let model = config
+            .models
+            .iter_mut()
+            .find(|model| model.id == "gpt-5.5")
+            .unwrap();
+        model.enabled = false;
+        let provider_id = model.provider_id.clone();
+
+        // The real routing path must still reject a disabled model.
+        assert!(match_route(&config, "gpt-5.5").is_err());
+
+        // The provider-scoped resolver used by model testing must still find it.
+        let scoped = match_route_for_provider(&config, "gpt-5.5", &provider_id).unwrap();
+        assert_eq!(scoped.model.id, "gpt-5.5");
+        assert_eq!(scoped.provider.id, provider_id);
+        assert_eq!(scoped.route_reason, ROUTE_REASON_DIRECT);
     }
 
     #[test]
