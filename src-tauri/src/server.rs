@@ -346,6 +346,8 @@ async fn responses(
                     stream_bytes: 0,
                     context_bridge: None,
                     usage: TokenUsage::default(),
+                    context_usage: TokenUsage::default(),
+                    cost_usd: None,
                 })
                 .await;
             return route_error.into_response();
@@ -432,6 +434,8 @@ async fn responses(
             stream_bytes: 0,
             context_bridge,
             usage,
+            context_usage: usage,
+            cost_usd: None,
         })
         .await;
 
@@ -2881,6 +2885,7 @@ fn converted_anthropic_sse(
         let mut compaction_text = String::new();
         let mut pending = String::new();
         let mut anthropic_usage = serde_json::Map::new();
+        let mut context_usage: Option<TokenUsage> = None;
         let mut saw_message_stop = false;
         let mut stop_reason: Option<String> = None;
         let mut last_upstream_event: Option<String> = None;
@@ -2962,6 +2967,10 @@ fn converted_anthropic_sse(
                             anthropic_usage.insert(k.clone(), v.clone());
                         }
                         let usage = parse_usage(ProviderProtocol::AnthropicMessages, &Value::Object(anthropic_usage.clone()));
+                        // message_start 的 usage 是 Context Editing 清理「前」的真实上下文体积，只取第一次。
+                        if context_usage.is_none() {
+                            context_usage = Some(usage);
+                        }
                         progress.observe_usage(usage).await;
                     }
                     if let Some(u) = value.get("usage").and_then(Value::as_object) {
@@ -3285,7 +3294,22 @@ fn converted_anthropic_sse(
                 }
                 AnthropicStreamTerminalState::Failed { .. } => unreachable!(),
             };
-        let usage_json = captured_usage.map(usage_to_responses_json);
+        // 给 Codex 报「清理前体积」(context_usage) 而非清理后消费，让它正确判断上下文占用、适时收敛。
+        // output 取最终值；拿不到 message_start 时回退 captured_usage。
+        let codex_usage = context_usage
+            .map(|ctx| {
+                let output = captured_usage.map_or(ctx.output_tokens, |u| u.output_tokens);
+                TokenUsage {
+                    output_tokens: output,
+                    total_tokens: ctx.input_tokens
+                        + ctx.cache_read_tokens
+                        + ctx.cache_write_tokens
+                        + output,
+                    ..ctx
+                }
+            })
+            .or(captured_usage);
+        let usage_json = codex_usage.map(usage_to_responses_json);
         yield Ok::<Bytes, Infallible>(sequenced_sse_event(&mut sequence_number, "response.completed", json!({
             "type": "response.completed",
             "response": response_object_with_incomplete_details(
@@ -3298,6 +3322,11 @@ fn converted_anthropic_sse(
             )
         })));
         progress.finish(captured_usage).await;
+        if let Some(ctx_usage) = context_usage {
+            store
+                .finalize_request_breakdown(request_id.clone(), ctx_usage)
+                .await;
+        }
         if saw_message_stop {
             record_claude_pressure_sample(&store, pressure_context.as_ref(), captured_usage.as_ref()).await;
             if !compaction_text.trim().is_empty() {
@@ -3720,7 +3749,7 @@ fn extract_stream_delta(protocol: &ProviderProtocol, data: &str) -> Option<Strin
 }
 
 pub(crate) fn build_anthropic_body(request: &Value, upstream_model: &str, stream: bool) -> Value {
-    let (system_instructions, messages) = anthropic_messages_from_request(request);
+    let (system_instructions, mut messages) = anthropic_messages_from_request(request);
     let max_tokens = request
         .get("max_output_tokens")
         .or_else(|| request.get("max_tokens"))
@@ -3728,13 +3757,31 @@ pub(crate) fn build_anthropic_body(request: &Value, upstream_model: &str, stream
         .unwrap_or(1024)
         .max(ANTHROPIC_THINKING_MIN_MAX_TOKENS);
 
+    // 把 Codex instructions 从 top-level system 解耦到 messages 末尾的 mid-conversation system，
+    // 避免 Codex 每轮改写 instructions 时击穿整个历史的 prompt cache（长会话 cache_read 崩溃）。
+    // 仅当最后一条是 user 时移动（mid-conversation system 的合法性要求）；否则回退保留在 top-level system。
+    let last_is_user = messages
+        .last()
+        .and_then(|message| message.get("role").and_then(Value::as_str))
+        == Some("user");
+    let top_level_instructions = match system_instructions
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        Some(instructions) if last_is_user => {
+            messages.push(json!({ "role": "system", "content": instructions }));
+            None
+        }
+        other => other,
+    };
+
     let mut body = json!({
         "model": upstream_model,
         "messages": messages,
         "stream": stream
     });
 
-    body["system"] = Value::Array(claude_desktop_system_blocks(system_instructions.as_deref()));
+    body["system"] = Value::Array(claude_desktop_system_blocks(top_level_instructions));
     add_claude_desktop_metadata(&mut body, request);
     add_claude_desktop_latest_user_cache_control(&mut body);
 
@@ -6187,10 +6234,37 @@ mod tests {
 
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"][0]["text"], "你好");
-        assert!(body["system"][2]["text"]
+        // instructions 现在解耦为末尾 mid-conversation system（绝不在 messages[0]），
+        // top-level system 只剩冻结的 billing + identity。
+        assert_eq!(body["messages"][1]["role"], "system");
+        assert!(body["messages"][1]["content"]
             .as_str()
             .unwrap()
             .contains("follow policy"));
+        assert_eq!(body["system"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn anthropic_body_keeps_instructions_in_system_when_last_not_user() {
+        let request = json!({
+            "model": "claude-3-5-haiku",
+            "instructions": "follow policy",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok"}
+            ],
+            "stream": false
+        });
+        let body = build_anthropic_body(&request, "claude-3-5-haiku", false);
+        // 末尾是 assistant → mid-conversation system 不合法 → instructions 回退 top-level system。
+        let system_blocks = body["system"].as_array().unwrap();
+        assert_eq!(system_blocks.len(), 3);
+        assert!(system_blocks[2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("follow policy"));
+        let last = body["messages"].as_array().unwrap().last().unwrap();
+        assert_ne!(last["role"], "system");
     }
 
     #[test]
@@ -8731,6 +8805,8 @@ mod tests {
                 stream_bytes: 0,
                 context_bridge: None,
                 usage: TokenUsage::default(),
+                context_usage: TokenUsage::default(),
+                cost_usd: None,
             })
             .await;
     }
@@ -8881,6 +8957,8 @@ data: {"type":"response.failed","response":{"error":{"code":"context_length_exce
                 stream_bytes: 0,
                 context_bridge: None,
                 usage: TokenUsage::default(),
+                context_usage: TokenUsage::default(),
+                cost_usd: None,
             })
             .await;
         let response = Client::new().post(&url).send().await.unwrap();

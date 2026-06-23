@@ -145,6 +145,8 @@ export type RequestRecord = {
   stream_bytes: number;
   context_bridge: ContextBridgeDiagnostics | null;
   usage: TokenUsage;
+  context_usage: TokenUsage;
+  cost_usd: number | null;
 };
 
 export type CodexConfigContent = {

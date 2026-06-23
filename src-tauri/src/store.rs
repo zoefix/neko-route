@@ -207,6 +207,15 @@ impl AppStore {
         .await;
     }
 
+    /// 写入「上下文体积」(清理前)并按上游模型重算 cost；流式结束时调。
+    pub async fn finalize_request_breakdown(&self, id: String, context_usage: TokenUsage) {
+        let log = self.inner.log.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            log.finalize_request_breakdown(&id, &context_usage)
+        })
+        .await;
+    }
+
     pub async fn update_request_stream(
         &self,
         id: String,

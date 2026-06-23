@@ -1101,7 +1101,7 @@ textarea.input:focus {
 
 /* request log columns */
 .cols-req {
-  grid-template-columns: 96px minmax(120px, 1fr) minmax(170px, 1.1fr) 92px 132px 70px 112px;
+  grid-template-columns: 96px minmax(120px, 1fr) minmax(170px, 1.1fr) 92px 132px 96px 70px 112px;
 }
 
 .req-stream-cell {
@@ -2812,7 +2812,7 @@ body.model-drag-active * {
 
 /* request table columns (+ tokens) */
 .cols-req {
-  grid-template-columns: 92px minmax(110px, 1fr) minmax(160px, 1.1fr) 92px 132px 70px 112px;
+  grid-template-columns: 92px minmax(110px, 1fr) minmax(160px, 1.1fr) 92px 132px 96px 70px 112px;
 }
 
 /* small button variant */

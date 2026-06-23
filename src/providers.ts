@@ -176,3 +176,10 @@ export function formatTokens(n: number) {
   if (n >= 1_000) return `${(n / 1000).toFixed(1)}K`;
   return n.toLocaleString();
 }
+
+export function formatCost(usd: number) {
+  if (usd <= 0) return "$0";
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  if (usd < 1) return `$${usd.toFixed(3)}`;
+  return `$${usd.toFixed(2)}`;
+}

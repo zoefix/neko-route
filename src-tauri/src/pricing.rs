@@ -87,6 +87,31 @@ fn price_for_model(model: &str) -> Option<ModelPrice> {
             cache_write_per_million: 2.0,
         });
     }
+    // Claude 市场定价（等效 API 价；Max 订阅不实际按 token 扣，仅作参考）。
+    if model.starts_with("claude-opus-4") {
+        return Some(ModelPrice {
+            input_per_million: 15.0,
+            output_per_million: 75.0,
+            cache_read_per_million: 1.5,
+            cache_write_per_million: 18.75,
+        });
+    }
+    if model.starts_with("claude-sonnet-4") {
+        return Some(ModelPrice {
+            input_per_million: 3.0,
+            output_per_million: 15.0,
+            cache_read_per_million: 0.3,
+            cache_write_per_million: 3.75,
+        });
+    }
+    if model.starts_with("claude-haiku-4") {
+        return Some(ModelPrice {
+            input_per_million: 1.0,
+            output_per_million: 5.0,
+            cache_read_per_million: 0.1,
+            cache_write_per_million: 1.25,
+        });
+    }
     None
 }
 
@@ -103,5 +128,12 @@ mod tests {
     #[test]
     fn unknown_model_has_no_cost() {
         assert!(estimate_model_cost_usd("custom-model", 1, 1, 0, 0).is_none());
+    }
+
+    #[test]
+    fn estimates_claude_opus_cost() {
+        // 1M input @ $15 + 1M output @ $75 = $90（上游真实模型按 Claude 定价）。
+        let cost = estimate_model_cost_usd("claude-opus-4-8", 1_000_000, 1_000_000, 0, 0).unwrap();
+        assert!((cost - 90.0).abs() < 0.0001);
     }
 }

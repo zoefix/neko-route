@@ -56,6 +56,7 @@ import type {
 import {
   formatContext,
   formatTokens,
+  formatCost,
   isOfficialClaude,
   newClaudeAccountProvider,
   newCustomProvider,
@@ -529,11 +530,14 @@ export function RequestTable({
             <span>{t("table.providerProtocol")}</span>
             <span>{t("table.reasoning")}</span>
             <span>{t("table.tokens")}</span>
+            <span className="hide-sm">{t("table.cost")}</span>
             <span>{t("table.status")}</span>
             <span className="req-stream-cell">{t("table.stream")}</span>
           </div>
           {requests.map((r) => {
-            const u = r.usage;
+            // TOKEN 列显示「清理前体积」(context_usage)；旧记录无体积时回退 usage。消费列用清理后 usage + cost。
+            const vol = r.context_usage.total_tokens > 0 ? r.context_usage : r.usage;
+            const billed = r.usage;
             const streamDisplay = streamStatusDisplay(r, t);
             const hasErrorDetail = Boolean(r.error || r.stream_error);
             return (
@@ -557,15 +561,25 @@ export function RequestTable({
                   )}
                 </span>
                 <span>
-                  {u.total_tokens > 0 ? (
+                  {vol.total_tokens > 0 ? (
                     <span className="tok-cell">
-                      <strong>{formatTokens(u.total_tokens)}</strong>
+                      <strong>{formatTokens(vol.total_tokens)}</strong>
                       <span className="tok-mini">
-                        ↑{formatTokens(u.input_tokens)} ↓{formatTokens(u.output_tokens)}
-                        {u.cache_read_tokens + u.cache_write_tokens > 0
-                          ? ` ⚡${formatTokens(u.cache_read_tokens + u.cache_write_tokens)}`
+                        ↑{formatTokens(vol.input_tokens)} ↓{formatTokens(vol.output_tokens)}
+                        {vol.cache_read_tokens + vol.cache_write_tokens > 0
+                          ? ` ⚡${formatTokens(vol.cache_read_tokens + vol.cache_write_tokens)}`
                           : ""}
                       </span>
+                    </span>
+                  ) : (
+                    <span style={{ color: "var(--faint)" }}>—</span>
+                  )}
+                </span>
+                <span className="hide-sm">
+                  {r.cost_usd != null ? (
+                    <span className="tok-cell">
+                      <strong>{formatCost(r.cost_usd)}</strong>
+                      <span className="tok-mini">{formatTokens(billed.total_tokens)}</span>
                     </span>
                   ) : (
                     <span style={{ color: "var(--faint)" }}>—</span>

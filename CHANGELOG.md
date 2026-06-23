@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-06-23
+
+### Fixed
+
+- Context usage reported to Codex now reflects the real pre-edit request size, fixing long agent sessions that under-counted context occupancy and never compacted. Billing and quota accounting still use the post-edit usage.
+- Dropped the local context-window pre-compression pass; its byte-based token estimate overshot the real size and could evict cached prefixes, breaking Anthropic prompt caching.
+
+### Added
+
+- Per-request estimated cost column in the request log, priced by the upstream model (Claude and OpenAI catalogs).
+
 ## [0.1.7] - 2026-06-23
 
 ### Fixed

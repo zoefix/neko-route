@@ -249,6 +249,12 @@ pub struct RequestRecord {
     pub context_bridge: Option<ContextBridgeDiagnostics>,
     #[serde(default)]
     pub usage: TokenUsage,
+    /// 清理前的真实上下文体积（给 Codex 判断占用 + UI TOKEN 列）。
+    #[serde(default)]
+    pub context_usage: TokenUsage,
+    /// 按上游模型市场定价估算的等效消费金额（基于清理后 usage）。
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

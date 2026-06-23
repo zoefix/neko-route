@@ -47,7 +47,13 @@ impl RequestLog {
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-                total_tokens INTEGER NOT NULL DEFAULT 0
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                ctx_input_tokens INTEGER NOT NULL DEFAULT 0,
+                ctx_output_tokens INTEGER NOT NULL DEFAULT 0,
+                ctx_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                ctx_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                ctx_total_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL
             );
             CREATE INDEX IF NOT EXISTS idx_requests_started_at ON requests(started_at DESC);
             CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
@@ -89,6 +95,19 @@ impl RequestLog {
             "ALTER TABLE requests ADD COLUMN context_bridge_json TEXT",
             [],
         );
+        for column in [
+            "ctx_input_tokens",
+            "ctx_output_tokens",
+            "ctx_cache_read_tokens",
+            "ctx_cache_write_tokens",
+            "ctx_total_tokens",
+        ] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE requests ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
+                [],
+            );
+        }
+        let _ = conn.execute("ALTER TABLE requests ADD COLUMN cost_usd REAL", []);
         let _ = conn.execute(
             "ALTER TABLE claude_context_pressure ADD COLUMN requires_precompression INTEGER NOT NULL DEFAULT 0",
             [],
@@ -129,13 +148,23 @@ impl RequestLog {
             .context_bridge
             .as_ref()
             .and_then(|diagnostics| serde_json::to_string(diagnostics).ok());
+        let cost_usd = record.cost_usd.or_else(|| {
+            crate::pricing::estimate_model_cost_usd(
+                &record.model,
+                record.usage.input_tokens,
+                record.usage.output_tokens,
+                record.usage.cache_read_tokens,
+                record.usage.cache_write_tokens,
+            )
+        });
         let _ = conn.execute(
             "INSERT OR REPLACE INTO requests
               (id, started_at, model, requested_model, route_reason, provider_id, provider_name, provider_protocol,
                status, latency_ms, streaming, error, reasoning_effort,
                stream_state, stream_error, last_event,
-               stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+               stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+               ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
             params![
                 record.id,
                 record.started_at.to_rfc3339(),
@@ -160,6 +189,12 @@ impl RequestLog {
                 record.usage.cache_read_tokens as i64,
                 record.usage.cache_write_tokens as i64,
                 record.usage.total_tokens as i64,
+                record.context_usage.input_tokens as i64,
+                record.context_usage.output_tokens as i64,
+                record.context_usage.cache_read_tokens as i64,
+                record.context_usage.cache_write_tokens as i64,
+                record.context_usage.total_tokens as i64,
+                cost_usd,
             ],
         );
     }
@@ -190,6 +225,42 @@ impl RequestLog {
         );
     }
 
+    /// 流式结束后写入「上下文体积」(清理前)，并按上游模型 + 已记录的消费 usage 重算 cost。
+    pub fn finalize_request_breakdown(&self, id: &str, context_usage: &TokenUsage) {
+        let conn = self.conn.lock().unwrap();
+        let cost: Option<f64> = conn
+            .query_row(
+                "SELECT model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+                 FROM requests WHERE id=?1",
+                params![id],
+                |row| {
+                    let model: String = row.get(0)?;
+                    Ok(crate::pricing::estimate_model_cost_usd(
+                        &model,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                        row.get::<_, i64>(3)? as u64,
+                        row.get::<_, i64>(4)? as u64,
+                    ))
+                },
+            )
+            .unwrap_or(None);
+        let _ = conn.execute(
+            "UPDATE requests SET ctx_input_tokens=?2, ctx_output_tokens=?3,
+                ctx_cache_read_tokens=?4, ctx_cache_write_tokens=?5, ctx_total_tokens=?6, cost_usd=?7
+             WHERE id=?1",
+            params![
+                id,
+                context_usage.input_tokens as i64,
+                context_usage.output_tokens as i64,
+                context_usage.cache_read_tokens as i64,
+                context_usage.cache_write_tokens as i64,
+                context_usage.total_tokens as i64,
+                cost,
+            ],
+        );
+    }
+
     pub fn update_stream_status(
         &self,
         id: &str,
@@ -212,7 +283,8 @@ impl RequestLog {
             "SELECT id, started_at, model, provider_id, provider_name, provider_protocol,
                     requested_model, route_reason, status, latency_ms, streaming, error, reasoning_effort,
                     stream_state, stream_error, last_event,
-                    stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens
+                    stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+                    ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd
              FROM requests ORDER BY started_at DESC LIMIT ?1",
         ) {
             Ok(stmt) => stmt,
@@ -253,7 +325,8 @@ impl RequestLog {
             "SELECT id, started_at, model, provider_id, provider_name, provider_protocol,
                     requested_model, route_reason, status, latency_ms, streaming, error, reasoning_effort,
                     stream_state, stream_error, last_event,
-                    stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens
+                    stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+                    ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd
              FROM requests ORDER BY started_at DESC LIMIT ?1 OFFSET ?2",
         ) {
             Ok(stmt) => stmt,
@@ -666,6 +739,14 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
             cache_write_tokens: row.get::<_, i64>(21)? as u64,
             total_tokens: row.get::<_, i64>(22)? as u64,
         },
+        context_usage: TokenUsage {
+            input_tokens: row.get::<_, i64>(23)? as u64,
+            output_tokens: row.get::<_, i64>(24)? as u64,
+            cache_read_tokens: row.get::<_, i64>(25)? as u64,
+            cache_write_tokens: row.get::<_, i64>(26)? as u64,
+            total_tokens: row.get::<_, i64>(27)? as u64,
+        },
+        cost_usd: row.get::<_, Option<f64>>(28)?,
     })
 }
 
@@ -733,6 +814,8 @@ mod tests {
                 cache_write_tokens: 0,
                 total_tokens: 15,
             },
+            context_usage: TokenUsage::default(),
+            cost_usd: None,
         }
     }
 
@@ -845,6 +928,35 @@ mod tests {
 
         assert_eq!(records[0].id, "old");
         assert_eq!(records[0].stream_bytes, 0);
+    }
+
+    #[test]
+    fn finalize_breakdown_writes_volume_and_recomputes_cost() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = RequestLog::open(&temp.path().join("requests.db")).unwrap();
+        let mut rec = record("r1", 0);
+        rec.model = "claude-opus-4-8".into();
+        rec.usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            total_tokens: 1_000_000,
+        };
+        log.insert(&rec);
+        // 体积(清理前)远大于消费；cost 按消费 1M input @ $15 重算。
+        let ctx = TokenUsage {
+            input_tokens: 2_000_000,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            total_tokens: 2_000_100,
+        };
+        log.finalize_request_breakdown("r1", &ctx);
+        let got = log.recent(1).remove(0);
+        assert_eq!(got.context_usage.input_tokens, 2_000_000);
+        assert_eq!(got.usage.input_tokens, 1_000_000);
+        assert!((got.cost_usd.unwrap() - 15.0).abs() < 0.0001);
     }
 
     #[test]

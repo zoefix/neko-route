@@ -318,6 +318,8 @@ export function mockSnapshot(): AppSnapshot {
         stream_bytes: 0,
         context_bridge: null,
         usage: { input_tokens: 1240, output_tokens: 380, cache_read_tokens: 512, cache_write_tokens: 0, total_tokens: 1620 },
+        context_usage: { input_tokens: 1240, output_tokens: 380, cache_read_tokens: 4800, cache_write_tokens: 0, total_tokens: 6420 },
+        cost_usd: 0.0054,
       },
       {
         id: "2",
@@ -361,6 +363,8 @@ export function mockSnapshot(): AppSnapshot {
           compaction_injected: false,
         },
         usage: { input_tokens: 860, output_tokens: 540, cache_read_tokens: 3200, cache_write_tokens: 1100, total_tokens: 5700 },
+        context_usage: { input_tokens: 7500, output_tokens: 540, cache_read_tokens: 156000, cache_write_tokens: 0, total_tokens: 164040 },
+        cost_usd: 0.0788,
       },
       {
         id: "3",
@@ -382,6 +386,8 @@ export function mockSnapshot(): AppSnapshot {
         stream_bytes: 0,
         context_bridge: null,
         usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 0 },
+        context_usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 0 },
+        cost_usd: null,
       },
     ],
     request_log_count: 3,
