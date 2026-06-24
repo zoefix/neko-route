@@ -597,6 +597,7 @@ struct TestModelResult {
     error: Option<String>,
     usage: TokenUsage,
     provider_name: String,
+    image_preview: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -618,6 +619,7 @@ struct StartModelTestResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelTestMode {
     Connectivity,
+    Image,
     Context400K,
     Context1M,
 }
@@ -626,6 +628,7 @@ impl ModelTestMode {
     fn parse(value: &str) -> Result<Self, String> {
         match value.trim() {
             "connectivity" => Ok(Self::Connectivity),
+            "image" => Ok(Self::Image),
             "context_400k" => Ok(Self::Context400K),
             "context_1m" => Ok(Self::Context1M),
             _ => Err("Unknown model test mode".into()),
@@ -635,6 +638,7 @@ impl ModelTestMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Connectivity => "connectivity",
+            Self::Image => "image",
             Self::Context400K => "context_400k",
             Self::Context1M => "context_1m",
         }
@@ -643,6 +647,7 @@ impl ModelTestMode {
     fn target_tokens(self) -> u64 {
         match self {
             Self::Connectivity => 0,
+            Self::Image => 0,
             Self::Context400K => 400_000,
             Self::Context1M => 1_000_000,
         }
@@ -655,6 +660,7 @@ impl ModelTestMode {
     fn probe_steps(self) -> &'static [u64] {
         match self {
             Self::Connectivity => &[],
+            Self::Image => &[],
             Self::Context400K => &[128_000, 258_000, 380_000, 420_000],
             Self::Context1M => &[128_000, 258_000, 400_000, 700_000, 950_000, 1_050_000],
         }
@@ -663,6 +669,7 @@ impl ModelTestMode {
     fn target_label(self) -> &'static str {
         match self {
             Self::Connectivity => "connectivity",
+            Self::Image => "image",
             Self::Context400K => "400K",
             Self::Context1M => "1M",
         }
@@ -780,7 +787,7 @@ async fn test_model(
         .map(|provider| match_route_for_provider(&config, &model, provider))
         .unwrap_or_else(|| match_route(&config, &model))?;
 
-    test_matched_model(store.inner(), matched).await
+    test_matched_model(store.inner(), matched, ModelTestMode::Connectivity).await
 }
 
 #[tauri::command]
@@ -887,8 +894,8 @@ async fn run_model_test_task(
     status: Arc<Mutex<ModelTestStatus>>,
     cancelled: Arc<AtomicBool>,
 ) {
-    if mode == ModelTestMode::Connectivity {
-        run_connectivity_test_task(&store, matched, &status).await;
+    if matches!(mode, ModelTestMode::Connectivity | ModelTestMode::Image) {
+        run_connectivity_test_task(&store, matched, mode, &status).await;
         return;
     }
     run_context_pressure_test_task(&store, matched, mode, &status, &cancelled).await;
@@ -905,6 +912,7 @@ async fn update_model_test_status(
 async fn run_connectivity_test_task(
     store: &AppStore,
     matched: RouteMatch,
+    mode: ModelTestMode,
     status: &Arc<Mutex<ModelTestStatus>>,
 ) {
     update_model_test_status(status, |status| {
@@ -912,7 +920,7 @@ async fn run_connectivity_test_task(
     })
     .await;
 
-    match test_matched_model(store, matched).await {
+    match test_matched_model(store, matched, mode).await {
         Ok(result) => {
             update_model_test_status(status, |status| {
                 status.state = "completed".into();
@@ -947,6 +955,7 @@ async fn run_connectivity_test_task(
                     error: Some(error),
                     usage: TokenUsage::default(),
                     provider_name: status.provider_name.clone(),
+                    image_preview: None,
                 });
             })
             .await;
@@ -966,30 +975,32 @@ async fn run_context_pressure_test_task(
     })
     .await;
 
-    let connectivity = match test_matched_model(store, matched.clone()).await {
-        Ok(result) => result,
-        Err(error) => {
-            update_model_test_status(status, |status| {
-                status.state = "completed".into();
-                status.stage = "done".into();
-                status.inconclusive = true;
-                status.supported = None;
-                status.last_error = Some(error.clone());
-                status.summary = Some(format!("Test inconclusive: {error}"));
-                status.result = Some(TestModelResult {
-                    ok: false,
-                    status: 0,
-                    latency_ms: 0,
-                    reply: String::new(),
-                    error: Some(error),
-                    usage: TokenUsage::default(),
-                    provider_name: status.provider_name.clone(),
-                });
-            })
-            .await;
-            return;
-        }
-    };
+    let connectivity =
+        match test_matched_model(store, matched.clone(), ModelTestMode::Connectivity).await {
+            Ok(result) => result,
+            Err(error) => {
+                update_model_test_status(status, |status| {
+                    status.state = "completed".into();
+                    status.stage = "done".into();
+                    status.inconclusive = true;
+                    status.supported = None;
+                    status.last_error = Some(error.clone());
+                    status.summary = Some(format!("Test inconclusive: {error}"));
+                    status.result = Some(TestModelResult {
+                        ok: false,
+                        status: 0,
+                        latency_ms: 0,
+                        reply: String::new(),
+                        error: Some(error),
+                        usage: TokenUsage::default(),
+                        provider_name: status.provider_name.clone(),
+                        image_preview: None,
+                    });
+                })
+                .await;
+                return;
+            }
+        };
 
     if !connectivity.ok {
         update_model_test_status(status, |status| {
@@ -1364,16 +1375,26 @@ fn pressure_test_request_shape(
                 "max_output_tokens": 128
             });
             let mut probe_body = server::build_anthropic_body(&request, &upstream_model, false);
-            // 探测只测 input 容量，保留请求里的小输出预算（不适用思考下限）。
-            if let Some(limit) = request.get("max_output_tokens").cloned() {
-                probe_body["max_tokens"] = limit;
+            // 探测只测连通/input 容量：关掉思考，让小输出预算直接产出正文
+            // （否则 thinking 会吃满预算，连通测试虽 200 但回复为空）。
+            if let Some(object) = probe_body.as_object_mut() {
+                object.remove("thinking");
+                object.remove("output_config");
+                if let Some(limit) = request.get("max_output_tokens").cloned() {
+                    object.insert("max_tokens".into(), limit);
+                }
             }
             (
                 server::anthropic_messages_url(base_url, one_million_context),
-                server::claude_code_mirror_headers(headers, &request),
+                server::claude_code_mirror_headers(headers, &request, one_million_context),
                 probe_body,
             )
         }
+        ProviderProtocol::OpenAiImages => (
+            endpoint(base_url, "images/generations"),
+            headers,
+            json!({ "model": upstream_model, "prompt": prompt, "n": 1, "size": "1024x1024" }),
+        ),
     }
 }
 
@@ -1492,10 +1513,11 @@ fn pressure_test_summary(
 async fn test_matched_model(
     store: &AppStore,
     matched: RouteMatch,
+    mode: ModelTestMode,
 ) -> Result<TestModelResult, String> {
     let default_client = default_http_client()?;
     let client = client_for_provider(store, &default_client, &matched.provider)?;
-    let (url, headers, payload) = test_request_parts(store, &client, &matched).await?;
+    let (url, headers, payload) = test_request_parts(store, &client, &matched, mode).await?;
 
     let started = Instant::now();
     let mut request = client.post(&url).timeout(Duration::from_secs(60));
@@ -1525,15 +1547,34 @@ async fn test_matched_model(
             error: Some(error),
             usage: TokenUsage::default(),
             provider_name: matched.provider.name.clone(),
+            image_preview: None,
         });
     }
 
-    let reply = test_reply_from_value(&matched.provider.protocol, &value);
+    // 图片测试用画图协议解析回复(检测 data → "(image generated)")，避免显示"无回复"。
+    let reply = if mode == ModelTestMode::Image {
+        test_reply_from_value(&ProviderProtocol::OpenAiImages, &value)
+    } else {
+        test_reply_from_value(&matched.provider.protocol, &value)
+    };
     let usage = value
         .get("usage")
         .filter(|u| u.is_object())
         .map(|u| parse_usage(matched.provider.protocol.clone(), u))
         .unwrap_or_default();
+    // 图片协议测试：把生成图 base64 带回前端预览(小猫)。
+    let image_preview = (mode == ModelTestMode::Image
+        || matched.provider.protocol == ProviderProtocol::OpenAiImages)
+        .then(|| {
+            value
+                .get("data")
+                .and_then(|data| data.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("b64_json"))
+                .and_then(|b64| b64.as_str())
+                .map(|s| s.to_string())
+        })
+        .flatten();
 
     Ok(TestModelResult {
         ok: true,
@@ -1543,6 +1584,7 @@ async fn test_matched_model(
         error: None,
         usage,
         provider_name: matched.provider.name.clone(),
+        image_preview,
     })
 }
 
@@ -1550,9 +1592,23 @@ async fn test_request_parts(
     store: &AppStore,
     client: &reqwest::Client,
     matched: &RouteMatch,
+    mode: ModelTestMode,
 ) -> Result<(String, Vec<(String, String)>, Value), String> {
     let (base_url, headers) = test_provider_upstream(store, client, matched).await?;
     let upstream = &matched.upstream_model;
+    // 图片测试：任意模型都强制走 images/generations 画一张猫，验证是否支持画图。
+    if mode == ModelTestMode::Image {
+        return Ok((
+            endpoint(&base_url, "images/generations"),
+            headers,
+            json!({
+                "model": upstream,
+                "prompt": "a cute cat",
+                "n": 1,
+                "size": "1024x1024"
+            }),
+        ));
+    }
     match &matched.provider.protocol {
         ProviderProtocol::OpenAiResponses => {
             let official_openai = matches!(
@@ -1598,16 +1654,31 @@ async fn test_request_parts(
                 "max_output_tokens": 16
             });
             let mut probe_body = server::build_anthropic_body(&request, &upstream_model, false);
-            // 探测只测 input 容量，保留请求里的小输出预算（不适用思考下限）。
-            if let Some(limit) = request.get("max_output_tokens").cloned() {
-                probe_body["max_tokens"] = limit;
+            // 探测只测连通/input 容量：关掉思考，让小输出预算直接产出正文
+            // （否则 thinking 会吃满预算，连通测试虽 200 但回复为空）。
+            if let Some(object) = probe_body.as_object_mut() {
+                object.remove("thinking");
+                object.remove("output_config");
+                if let Some(limit) = request.get("max_output_tokens").cloned() {
+                    object.insert("max_tokens".into(), limit);
+                }
             }
             Ok((
                 server::anthropic_messages_url(&base_url, one_million_context),
-                server::claude_code_mirror_headers(headers, &request),
+                server::claude_code_mirror_headers(headers, &request, one_million_context),
                 probe_body,
             ))
         }
+        ProviderProtocol::OpenAiImages => Ok((
+            endpoint(&base_url, "images/generations"),
+            headers,
+            json!({
+                "model": upstream,
+                "prompt": "a cute cat",
+                "n": 1,
+                "size": "1024x1024"
+            }),
+        )),
     }
 }
 
@@ -1935,6 +2006,17 @@ fn test_reply_from_value(protocol: &ProviderProtocol, value: &Value) -> String {
                     .join("")
             })
             .unwrap_or_default(),
+        ProviderProtocol::OpenAiImages => {
+            if value
+                .get("data")
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+            {
+                "(image generated)".to_string()
+            } else {
+                String::new()
+            }
+        }
     }
 }
 
@@ -2884,6 +2966,19 @@ async fn clear_request_logs(store: tauri::State<'_, AppStore>) -> Result<AppSnap
     Ok(store.snapshot().await)
 }
 
+/// 读 image_cache 里的画图原图，返回 base64(供日志点击预览)。
+#[tauri::command]
+async fn read_image_preview(
+    store: tauri::State<'_, AppStore>,
+    name: String,
+) -> Result<String, String> {
+    use base64::Engine;
+    store
+        .image_preview_bytes(&name)
+        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+        .ok_or_else(|| "Image not found".to_string())
+}
+
 #[tauri::command]
 async fn get_request_logs(
     store: tauri::State<'_, AppStore>,
@@ -2903,7 +2998,7 @@ mod tests {
         provider_error_message, provider_status_error, server_bind_settings_changed,
         test_reply_from_value, test_response_value, windows_restart_preflight_error, ModelTestMode,
     };
-    use crate::types::{default_config, Provider, ProviderKind, ProviderProtocol, TokenUsage};
+    use crate::types::{seeded_config, Provider, ProviderKind, ProviderProtocol, TokenUsage};
     use std::path::PathBuf;
 
     #[test]
@@ -3076,8 +3171,9 @@ mod tests {
         assert!(beta.contains("mid-conversation-system-2026-04-07"));
         assert!(beta.contains("effort-2025-11-24"));
         assert!(!beta.contains("fallback-credit-2026-06-01"));
-        assert_eq!(body["thinking"]["type"], "adaptive");
-        assert_eq!(body["output_config"]["effort"], "max");
+        // 探测显式关闭思考与 effort，让小输出预算直接产出正文（否则回复为空）。
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("context_management").is_none());
     }
@@ -3117,7 +3213,7 @@ mod tests {
 
     #[test]
     fn server_restart_is_required_only_for_bind_address_changes() {
-        let mut previous = default_config().settings;
+        let mut previous = seeded_config().settings;
         let mut next = previous.clone();
 
         next.allow_lan = !previous.allow_lan;
@@ -3618,6 +3714,7 @@ pub fn run() {
             save_codex_config,
             import_sessions,
             clear_request_logs,
+            read_image_preview,
             get_request_logs
         ])
         .run(tauri::generate_context!())

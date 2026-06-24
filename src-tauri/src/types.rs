@@ -18,6 +18,7 @@ pub enum ProviderProtocol {
     OpenAiResponses,
     OpenAiChatCompletions,
     AnthropicMessages,
+    OpenAiImages,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +78,12 @@ pub struct ModelEntry {
     pub supported_reasoning_levels: Vec<String>,
     #[serde(default)]
     pub codex_alias: Option<String>,
+    /// 是否图片生成模型(由 OpenAI Images 协议自动识别)。Codex 配置的「image_gen 模型」下拉据此过滤。
+    #[serde(default)]
+    pub image_generation: bool,
+    /// 图片质量(low/medium/high)。仅图片模型用，转发 /v1/images 时若请求没传则注入。
+    #[serde(default)]
+    pub image_quality: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,6 +131,10 @@ pub struct Settings {
     pub codex_internal_model_lock: bool,
     #[serde(default)]
     pub codex_slots: Vec<CodexSlotAssignment>,
+    /// 当 Codex 触发画图(image_gen 技能)时，强制把请求路由到这个图片模型，
+    /// 覆盖默认路由。None = 默认，不改变路由。三种应用模式(官方/第三方/局域网)都生效。
+    #[serde(default)]
+    pub image_gen_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +266,9 @@ pub struct RequestRecord {
     /// 按上游模型市场定价估算的等效消费金额（基于清理后 usage）。
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// 画图请求生成的原图文件名（image_cache 内），日志可点击预览。
+    #[serde(default)]
+    pub image_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,7 +379,7 @@ pub struct AppSnapshot {
 
 pub fn default_config() -> AppConfig {
     AppConfig {
-        version: 14,
+        version: 15,
         providers: vec![
             Provider {
                 id: "openai-official".into(),
@@ -395,32 +409,9 @@ pub fn default_config() -> AppConfig {
                 http_proxy: ProviderHttpProxy::default(),
             },
         ],
-        models: vec![
-            model(
-                "gpt-5.5",
-                "GPT-5.5",
-                "OpenAI",
-                1_000_000,
-                "openai-official",
-                ProviderProtocol::OpenAiResponses,
-            ),
-            model(
-                "claude-opus-4-8",
-                "Claude Opus 4.8",
-                "Claude CLI",
-                200_000,
-                "anthropic-cli",
-                ProviderProtocol::AnthropicMessages,
-            ),
-            model(
-                "claude-sonnet-4-5",
-                "Claude Sonnet 4.5",
-                "Claude Desktop",
-                200_000,
-                "anthropic-desktop",
-                ProviderProtocol::AnthropicMessages,
-            ),
-        ],
+        // 不预设任何模型——预设模型挂在未登录的内置客户端 provider 上会造成
+        // 「计数有数但页面空、删不掉、不可用还参与路由」的矛盾。用户自己按需添加。
+        models: vec![],
         settings: Settings {
             bind_host: "127.0.0.1".into(),
             port: 8787,
@@ -430,12 +421,13 @@ pub fn default_config() -> AppConfig {
             lan_remote_port: default_lan_remote_port(),
             lan_remote_api_key: String::new(),
             request_log_limit: 300,
-            fallback_model: Some("gpt-5.5".into()),
+            fallback_model: None,
             auto_inject: false,
             codex_default_model: None,
             codex_injection_mode: CodexInjectionMode::OfficialAccount,
             codex_internal_model_lock: true,
             codex_slots: Vec::new(),
+            image_gen_model: None,
         },
     }
 }
@@ -452,6 +444,41 @@ pub fn default_lan_api_key() -> String {
     format!("nr_{}", uuid::Uuid::new_v4().simple())
 }
 
+/// 仅供测试：在空预设之上注入旧的 3 个示例模型，让依赖模型的测试不受空预设影响。
+#[cfg(test)]
+pub(crate) fn seeded_config() -> AppConfig {
+    let mut config = default_config();
+    config.models = vec![
+        model(
+            "gpt-5.5",
+            "GPT-5.5",
+            "OpenAI",
+            1_000_000,
+            "openai-official",
+            ProviderProtocol::OpenAiResponses,
+        ),
+        model(
+            "claude-opus-4-8",
+            "Claude Opus 4.8",
+            "Claude CLI",
+            200_000,
+            "anthropic-cli",
+            ProviderProtocol::AnthropicMessages,
+        ),
+        model(
+            "claude-sonnet-4-5",
+            "Claude Sonnet 4.5",
+            "Claude Desktop",
+            200_000,
+            "anthropic-desktop",
+            ProviderProtocol::AnthropicMessages,
+        ),
+    ];
+    config.settings.fallback_model = Some("gpt-5.5".into());
+    config
+}
+
+#[cfg(test)]
 fn model(
     id: &str,
     display_name: &str,
@@ -476,6 +503,8 @@ fn model(
         default_reasoning_level,
         supported_reasoning_levels,
         codex_alias: None,
+        image_generation: false,
+        image_quality: None,
     }
 }
 
@@ -496,6 +525,8 @@ pub fn reasoning_defaults_for_protocol(protocol: &ProviderProtocol) -> (bool, St
             "xhigh".into(),
             reasoning_levels(&["low", "medium", "high", "xhigh"]),
         ),
+        // 画图模型无推理档位。
+        ProviderProtocol::OpenAiImages => (false, String::new(), Vec::new()),
     }
 }
 
@@ -503,10 +534,12 @@ fn reasoning_levels(levels: &[&str]) -> Vec<String> {
     levels.iter().map(|level| (*level).to_string()).collect()
 }
 
+#[cfg(test)]
 fn default_timeout_ms() -> u64 {
     0
 }
 
+#[cfg(test)]
 fn default_retry_count() -> u8 {
     0
 }

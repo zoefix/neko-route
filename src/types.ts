@@ -9,7 +9,8 @@ export type ProviderKind =
 export type ProviderProtocol =
   | "open_ai_responses"
   | "open_ai_chat_completions"
-  | "anthropic_messages";
+  | "anthropic_messages"
+  | "open_ai_images";
 
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max";
 export type CodexInjectionMode = "official_account" | "third_party_api" | "lan_share";
@@ -53,6 +54,8 @@ export type ModelEntry = {
   default_reasoning_level: ReasoningEffort;
   supported_reasoning_levels: ReasoningEffort[];
   codex_alias: string | null;
+  image_generation: boolean;
+  image_quality: string | null;
 };
 
 export type CodexSlotAssignment = {
@@ -77,6 +80,7 @@ export type SettingsState = {
   codex_injection_mode: CodexInjectionMode;
   codex_internal_model_lock: boolean;
   codex_slots: CodexSlotAssignment[];
+  image_gen_model: string | null;
 };
 
 export type AppConfig = {
@@ -147,6 +151,7 @@ export type RequestRecord = {
   usage: TokenUsage;
   context_usage: TokenUsage;
   cost_usd: number | null;
+  image_preview: string | null;
 };
 
 export type CodexConfigContent = {
@@ -213,9 +218,10 @@ export type TestModelResult = {
   error: string | null;
   usage: TokenUsage;
   provider_name: string;
+  image_preview: string | null;
 };
 
-export type ModelTestMode = "connectivity" | "context_400k" | "context_1m";
+export type ModelTestMode = "connectivity" | "image" | "context_400k" | "context_1m";
 
 export type StartModelTestResult = {
   test_id: string;

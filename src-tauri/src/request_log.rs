@@ -53,7 +53,8 @@ impl RequestLog {
                 ctx_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                 ctx_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
                 ctx_total_tokens INTEGER NOT NULL DEFAULT 0,
-                cost_usd REAL
+                cost_usd REAL,
+                image_preview TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_requests_started_at ON requests(started_at DESC);
             CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
@@ -108,6 +109,7 @@ impl RequestLog {
             );
         }
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN cost_usd REAL", []);
+        let _ = conn.execute("ALTER TABLE requests ADD COLUMN image_preview TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE claude_context_pressure ADD COLUMN requires_precompression INTEGER NOT NULL DEFAULT 0",
             [],
@@ -163,8 +165,8 @@ impl RequestLog {
                status, latency_ms, streaming, error, reasoning_effort,
                stream_state, stream_error, last_event,
                stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
-               ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
+               ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd, image_preview)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)",
             params![
                 record.id,
                 record.started_at.to_rfc3339(),
@@ -195,6 +197,7 @@ impl RequestLog {
                 record.context_usage.cache_write_tokens as i64,
                 record.context_usage.total_tokens as i64,
                 cost_usd,
+                record.image_preview,
             ],
         );
     }
@@ -284,7 +287,7 @@ impl RequestLog {
                     requested_model, route_reason, status, latency_ms, streaming, error, reasoning_effort,
                     stream_state, stream_error, last_event,
                     stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
-                    ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd
+                    ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd, image_preview
              FROM requests ORDER BY started_at DESC LIMIT ?1",
         ) {
             Ok(stmt) => stmt,
@@ -326,7 +329,7 @@ impl RequestLog {
                     requested_model, route_reason, status, latency_ms, streaming, error, reasoning_effort,
                     stream_state, stream_error, last_event,
                     stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
-                    ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd
+                    ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd, image_preview
              FROM requests ORDER BY started_at DESC LIMIT ?1 OFFSET ?2",
         ) {
             Ok(stmt) => stmt,
@@ -747,6 +750,7 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
             total_tokens: row.get::<_, i64>(27)? as u64,
         },
         cost_usd: row.get::<_, Option<f64>>(28)?,
+        image_preview: row.get::<_, Option<String>>(29)?,
     })
 }
 
@@ -770,6 +774,7 @@ fn protocol_to_str(p: &ProviderProtocol) -> &'static str {
         ProviderProtocol::OpenAiResponses => "open_ai_responses",
         ProviderProtocol::OpenAiChatCompletions => "open_ai_chat_completions",
         ProviderProtocol::AnthropicMessages => "anthropic_messages",
+        ProviderProtocol::OpenAiImages => "open_ai_images",
     }
 }
 
@@ -816,6 +821,7 @@ mod tests {
             },
             context_usage: TokenUsage::default(),
             cost_usd: None,
+            image_preview: None,
         }
     }
 

@@ -19,6 +19,7 @@ import {
   IconGauge as Gauge,
   IconGripVertical as GripVertical,
   IconInbox as Inbox,
+  IconPhoto as ImageIcon,
   IconExternalLink as ExternalLink,
   IconListTree as ListTree,
   IconPencil as Pencil,
@@ -140,12 +141,18 @@ function providerVisibleInUi(provider: Provider, snapshot: AppSnapshot) {
   return Boolean(status?.present && status.available !== false);
 }
 
-function visibleUiProviders(config: AppConfig, snapshot: AppSnapshot) {
+export function visibleUiProviders(config: AppConfig, snapshot: AppSnapshot) {
   return config.providers.filter((provider) => providerVisibleInUi(provider, snapshot));
 }
 
 function visibleUiProviderIds(config: AppConfig, snapshot: AppSnapshot) {
   return new Set(visibleUiProviders(config, snapshot).map((provider) => provider.id));
+}
+
+/// 左侧导航/计数用：可见 provider(已登录或第三方)下的模型数；未登录客户端的模型不计入。
+export function visibleUiModelCount(config: AppConfig, snapshot: AppSnapshot) {
+  const ids = visibleUiProviderIds(config, snapshot);
+  return config.models.filter((model) => ids.has(model.provider_id)).length;
 }
 
 function providerShortSourceKey(provider?: Provider): MsgKey {
@@ -262,17 +269,20 @@ function streamStatusDisplay(
   return { label: latency, tone: latencyTone(record.latency_ms), title };
 }
 
-function requestDisplayModel(record: RequestRecordView) {
-  return record.model || record.requested_model || "—";
+function requestDisplayModel(record: RequestRecordView, models: ModelEntry[]) {
+  // 模型 ID 现在是随机的 neko-model-xxx，日志显示用户填的显示名称更直观。
+  const found = models.find((model) => model.id === record.model);
+  return found?.display_name || record.model || record.requested_model || "—";
 }
 
 function requestErrorDetail(
   record: RequestRecordView,
   t: (key: MsgKey, vars?: Record<string, string | number>) => string,
+  models: ModelEntry[],
 ) {
   const lines = [
     `${t("table.status")}: ${record.status}`,
-    `${t("table.model")}: ${requestDisplayModel(record)}`,
+    `${t("table.model")}: ${requestDisplayModel(record, models)}`,
   ];
   if (record.requested_model && record.requested_model !== record.model) {
     lines.push(t("table.requestedModel", { model: record.requested_model }));
@@ -499,16 +509,28 @@ export function About({
    ============================================================ */
 export function RequestTable({
   requests,
+  models,
   emptyTitle = "table.empty",
   emptyHint = "table.emptyHint",
 }: {
   requests: AppSnapshot["requests"];
+  models: ModelEntry[];
   emptyTitle?: MsgKey;
   emptyHint?: MsgKey;
 }) {
   const { t } = useI18n();
   const [errorRecord, setErrorRecord] = React.useState<RequestRecordView | null>(null);
-  const errorDetail = errorRecord ? requestErrorDetail(errorRecord, t) : "";
+  const errorDetail = errorRecord ? requestErrorDetail(errorRecord, t, models) : "";
+  const [imageData, setImageData] = React.useState<string | null>(null);
+  async function openImagePreview(name: string) {
+    setImageData("loading");
+    try {
+      const b64 = await api.readImagePreview(name);
+      setImageData(b64 ? `data:image/png;base64,${b64}` : null);
+    } catch {
+      setImageData(null);
+    }
+  }
   async function copyErrorDetail() {
     if (!errorDetail) return;
     try {
@@ -544,7 +566,7 @@ export function RequestTable({
               <div className="trow cols-req" key={r.id}>
                 <span className="mono">{new Date(r.started_at).toLocaleTimeString()}</span>
                 <span className="model-cell">
-                  <strong>{requestDisplayModel(r)}</strong>
+                  <strong>{requestDisplayModel(r, models)}</strong>
                   {r.requested_model && r.requested_model !== r.model ? (
                     <span className="model-alias mono">{t("table.requestedModel", { model: r.requested_model })}</span>
                   ) : null}
@@ -561,7 +583,16 @@ export function RequestTable({
                   )}
                 </span>
                 <span>
-                  {vol.total_tokens > 0 ? (
+                  {r.image_preview ? (
+                    <button
+                      type="button"
+                      className="img-preview-btn"
+                      onClick={() => void openImagePreview(r.image_preview!)}
+                      title={t("logs.imagePreview")}
+                    >
+                      <ImageIcon size={18} />
+                    </button>
+                  ) : vol.total_tokens > 0 ? (
                     <span className="tok-cell">
                       <strong>{formatTokens(vol.total_tokens)}</strong>
                       <span className="tok-mini">
@@ -616,7 +647,7 @@ export function RequestTable({
         open={Boolean(errorRecord)}
         onClose={() => setErrorRecord(null)}
         title={t("logs.errorDetail")}
-        sub={errorRecord ? `${errorRecord.status} · ${requestDisplayModel(errorRecord)}` : ""}
+        sub={errorRecord ? `${errorRecord.status} · ${requestDisplayModel(errorRecord, models)}` : ""}
         icon={<ListTree size={18} />}
         color="sakura"
         width={680}
@@ -628,6 +659,20 @@ export function RequestTable({
         }
       >
         <pre className="error-detail-box">{errorDetail || "—"}</pre>
+      </Modal>
+      <Modal
+        open={Boolean(imageData)}
+        onClose={() => setImageData(null)}
+        title={t("logs.imagePreview")}
+        icon={<ImageIcon size={18} />}
+        color="lav"
+        width={560}
+      >
+        {imageData === "loading" ? (
+          <div className="img-preview-loading">…</div>
+        ) : imageData ? (
+          <img src={imageData} alt="" className="img-preview-full" />
+        ) : null}
       </Modal>
     </>
   );
@@ -794,7 +839,7 @@ export function Dashboard({ snapshot, config }: PageProps) {
     <div className="stack page-enter">
       <div className="grid grid-4">
         <Stat icon={<Coins size={15} />} label={t("dash.statTokens")} value={formatTokens(stats.all_time.total_tokens)} foot={t("dash.statTokensFoot", { requests: stats.all_time.requests })} grad />
-        <Stat icon={<Cpu size={15} />} label={t("dash.statModels")} value={enabledModels} foot={t("dash.statModelsFoot", { total: config.models.length })} grad />
+        <Stat icon={<Cpu size={15} />} label={t("dash.statModels")} value={enabledModels} foot={t("dash.statModelsFoot", { total: visibleUiModelCount(config, snapshot) })} grad />
         <Stat icon={<Server size={15} />} label={t("dash.statProviders")} value={providerCount} foot={t("dash.statProvidersFoot", { total: providerCount })} grad />
         <Stat icon={<Gauge size={15} />} label={t("dash.statSuccess")} value={`${success}%`} foot={total === 0 ? t("dash.successIdle") : t("dash.statSuccessFoot", { count: total, ms: avgLatency })} grad />
       </div>
@@ -839,7 +884,7 @@ export function Dashboard({ snapshot, config }: PageProps) {
       </Panel>
 
       <Panel title={t("dash.recentTitle")} sub={t("dash.recentSub")} icon={<Activity size={18} />} color="lav">
-        <RequestTable requests={snapshot.requests.slice(0, 6)} />
+        <RequestTable requests={snapshot.requests.slice(0, 6)} models={config.models} />
       </Panel>
     </div>
   );
@@ -887,7 +932,9 @@ function modelRuntimeDefaults(provider: Provider | undefined) {
 
 function EMPTY_MODEL(provider: Provider | undefined): ModelEntry {
   return {
-    id: "",
+    // 模型 ID 不让用户填，底层自动随机。官方账号模式直接拿它作 Codex slug；
+    // 第三方/局域网模式走 gpt 模型池(codex slot)，不受此 id 影响。
+    id: `neko-model-${crypto.randomUUID().slice(0, 8)}`,
     display_name: "",
     description: "",
     context_window: DEFAULT_MODEL_CONTEXT_WINDOW,
@@ -895,6 +942,8 @@ function EMPTY_MODEL(provider: Provider | undefined): ModelEntry {
     provider_id: provider?.id ?? "",
     upstream_model: null,
     codex_alias: null,
+    image_generation: false,
+    image_quality: null,
     ...modelRuntimeDefaults(provider),
   };
 }
@@ -991,6 +1040,7 @@ function ModelModal({
 
   const selectedProvider = config.providers.find((p) => p.id === draft.provider_id);
   const protocolDefaults = providerReasoningDefaults(selectedProvider);
+  const isImageModel = selectedProvider?.protocol === "open_ai_images";
   const draftModelId = modelIdKey(draft.id);
   const duplicateModels = config.models.filter((model, index) => {
     if (isEdit && editIndex === index) return false;
@@ -1008,7 +1058,8 @@ function ModelModal({
   }
 
   const valid =
-    draft.id.trim().length > 0 &&
+    draft.display_name.trim().length > 0 &&
+    (draft.upstream_model ?? "").trim().length > 0 &&
     draft.provider_id.length > 0 &&
     visibleProviders.some((provider) => provider.id === draft.provider_id);
 
@@ -1025,6 +1076,8 @@ function ModelModal({
       context_window: normalizeModelContextWindow(draft.context_window),
       upstream_model: draft.upstream_model?.trim() || null,
       ...runtimeDefaults,
+      image_generation: isImageModel,
+      image_quality: isImageModel ? draft.image_quality ?? "high" : null,
     };
     let addedAsDisabledDuplicate = false;
     if (!isEdit && hasDuplicateModelId) {
@@ -1079,14 +1132,9 @@ function ModelModal({
         </>
       }
     >
-      <div className="grid grid-2">
-        <Field label={t("model.id")}>
-          <Input value={draft.id} autoFocus placeholder="gpt-5.5" onChange={(e) => patch({ id: e.target.value })} />
-        </Field>
-        <Field label={t("model.displayName")}>
-          <Input value={draft.display_name} placeholder="GPT-5.5" onChange={(e) => patch({ display_name: e.target.value })} />
-        </Field>
-      </div>
+      <Field label={t("model.displayName")}>
+        <Input value={draft.display_name} autoFocus placeholder="GPT-5.5" onChange={(e) => patch({ display_name: e.target.value })} />
+      </Field>
       <Field label={t("model.provider")}>
         <Dropdown value={draft.provider_id} options={providerOptions} onChange={setProvider} />
       </Field>
@@ -1099,12 +1147,9 @@ function ModelModal({
           emptyHint={t("model.upstreamEmpty")}
           onChange={(v) => patch({ upstream_model: v || null })}
           onPick={(o) => {
-            // Pick fills upstream + auto-fills the model ID; ID stays editable.
+            // 选上游自动带出显示名称(若未填)；模型 ID 保持自动随机，不跟随上游。
             const next: Partial<ModelEntry> = { upstream_model: o.value };
-            if (!draft.id.trim() || draft.id.trim() === (draft.upstream_model ?? "").trim()) {
-              next.id = o.value;
-              if (!draft.display_name.trim()) next.display_name = o.label;
-            }
+            if (!draft.display_name.trim()) next.display_name = o.label;
             patch(next);
           }}
         />
@@ -1112,17 +1157,33 @@ function ModelModal({
           <div className="inline-warning">{t("model.upstreamError", { error: upstreamError })}</div>
         ) : null}
       </Field>
-      <Field label={t("model.context")}>
-        <Dropdown
-          value={String(normalizeModelContextWindow(draft.context_window))}
-          options={MODEL_CONTEXT_OPTIONS}
-          onChange={(value) => patch({ context_window: Number(value) })}
-        />
-      </Field>
-      {showContextPressureHint ? <div className="inline-info">{t("model.contextPressureHint")}</div> : null}
-      <Field label={t("model.description")}>
-        <Input value={draft.description} onChange={(e) => patch({ description: e.target.value })} />
-      </Field>
+      {isImageModel ? (
+        <Field label={t("model.imageQuality")}>
+          <Dropdown
+            value={draft.image_quality ?? "high"}
+            options={[
+              { value: "high", label: "High" },
+              { value: "medium", label: "Medium" },
+              { value: "low", label: "Low" },
+            ]}
+            onChange={(value) => patch({ image_quality: value })}
+          />
+        </Field>
+      ) : (
+        <>
+          <Field label={t("model.context")}>
+            <Dropdown
+              value={String(normalizeModelContextWindow(draft.context_window))}
+              options={MODEL_CONTEXT_OPTIONS}
+              onChange={(value) => patch({ context_window: Number(value) })}
+            />
+          </Field>
+          {showContextPressureHint ? <div className="inline-info">{t("model.contextPressureHint")}</div> : null}
+          <Field label={t("model.description")}>
+            <Input value={draft.description} onChange={(e) => patch({ description: e.target.value })} />
+          </Field>
+        </>
+      )}
       <div className="modal-toggle-row">
         <div className="mtr-title">{t("common.enabled")}</div>
         <Switch checked={draft.enabled} onChange={(v) => patch({ enabled: v })} />
@@ -1136,6 +1197,7 @@ function ModelModal({
    ============================================================ */
 const MODEL_TEST_OPTIONS: { value: ModelTestMode; key: MsgKey }[] = [
   { value: "connectivity", key: "test.modeConnectivity" },
+  { value: "image", key: "test.modeImage" },
   { value: "context_400k", key: "test.mode400k" },
   { value: "context_1m", key: "test.mode1m" },
 ];
@@ -1202,11 +1264,11 @@ function TestModal({
         {running ? (
           <div className="test-loading compact">
             <span className="test-spinner" />
-            <p>{status?.stage === "connectivity" ? t("test.stageConnectivity") : t("test.stageProbe")}</p>
+            <p>{status?.mode === "image" ? t("test.stageImage") : status?.stage === "connectivity" ? t("test.stageConnectivity") : t("test.stageProbe")}</p>
           </div>
         ) : null}
 
-        {status && status.mode !== "connectivity" ? (
+        {status && status.mode !== "connectivity" && status.mode !== "image" ? (
           <div className="test-progress-box">
             <div className="test-progress-grid">
               <TestMetric label={t("test.currentContext")} value={formatContext(status.current_tokens)} muted={status.current_estimated ? t("test.estimated") : ""} />
@@ -1239,6 +1301,13 @@ function TestModal({
             <div className="test-reply">
               <div className="test-reply-label">{t("test.reply")} · {t("test.via", { provider: r.provider_name })}</div>
               <p>{r.reply || t("test.noReply")}</p>
+              {r.image_preview ? (
+                <img
+                  src={`data:image/png;base64,${r.image_preview}`}
+                  alt=""
+                  className="img-preview-full"
+                />
+              ) : null}
             </div>
           </>
         ) : r ? (
@@ -1284,6 +1353,9 @@ function testSummary(t: (key: MsgKey, vars?: Record<string, string | number>) =>
   if (status.state === "cancelled") return t("test.cancelled");
   if (status.mode === "connectivity") {
     return status.result?.ok ? t("test.connectivityOk") : t("test.failed");
+  }
+  if (status.mode === "image") {
+    return status.result?.ok ? t("test.imageOk") : t("test.failed");
   }
   if (status.inconclusive) {
     return t("test.inconclusive", { error: status.last_error || status.summary || "" });
@@ -1899,6 +1971,7 @@ function ProviderModal({
     { value: "open_ai_responses", label: t("proto.responses") },
     { value: "open_ai_chat_completions", label: t("proto.chat") },
     { value: "anthropic_messages", label: t("proto.anthropic") },
+    { value: "open_ai_images", label: t("proto.images") },
   ];
   const providerTypeOptions = [
     { value: "custom", label: t("providerType.custom") },
@@ -2980,7 +3053,7 @@ export function Logs({ snapshot, refresh, notify, notifyRaw }: PageProps) {
         </div>
       </div>
       <Panel title={t("nav.logs")} sub={t("logs.count", { n: total })} icon={<ListTree size={18} />} color="lav">
-        <RequestTable requests={records} emptyTitle="logs.empty" emptyHint="logs.emptyHint" />
+        <RequestTable requests={records} models={snapshot.config.models} emptyTitle="logs.empty" emptyHint="logs.emptyHint" />
       </Panel>
       <ConfirmDialog
         open={confirmClear}
@@ -3132,6 +3205,11 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
       d.settings.fallback_model = id;
     });
   }
+  async function setImageGenModel(id: string) {
+    await commit((d) => {
+      d.settings.image_gen_model = id || null;
+    });
+  }
   async function setAutoInject(v: boolean) {
     await commit((d) => {
       d.settings.auto_inject = v;
@@ -3244,6 +3322,18 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
   const fallbackOptions = lanMode
     ? lanModels.map(lanModelOption)
     : selectable.map((m) => ({ value: m.id, label: m.display_name || m.id, sub: m.id }));
+  // 画图模型不依赖当前应用模式(只用于改 image_generation 工具的 model)，所以列全部已配的图片模型 + 「默认」。
+  const imageGenOptions = [
+    { value: "", label: t("setup.imageGenDefault"), sub: "" },
+    ...config.models
+      .filter((m) => m.image_generation)
+      .map((m) => ({ value: m.id, label: m.display_name || m.id, sub: m.id })),
+  ];
+  const imageGenModel =
+    config.settings.image_gen_model &&
+    config.models.some((m) => m.id === config.settings.image_gen_model && m.image_generation)
+      ? config.settings.image_gen_model
+      : "";
   const defaultModel = lanMode
     ? validCodexOption(config.settings.codex_default_model, modelOptions)
     : validCodexSettingModel(config.settings.codex_default_model, selectable);
@@ -3263,7 +3353,7 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
 
   return (
     <div className="stack page-enter">
-      <Panel title={t("nav.setup")} sub={t("setup.sub")} icon={<FileJson size={18} />} color="lav">
+      <Panel title={t("nav.setup")} sub={t("setup.sub")} icon={<FileJson size={18} />} color="lav" className="setup-panel">
         <Field label={t("setup.mode")}>
           <div className="segmented setup-mode">
             {(["official_account", "third_party_api", "lan_share"] as CodexInjectionMode[]).map((item) => (
@@ -3315,6 +3405,9 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
             <Dropdown value={fallback} options={fallbackOptions} onChange={setFallback} />
           </Field>
         </div>
+        <Field label={t("setup.imageGenModel")} hint={t("setup.imageGenModelHint")}>
+          <Dropdown value={imageGenModel} options={imageGenOptions} onChange={setImageGenModel} />
+        </Field>
 
         <div className="modal-toggle-row" style={{ marginBottom: 16 }}>
           <div>

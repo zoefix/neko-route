@@ -342,13 +342,13 @@ mod tests {
         CODEX_SLOT_POOL,
     };
     use crate::types::{
-        default_config, CodexInjectionMode, CodexSlotAssignment, Provider, ProviderKind,
+        seeded_config, CodexInjectionMode, CodexSlotAssignment, Provider, ProviderKind,
         ProviderProtocol,
     };
 
     #[test]
     fn assigns_default_and_fallback_first() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
         config.settings.codex_default_model = Some("claude-opus-4-8".into());
         config.settings.fallback_model = Some("claude-sonnet-4-5".into());
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn local_targets_ignore_official_openai_provider() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(Provider {
             id: "custom-chat".into(),
             name: "Custom Chat".into(),

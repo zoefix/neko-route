@@ -19,7 +19,7 @@ use std::{
 };
 use tokio::sync::RwLock;
 
-const CURRENT_CONFIG_VERSION: u32 = 14;
+const CURRENT_CONFIG_VERSION: u32 = 15;
 const DASHBOARD_RECENT_REQUESTS: usize = 6;
 
 struct CodexApplicationPlan {
@@ -41,28 +41,38 @@ struct AppStoreInner {
     server_status: RwLock<ServerStatus>,
     codex_apply_error: RwLock<Option<String>>,
     key_store: KeyStore,
+    image_dir: PathBuf,
 }
 
 impl AppStore {
     pub fn load(app_data_dir: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(&app_data_dir).map_err(|error| error.to_string())?;
         let config_path = app_data_dir.join("config.json");
-        let config = if config_path.exists() {
+        let (mut config, prior_version) = if config_path.exists() {
             let raw = fs::read_to_string(&config_path).map_err(|error| error.to_string())?;
             match serde_json::from_str::<AppConfig>(&raw) {
-                Ok(parsed) => normalize_config(parsed),
-                Err(_) => normalize_config(reset_config_preserving_settings(&raw)),
+                Ok(parsed) => {
+                    let prior = parsed.version;
+                    (normalize_config(parsed), prior)
+                }
+                Err(_) => (normalize_config(reset_config_preserving_settings(&raw)), 0),
             }
         } else {
-            let config = normalize_config(default_config());
-            fs::write(&config_path, to_string_pretty(&config).unwrap())
-                .map_err(|error| error.to_string())?;
-            config
+            (normalize_config(default_config()), CURRENT_CONFIG_VERSION)
         };
+
+        let key_store = KeyStore::new(&app_data_dir);
+        // 一次性迁移：清掉挂在「未登录内置客户端 provider」上的历史预设模型——
+        // 这些模型在 UI 里被隐藏、删不掉、又不可用，是一堆 BUG 的根源。
+        if prior_version < 15 {
+            drop_unavailable_preset_models(&mut config, &key_store);
+        }
         fs::write(&config_path, to_string_pretty(&config).unwrap())
             .map_err(|error| error.to_string())?;
 
         let log = RequestLog::open(&app_data_dir.join("requests.db"))?;
+        let image_dir = app_data_dir.join("image_cache");
+        fs::create_dir_all(&image_dir).map_err(|error| error.to_string())?;
 
         let bind_url = format!(
             "http://{}:{}/v1",
@@ -79,7 +89,8 @@ impl AppStore {
                     error: None,
                 }),
                 codex_apply_error: RwLock::new(None),
-                key_store: KeyStore::new(&app_data_dir),
+                key_store,
+                image_dir,
             }),
         })
     }
@@ -190,6 +201,21 @@ impl AppStore {
         let _ = tokio::task::spawn_blocking(move || log.insert(&record)).await;
     }
 
+    /// 把画图响应的原图存进 image_cache，返回文件名(供日志 image_preview 记录)。
+    pub fn save_image_preview(&self, request_id: &str, bytes: &[u8]) -> Option<String> {
+        let name = format!("{request_id}.png");
+        fs::write(self.inner.image_dir.join(&name), bytes).ok()?;
+        Some(name)
+    }
+
+    /// 按文件名读 image_cache 里的原图(拒绝路径穿越)。
+    pub fn image_preview_bytes(&self, name: &str) -> Option<Vec<u8>> {
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+            return None;
+        }
+        fs::read(self.inner.image_dir.join(name)).ok()
+    }
+
     pub async fn update_request_stream_progress(
         &self,
         id: String,
@@ -288,6 +314,12 @@ impl AppStore {
     pub async fn clear_requests(&self) {
         let log = self.inner.log.clone();
         let _ = tokio::task::spawn_blocking(move || log.clear()).await;
+        // 清空日志同时清空缓存的画图原图。
+        if let Ok(entries) = fs::read_dir(&self.inner.image_dir) {
+            for entry in entries.flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
 
     pub async fn request_log_page(&self, page: usize, page_size: usize) -> RequestLogPage {
@@ -802,6 +834,37 @@ pub fn validate_bind_settings(config: &AppConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// 清理挂在「未登录内置客户端 provider」上的模型(历史预设遗留)。
+/// 这些 provider(OpenAI/Claude CLI/Claude Desktop)未登录时在 UI 被隐藏、模型删不掉、
+/// 又不可用——直接移除。已登录在用的保留；兜底若指向被删模型则置空。
+fn drop_unavailable_preset_models(config: &mut AppConfig, key_store: &KeyStore) {
+    let unavailable: HashSet<String> = config
+        .providers
+        .iter()
+        .filter(|provider| {
+            matches!(
+                provider.kind,
+                ProviderKind::OfficialOpenAi
+                    | ProviderKind::OfficialAnthropicCli
+                    | ProviderKind::OfficialAnthropicDesktop
+            )
+        })
+        .filter(|provider| !key_store.status_for_provider(provider).present)
+        .map(|provider| provider.id.clone())
+        .collect();
+    if unavailable.is_empty() {
+        return;
+    }
+    config
+        .models
+        .retain(|model| !unavailable.contains(&model.provider_id));
+    if let Some(fallback) = config.settings.fallback_model.clone() {
+        if !config.models.iter().any(|model| model.id == fallback) {
+            config.settings.fallback_model = None;
+        }
+    }
+}
+
 pub fn normalize_config(mut config: AppConfig) -> AppConfig {
     config.version = CURRENT_CONFIG_VERSION;
     if config.settings.lan_api_key.trim().is_empty() {
@@ -1101,7 +1164,7 @@ mod tests {
         validate_enabled_model_ids, validate_provider_urls, AppStore, CURRENT_CONFIG_VERSION,
     };
     use crate::types::{
-        default_config, CodexInjectionMode, Provider, ProviderHttpProxy, ProviderKind,
+        seeded_config, CodexInjectionMode, Provider, ProviderHttpProxy, ProviderKind,
         ProviderProtocol,
     };
     use serde_json::json;
@@ -1113,7 +1176,7 @@ mod tests {
 
     #[test]
     fn rejects_public_bind_without_allow_lan() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.bind_host = "0.0.0.0".into();
         config.settings.allow_lan = false;
         assert!(validate_bind_settings(&config).is_err());
@@ -1121,7 +1184,7 @@ mod tests {
 
     #[test]
     fn accepts_public_bind_with_allow_lan() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.bind_host = "0.0.0.0".into();
         config.settings.allow_lan = true;
         assert!(validate_bind_settings(&config).is_ok());
@@ -1129,7 +1192,7 @@ mod tests {
 
     #[test]
     fn normalize_config_generates_lan_api_key() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.lan_api_key = "   ".into();
 
         let normalized = normalize_config(config);
@@ -1139,7 +1202,7 @@ mod tests {
 
     #[test]
     fn lan_share_mode_does_not_select_local_models() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.codex_injection_mode = CodexInjectionMode::LanShare;
         config.settings.codex_default_model = None;
         config.settings.fallback_model = None;
@@ -1179,7 +1242,7 @@ mod tests {
 
     #[test]
     fn locks_official_openai_base_url() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         let official = config
             .providers
             .iter_mut()
@@ -1201,7 +1264,7 @@ mod tests {
 
     #[test]
     fn locks_official_anthropic_cli_to_local_credentials() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         let official = config
             .providers
             .iter_mut()
@@ -1223,7 +1286,7 @@ mod tests {
 
     #[test]
     fn locks_official_anthropic_desktop_to_local_credentials() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         let official = config
             .providers
             .iter_mut()
@@ -1245,7 +1308,7 @@ mod tests {
 
     #[test]
     fn validates_custom_provider_base_urls() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(custom_provider(
             "third-party",
             ProviderProtocol::OpenAiChatCompletions,
@@ -1259,7 +1322,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_enabled_model_ids() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         let mut duplicate = config.models[0].clone();
         duplicate.id = " gpt-5.5 ".into();
         duplicate.display_name = "Second GPT-5.5".into();
@@ -1274,7 +1337,7 @@ mod tests {
 
     #[test]
     fn allows_duplicate_model_ids_when_only_one_is_enabled() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         let mut duplicate = config.models[0].clone();
         duplicate.display_name = "Second GPT-5.5".into();
         duplicate.enabled = false;
@@ -1286,7 +1349,7 @@ mod tests {
 
     #[test]
     fn default_config_contains_only_official_providers() {
-        let config = default_config();
+        let config = seeded_config();
         assert_eq!(config.providers.len(), 3);
         assert!(config
             .providers
@@ -1300,7 +1363,7 @@ mod tests {
 
     #[test]
     fn restores_deleted_official_providers_and_repoints_models() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config
             .providers
             .retain(|provider| provider.id != "openai-official");
@@ -1318,7 +1381,7 @@ mod tests {
 
     #[test]
     fn keeps_custom_provider_protocol_and_normalizes_key_ref() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(custom_provider(
             "My Provider!",
             ProviderProtocol::AnthropicMessages,
@@ -1340,10 +1403,10 @@ mod tests {
 
     #[test]
     fn missing_proxy_config_defaults_to_disabled_and_version_13() {
-        let config = normalize_config(default_config());
+        let config = normalize_config(seeded_config());
 
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
-        assert_eq!(CURRENT_CONFIG_VERSION, 14);
+        assert_eq!(CURRENT_CONFIG_VERSION, 15);
         assert!(config.providers.iter().all(|provider| {
             !provider.http_proxy.enabled
                 && provider.http_proxy.url.is_empty()
@@ -1353,7 +1416,7 @@ mod tests {
 
     #[test]
     fn preserves_builtin_official_proxy_settings() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         let openai = config
             .providers
             .iter_mut()
@@ -1384,7 +1447,7 @@ mod tests {
 
     #[test]
     fn validates_http_proxy_address() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers[0].http_proxy = ProviderHttpProxy {
             enabled: true,
             url: "127.0.0.1:7890".into(),
@@ -1394,7 +1457,7 @@ mod tests {
         let config = normalize_config(config);
         assert!(validate_provider_urls(&config).is_ok());
 
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers[0].http_proxy = ProviderHttpProxy {
             enabled: true,
             url: "socks5://127.0.0.1:7890".into(),
@@ -1451,7 +1514,7 @@ mod tests {
 
     #[test]
     fn keeps_user_added_official_account_providers() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(Provider {
             id: "openai-account-main".into(),
             name: "Personal OpenAI".into(),
@@ -1501,7 +1564,7 @@ mod tests {
 
     #[test]
     fn same_base_url_custom_providers_keep_distinct_key_refs() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(custom_provider(
             "same-url-a",
             ProviderProtocol::OpenAiResponses,
@@ -1557,7 +1620,7 @@ mod tests {
 
     #[test]
     fn normalizes_reasoning_defaults_by_provider_protocol() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(custom_provider(
             "deepseek",
             ProviderProtocol::OpenAiChatCompletions,
@@ -1615,7 +1678,7 @@ mod tests {
 
     #[test]
     fn normalizes_runtime_defaults_and_required_fallback() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.fallback_model = None;
         config.models[0].timeout_ms = 30_000;
         config.models[0].retry_count = 3;
@@ -1650,7 +1713,7 @@ mod tests {
 
     #[test]
     fn disabled_codex_default_and_fallback_switch_to_available_model() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.codex_default_model = Some("gpt-5.5".into());
         config.settings.fallback_model = Some("gpt-5.5".into());
         config.models[0].enabled = false;
@@ -1669,7 +1732,7 @@ mod tests {
 
     #[test]
     fn codex_default_and_fallback_empty_until_model_is_enabled_again() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         for model in &mut config.models {
             model.enabled = false;
         }
@@ -1701,7 +1764,7 @@ mod tests {
 
     #[test]
     fn third_party_mode_codex_settings_skip_openai_official() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
         config.settings.codex_default_model = Some("gpt-5.5".into());
         config.settings.fallback_model = Some("gpt-5.5".into());
@@ -1872,7 +1935,7 @@ mod tests {
     }
 
     fn config_with_gpt_54_pro() -> crate::types::AppConfig {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(custom_provider(
             "custom-chat",
             ProviderProtocol::OpenAiChatCompletions,

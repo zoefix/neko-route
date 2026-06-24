@@ -341,4 +341,9 @@ export const api = {
     }
     return invoke("clear_request_logs");
   },
+
+  readImagePreview: (name: string): Promise<string> => {
+    if (!isTauri) return Promise.resolve("");
+    return invoke<string>("read_image_preview", { name });
+  },
 };

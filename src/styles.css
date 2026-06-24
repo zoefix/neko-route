@@ -850,6 +850,9 @@ button:disabled {
   letter-spacing: 0.2px;
 }
 
+/* Codex 配置面板：各 section 统一上下间距，避免黏在一起 */
+.setup-panel > .panel-head ~ * { margin-top: 18px; }
+
 .input,
 .select,
 textarea.input {
@@ -1101,7 +1104,7 @@ textarea.input:focus {
 
 /* request log columns */
 .cols-req {
-  grid-template-columns: 96px minmax(120px, 1fr) minmax(170px, 1.1fr) 92px 132px 96px 70px 112px;
+  grid-template-columns: 88px minmax(110px, 1.2fr) minmax(150px, 1.1fr) 80px minmax(116px, 1fr) max-content max-content max-content;
 }
 
 .req-stream-cell {
@@ -1109,6 +1112,22 @@ textarea.input:focus {
   justify-content: flex-end;
   text-align: right;
 }
+
+.img-preview-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.img-preview-btn:hover { background: rgba(124, 92, 255, 0.12); }
+.img-preview-full { display: block; max-width: 100%; border-radius: var(--radius-sm); margin: 0 auto; }
+.img-preview-loading { text-align: center; padding: 48px; color: var(--muted); font-size: 26px; }
 
 .status-chip {
   display: inline-flex;
@@ -2812,7 +2831,7 @@ body.model-drag-active * {
 
 /* request table columns (+ tokens) */
 .cols-req {
-  grid-template-columns: 92px minmax(110px, 1fr) minmax(160px, 1.1fr) 92px 132px 96px 70px 112px;
+  grid-template-columns: 88px minmax(110px, 1.2fr) minmax(150px, 1.1fr) 80px minmax(116px, 1fr) max-content max-content max-content;
 }
 
 /* small button variant */

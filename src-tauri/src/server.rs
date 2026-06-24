@@ -42,7 +42,11 @@ const RESPONSES_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const ANTHROPIC_ONE_MILLION_CONTEXT_WINDOW: u64 = 1_000_000;
 const ANTHROPIC_ONE_MILLION_SUFFIX: &str = "[1m]";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-pub(crate) const CLAUDE_DESKTOP_MESSAGES_BETA: &str = "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07,effort-2025-11-24";
+pub(crate) const CLAUDE_DESKTOP_MESSAGES_BETA: &str = "claude-code-20250219,interleaved-thinking-2025-05-14,mid-conversation-system-2026-04-07,effort-2025-11-24";
+/// 1M 长上下文 beta：仅在模型显式启用（[1m] 后缀或 context_window ≥ 1M）时追加。
+/// 官方订阅账户没有按量付费 credits，无条件加会被 Anthropic 拒
+/// （"Usage credits are required for long context requests."）。
+pub(crate) const CLAUDE_DESKTOP_ONE_MILLION_BETA: &str = "context-1m-2025-08-07";
 const CLAUDE_DESKTOP_USER_AGENT: &str =
     "claude-cli/2.1.170 (external, claude-desktop-3p, agent-sdk/0.3.170)";
 const CLAUDE_CODE_STAINLESS_PACKAGE_VERSION: &str = "0.94.0";
@@ -162,6 +166,14 @@ where
             "/v1/responses",
             post(responses).layer(DefaultBodyLimit::max(RESPONSES_BODY_LIMIT_BYTES)),
         )
+        .route(
+            "/v1/images/generations",
+            post(images_generations).layer(DefaultBodyLimit::max(RESPONSES_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/v1/images/edits",
+            post(images_edits).layer(DefaultBodyLimit::max(RESPONSES_BODY_LIMIT_BYTES)),
+        )
         .with_state(state);
 
     axum::serve(
@@ -186,6 +198,33 @@ async fn health(State(state): State<ServerState>) -> Json<Value> {
         "models": config.models.iter().filter(|model| model.enabled).count(),
         "keys": keys,
     }))
+}
+
+/// 若配了「image_gen 模型」(非默认)，把请求里 `image_generation` 工具的 `model` 字段
+/// 改成所选图片模型的上游名。默认(None)不改，让官方账号用自带画图模型。
+/// 三种应用模式(官方/第三方/局域网)统一适用——只改工具字段，不动路由。
+fn apply_image_gen_override(body: &mut Value, config: &crate::types::AppConfig) {
+    let Some(image_gen_id) = config.settings.image_gen_model.as_deref() else {
+        return;
+    };
+    let Some(image_model) = config.models.iter().find(|model| model.id == image_gen_id) else {
+        return;
+    };
+    let upstream = image_model
+        .upstream_model
+        .as_deref()
+        .unwrap_or(image_model.id.as_str())
+        .to_string();
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools {
+        if tool.get("type").and_then(Value::as_str) == Some("image_generation") {
+            if let Some(object) = tool.as_object_mut() {
+                object.insert("model".to_string(), Value::String(upstream.clone()));
+            }
+        }
+    }
 }
 
 async fn ensure_lan_request_authorized(
@@ -348,6 +387,7 @@ async fn responses(
                     usage: TokenUsage::default(),
                     context_usage: TokenUsage::default(),
                     cost_usd: None,
+                    image_preview: None,
                 })
                 .await;
             return route_error.into_response();
@@ -436,6 +476,7 @@ async fn responses(
             usage,
             context_usage: usage,
             cost_usd: None,
+            image_preview: None,
         })
         .await;
 
@@ -468,6 +509,7 @@ async fn route_response(
         })?
         .to_string();
     let config = state.store.config().await;
+    apply_image_gen_override(&mut body, &config);
     if config.settings.codex_injection_mode == CodexInjectionMode::LanShare {
         let lan_model = state
             .store
@@ -552,12 +594,443 @@ async fn route_response(
                 body["model"] = Value::String(matched.upstream_model.clone());
                 forward_anthropic(&state, &matched, body, request_id, &model).await
             }
+            ProviderProtocol::OpenAiImages => Err(RouteError::new(
+                StatusCode::BAD_REQUEST,
+                "image_model_not_routable",
+                "Image generation models are only used via /v1/images, not /v1/responses.",
+            )),
         },
     };
     let (response, usage, context_bridge) =
         response_result.map_err(|error| error.with_match(&matched))?;
 
     Ok((response, matched, usage, context_bridge))
+}
+
+async fn images_generations(
+    State(state): State<ServerState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body_bytes: Bytes,
+) -> Response {
+    match forward_images_generations(&state, remote_addr, &headers, body_bytes).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+/// 把 `/v1/images/generations` 请求转发到「image_gen 模型」配置的画图 provider。
+/// 供 neko-image skill（Codex 主动 curl）使用，让画图走第三方画图 API。
+async fn forward_images_generations(
+    state: &ServerState,
+    remote_addr: SocketAddr,
+    inbound_headers: &HeaderMap,
+    body_bytes: Bytes,
+) -> Result<Response, RouteError> {
+    ensure_lan_request_authorized(state, remote_addr, inbound_headers).await?;
+    let config = state.store.config().await;
+    let image_gen_id = config
+        .settings
+        .image_gen_model
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            RouteError::new(
+                StatusCode::BAD_REQUEST,
+                "image_gen_not_configured",
+                "No image_gen model is configured. Pick one in Codex settings.",
+            )
+        })?;
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == image_gen_id)
+        .ok_or_else(|| {
+            RouteError::new(
+                StatusCode::NOT_FOUND,
+                "image_gen_model_missing",
+                "Configured image_gen model not found.",
+            )
+        })?;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == model.provider_id)
+        .ok_or_else(|| {
+            RouteError::new(
+                StatusCode::NOT_FOUND,
+                "image_gen_provider_missing",
+                "Image provider not found.",
+            )
+        })?;
+    let client = client_for_provider(state, provider)?;
+
+    let mut body: Value = serde_json::from_slice(&body_bytes).map_err(|error| {
+        RouteError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("Invalid JSON request body: {error}"),
+        )
+    })?;
+    let upstream = model
+        .upstream_model
+        .as_deref()
+        .unwrap_or(model.id.as_str())
+        .to_string();
+    body["model"] = Value::String(upstream);
+    // 请求没传 quality 且模型配了 image_quality → 注入(low/medium/high)。
+    if body.get("quality").is_none() {
+        if let Some(quality) = model
+            .image_quality
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            body["quality"] = Value::String(quality.to_string());
+        }
+    }
+    // 最终质量(注入的或请求自带的)，日志推理强度列复用显示。
+    let image_quality = body
+        .get("quality")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let out_bytes = serde_json::to_vec(&body)
+        .map(Bytes::from)
+        .map_err(|error| {
+            RouteError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "image_body_failed",
+                error.to_string(),
+            )
+        })?;
+
+    let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
+    if let Some(key_ref) = provider.key_ref.as_deref() {
+        let secret = state
+            .store
+            .key_store()
+            .get_secret(key_ref)
+            .map_err(|message| {
+                RouteError::new(
+                    StatusCode::FAILED_DEPENDENCY,
+                    "key_store_unavailable",
+                    message,
+                )
+            })?
+            .ok_or_else(|| {
+                RouteError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "missing_provider_key",
+                    format!(
+                        "Provider '{}' needs an API key in local storage",
+                        provider.name
+                    ),
+                )
+            })?;
+        headers.push(("authorization".to_string(), format!("Bearer {secret}")));
+    }
+
+    let url = endpoint(&provider.base_url, "images/generations");
+    let request_id = Uuid::new_v4().to_string();
+    let started = std::time::Instant::now();
+    let upstream = post_bytes_with_retries(&client, &url, headers, out_bytes, 0, 0).await?;
+    let status = upstream.status();
+    let content_type = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let resp_bytes = upstream.bytes().await.map_err(|error| {
+        RouteError::new(
+            StatusCode::BAD_GATEWAY,
+            "image_upstream_read_failed",
+            error.to_string(),
+        )
+    })?;
+    let usage = serde_json::from_slice::<Value>(&resp_bytes)
+        .ok()
+        .and_then(|value| value.get("usage").cloned())
+        .map(|value| parse_usage(ProviderProtocol::OpenAiImages, &value))
+        .unwrap_or_default();
+    let error = (!status.is_success()).then(|| {
+        String::from_utf8_lossy(&resp_bytes)
+            .chars()
+            .take(300)
+            .collect()
+    });
+    // 成功响应取首图原图存进 image_cache，日志可点击预览。
+    let image_preview = status
+        .is_success()
+        .then(|| extract_image_b64(&resp_bytes))
+        .flatten()
+        .and_then(|b64| BASE64_STANDARD.decode(b64).ok())
+        .and_then(|bytes| state.store.save_image_preview(&request_id, &bytes));
+    state
+        .store
+        .push_request(RequestRecord {
+            id: request_id,
+            started_at: Utc::now(),
+            model: model.id.clone(),
+            requested_model: None,
+            route_reason: Some("image_gen".into()),
+            provider_id: Some(provider.id.clone()),
+            provider_name: Some(provider.name.clone()),
+            provider_protocol: Some(ProviderProtocol::OpenAiImages),
+            status: status.as_u16(),
+            latency_ms: started.elapsed().as_millis(),
+            streaming: false,
+            error,
+            reasoning_effort: image_quality,
+            stream_state: None,
+            stream_error: None,
+            last_event: None,
+            stream_bytes: resp_bytes.len() as u64,
+            context_bridge: None,
+            usage,
+            context_usage: usage,
+            cost_usd: None,
+            image_preview,
+        })
+        .await;
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(resp_bytes))
+        .map_err(|error| {
+            RouteError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "image_response_failed",
+                error.to_string(),
+            )
+        })
+}
+
+async fn images_edits(
+    State(state): State<ServerState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body_bytes: Bytes,
+) -> Response {
+    match forward_images_edits(&state, remote_addr, &headers, body_bytes).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+/// 把 `/v1/images/edits` 的 multipart 请求透传到画图 provider（编辑/参考图）。
+async fn forward_images_edits(
+    state: &ServerState,
+    remote_addr: SocketAddr,
+    inbound_headers: &HeaderMap,
+    body_bytes: Bytes,
+) -> Result<Response, RouteError> {
+    ensure_lan_request_authorized(state, remote_addr, inbound_headers).await?;
+    let config = state.store.config().await;
+    let image_gen_id = config
+        .settings
+        .image_gen_model
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            RouteError::new(
+                StatusCode::BAD_REQUEST,
+                "image_gen_not_configured",
+                "No image_gen model is configured. Pick one in Codex settings.",
+            )
+        })?;
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == image_gen_id)
+        .ok_or_else(|| {
+            RouteError::new(
+                StatusCode::NOT_FOUND,
+                "image_gen_model_missing",
+                "Configured image_gen model not found.",
+            )
+        })?;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == model.provider_id)
+        .ok_or_else(|| {
+            RouteError::new(
+                StatusCode::NOT_FOUND,
+                "image_gen_provider_missing",
+                "Image provider not found.",
+            )
+        })?;
+    let client = client_for_provider(state, provider)?;
+
+    // multipart 透传：保留入站 content-type(含 boundary)。
+    let content_type = inbound_headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("multipart/form-data")
+        .to_string();
+    // new-api 等要求 multipart 里带 model，Codex/skill 不传 → 注入上游模型，避免编辑端点 400。
+    let upstream_model = model
+        .upstream_model
+        .as_deref()
+        .unwrap_or(model.id.as_str())
+        .to_string();
+    let body_bytes = match content_type.split("boundary=").nth(1) {
+        Some(raw) => {
+            let boundary = raw
+                .split(';')
+                .next()
+                .unwrap_or(raw)
+                .trim()
+                .trim_matches('"');
+            Bytes::from(inject_multipart_field(
+                &body_bytes,
+                boundary,
+                "model",
+                &upstream_model,
+            ))
+        }
+        None => body_bytes,
+    };
+    let mut headers = vec![("content-type".to_string(), content_type)];
+    if let Some(key_ref) = provider.key_ref.as_deref() {
+        let secret = state
+            .store
+            .key_store()
+            .get_secret(key_ref)
+            .map_err(|message| {
+                RouteError::new(
+                    StatusCode::FAILED_DEPENDENCY,
+                    "key_store_unavailable",
+                    message,
+                )
+            })?
+            .ok_or_else(|| {
+                RouteError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "missing_provider_key",
+                    format!(
+                        "Provider '{}' needs an API key in local storage",
+                        provider.name
+                    ),
+                )
+            })?;
+        headers.push(("authorization".to_string(), format!("Bearer {secret}")));
+    }
+
+    let url = endpoint(&provider.base_url, "images/edits");
+    let request_id = Uuid::new_v4().to_string();
+    let started = std::time::Instant::now();
+    let upstream = post_bytes_with_retries(&client, &url, headers, body_bytes, 0, 0).await?;
+    let status = upstream.status();
+    let resp_content_type = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let resp_bytes = upstream.bytes().await.map_err(|error| {
+        RouteError::new(
+            StatusCode::BAD_GATEWAY,
+            "image_upstream_read_failed",
+            error.to_string(),
+        )
+    })?;
+    let usage = serde_json::from_slice::<Value>(&resp_bytes)
+        .ok()
+        .and_then(|value| value.get("usage").cloned())
+        .map(|value| parse_usage(ProviderProtocol::OpenAiImages, &value))
+        .unwrap_or_default();
+    let error = (!status.is_success()).then(|| {
+        String::from_utf8_lossy(&resp_bytes)
+            .chars()
+            .take(300)
+            .collect()
+    });
+    // 编辑成功后取首图原图存进 image_cache，日志可点击预览。
+    let image_preview = status
+        .is_success()
+        .then(|| extract_image_b64(&resp_bytes))
+        .flatten()
+        .and_then(|b64| BASE64_STANDARD.decode(b64).ok())
+        .and_then(|bytes| state.store.save_image_preview(&request_id, &bytes));
+    state
+        .store
+        .push_request(RequestRecord {
+            id: request_id,
+            started_at: Utc::now(),
+            model: model.id.clone(),
+            requested_model: None,
+            route_reason: Some("image_edit".into()),
+            provider_id: Some(provider.id.clone()),
+            provider_name: Some(provider.name.clone()),
+            provider_protocol: Some(ProviderProtocol::OpenAiImages),
+            status: status.as_u16(),
+            latency_ms: started.elapsed().as_millis(),
+            streaming: false,
+            error,
+            reasoning_effort: model.image_quality.clone(),
+            stream_state: None,
+            stream_error: None,
+            last_event: None,
+            stream_bytes: resp_bytes.len() as u64,
+            context_bridge: None,
+            usage,
+            context_usage: usage,
+            cost_usd: None,
+            image_preview,
+        })
+        .await;
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, resp_content_type)
+        .body(Body::from(resp_bytes))
+        .map_err(|error| {
+            RouteError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "image_response_failed",
+                error.to_string(),
+            )
+        })
+}
+
+/// 从画图响应 JSON 取第一张图的 base64(`data[0].b64_json`)。
+fn extract_image_b64(resp_bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(resp_bytes)
+        .ok()?
+        .get("data")?
+        .as_array()?
+        .first()?
+        .get("b64_json")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// 在 multipart body 末尾(closing boundary 前)插入一个文本 field。
+/// 若 body 已含同名 field 则原样返回。供 `/v1/images/edits` 注入 `model` 用，
+/// 不解析/重建整个 multipart，原始 image 二进制保持不动。
+fn inject_multipart_field(body: &[u8], boundary: &str, name: &str, value: &str) -> Vec<u8> {
+    let needle = format!("name=\"{name}\"");
+    if body
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+    {
+        return body.to_vec();
+    }
+    let closing = format!("--{boundary}--");
+    let Some(pos) = body
+        .windows(closing.len())
+        .rposition(|window| window == closing.as_bytes())
+    else {
+        return body.to_vec();
+    };
+    let part = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+    );
+    let mut out = Vec::with_capacity(body.len() + part.len());
+    out.extend_from_slice(&body[..pos]);
+    out.extend_from_slice(part.as_bytes());
+    out.extend_from_slice(&body[pos..]);
+    out
 }
 
 fn lan_route_match(
@@ -581,6 +1054,8 @@ fn lan_route_match(
             default_reasoning_level: lan_model.default_reasoning_level.clone(),
             supported_reasoning_levels: lan_model.supported_reasoning_levels.clone(),
             codex_alias: None,
+            image_generation: false,
+            image_quality: None,
         },
         provider: Provider {
             id: "lan-share".into(),
@@ -1057,6 +1532,7 @@ fn claude_code_stainless_os() -> &'static str {
 pub(crate) fn claude_code_mirror_headers(
     base_headers: Vec<(String, String)>,
     request: &Value,
+    one_million: bool,
 ) -> Vec<(String, String)> {
     let auth = header_value(&base_headers, "authorization")
         .or_else(|| header_value(&base_headers, "x-api-key").map(|key| format!("Bearer {key}")));
@@ -1091,7 +1567,12 @@ pub(crate) fn claude_code_mirror_headers(
         "x-stainless-timeout".into(),
         CLAUDE_DESKTOP_STAINLESS_TIMEOUT.into(),
     ));
-    headers.push(("anthropic-beta".into(), CLAUDE_DESKTOP_MESSAGES_BETA.into()));
+    let beta = if one_million {
+        format!("{CLAUDE_DESKTOP_MESSAGES_BETA},{CLAUDE_DESKTOP_ONE_MILLION_BETA}")
+    } else {
+        CLAUDE_DESKTOP_MESSAGES_BETA.to_string()
+    };
+    headers.push(("anthropic-beta".into(), beta));
     headers.push((
         "anthropic-dangerous-direct-browser-access".into(),
         "true".into(),
@@ -1639,7 +2120,8 @@ async fn forward_anthropic(
     let client = client_for_provider(state, &matched.provider)?;
     let (base_url, headers) = anthropic_upstream(state, &client, &matched.provider).await?;
     let url = anthropic_messages_url(&base_url, one_million_context);
-    let mut message_headers = claude_code_mirror_headers(headers.clone(), &body);
+    let mut message_headers =
+        claude_code_mirror_headers(headers.clone(), &body, one_million_context);
     append_anthropic_betas(&mut message_headers);
 
     let original_body_bytes = json_size(&anthropic_body) as u64;
@@ -3745,6 +4227,7 @@ fn extract_stream_delta(protocol: &ProviderProtocol, data: &str) -> Option<Strin
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        ProviderProtocol::OpenAiImages => None,
     }
 }
 
@@ -5773,36 +6256,35 @@ fn is_public_openai_api_key(auth: &str) -> bool {
 mod tests {
     use super::{
         anthropic_messages_url, anthropic_model_for_request, anthropic_output_items,
-        anthropic_response_json, anthropic_thinking_content_from_input_item, build_anthropic_body,
-        build_chat_completions_body, build_chat_completions_body_with_profile,
-        chat_body_without_response_format, chat_completion_output_items,
-        chat_completion_response_json, chat_completions_compatibility_profile,
-        chat_reasoning_content_from_input_item, chat_tool_call_deltas, classify_raw_stream_finish,
-        claude_code_mirror_headers, collect_anthropic_tool_result_positions,
-        context_bridge_diagnostics, context_full_error_message, converted_anthropic_sse,
-        converted_chat_sse, endpoint, event_data_lines, extract_stream_delta, find_sse_boundary,
-        forward_chat_completions, forward_responses_proxy, is_public_openai_api_key, json_size,
-        lan_proxy_request_headers, map_openai_chat_reasoning_effort, map_reasoning_effort,
-        official_responses_endpoint, post_bytes_with_retries, proxy_lan_models, proxy_raw,
-        proxy_request_headers, response_stream_done_events, response_stream_start_events,
-        responses_proxy_body, responses_proxy_url, route_response,
-        should_retry_chat_without_response_format, should_skip_proxy_request_header,
-        validate_lan_authorization, ChatCompletionsCompatibilityProfile, RawProxyContext,
-        RawSseObserver, ResponsesAuthMode, RouteError, ServerState, CLAUDE_DESKTOP_MESSAGES_BETA,
-        RESPONSES_BODY_LIMIT_BYTES,
+        anthropic_response_json, anthropic_thinking_content_from_input_item,
+        apply_image_gen_override, build_anthropic_body, build_chat_completions_body,
+        build_chat_completions_body_with_profile, chat_body_without_response_format,
+        chat_completion_output_items, chat_completion_response_json,
+        chat_completions_compatibility_profile, chat_reasoning_content_from_input_item,
+        chat_tool_call_deltas, classify_raw_stream_finish, claude_code_mirror_headers,
+        context_bridge_diagnostics, converted_anthropic_sse, converted_chat_sse, endpoint,
+        event_data_lines, extract_stream_delta, find_sse_boundary, forward_chat_completions,
+        forward_responses_proxy, is_public_openai_api_key, json_size, lan_proxy_request_headers,
+        map_openai_chat_reasoning_effort, map_reasoning_effort, official_responses_endpoint,
+        post_bytes_with_retries, proxy_lan_models, proxy_raw, proxy_request_headers,
+        response_stream_done_events, response_stream_start_events, responses_proxy_body,
+        responses_proxy_url, route_response, should_retry_chat_without_response_format,
+        should_skip_proxy_request_header, validate_lan_authorization,
+        ChatCompletionsCompatibilityProfile, RawProxyContext, RawSseObserver, ResponsesAuthMode,
+        RouteError, ServerState, CLAUDE_DESKTOP_MESSAGES_BETA, RESPONSES_BODY_LIMIT_BYTES,
     };
     use super::{
         append_anthropic_betas, build_context_management, context_management_edit_names,
         extract_applied_edits, extract_compaction_summary, inject_compaction_block,
-        is_strong_context_key, truncate_tool_result_with_marker, truncate_tool_results_in_body,
+        inject_multipart_field, is_strong_context_key, truncate_tool_result_with_marker,
+        truncate_tool_results_in_body,
     };
     use crate::{
         router::{match_route, RouteMatch},
         store::AppStore,
         types::{
-            default_config, ClaudeContextPressureSample, CodexInjectionMode,
-            ContextBridgeDiagnostics, ModelEntry, Provider, ProviderKind, ProviderProtocol,
-            RequestRecord, TokenUsage,
+            seeded_config, CodexInjectionMode, ContextBridgeDiagnostics, ModelEntry, Provider,
+            ProviderKind, ProviderProtocol, RequestRecord, TokenUsage,
         },
     };
     use axum::{
@@ -5821,6 +6303,33 @@ mod tests {
             Arc, Mutex,
         },
     };
+
+    #[test]
+    fn inject_multipart_field_adds_missing_model() {
+        let boundary = "----neko";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nfix it\r\n--{boundary}--\r\n"
+        );
+        let out = inject_multipart_field(body.as_bytes(), boundary, "model", "gpt-image-2");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("name=\"prompt\""));
+        assert!(text.contains("gpt-image-2"));
+        assert!(text.ends_with(&format!("--{boundary}--\r\n")));
+        // 注入的 model 段紧贴 closing boundary 之前
+        assert!(text.contains(&format!(
+            "name=\"model\"\r\n\r\ngpt-image-2\r\n--{boundary}--"
+        )));
+    }
+
+    #[test]
+    fn inject_multipart_field_skips_existing_model() {
+        let boundary = "----neko";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nkept\r\n--{boundary}--\r\n"
+        );
+        let out = inject_multipart_field(body.as_bytes(), boundary, "model", "gpt-image-2");
+        assert_eq!(out, body.as_bytes());
+    }
 
     #[test]
     fn truncate_tool_result_with_marker_keeps_head_tail() {
@@ -5985,8 +6494,35 @@ mod tests {
     }
 
     #[test]
+    fn image_gen_override_rewrites_tool_model_only_when_configured() {
+        // 默认(None)：不改 image_generation 工具。
+        let config = seeded_config();
+        let mut body = json!({ "tools": [{ "type": "image_generation" }] });
+        apply_image_gen_override(&mut body, &config);
+        assert!(body["tools"][0].get("model").is_none());
+
+        // 配了 image_gen_model：把画图工具的 model 改成上游名，非画图工具不动。
+        let mut config = seeded_config();
+        let target = config.models[0].id.clone();
+        let expected = config.models[0]
+            .upstream_model
+            .clone()
+            .unwrap_or_else(|| target.clone());
+        config.settings.image_gen_model = Some(target);
+        let mut body = json!({
+            "tools": [
+                { "type": "function", "name": "shell" },
+                { "type": "image_generation" }
+            ]
+        });
+        apply_image_gen_override(&mut body, &config);
+        assert_eq!(body["tools"][1]["model"], json!(expected));
+        assert!(body["tools"][0].get("model").is_none());
+    }
+
+    #[test]
     fn lan_auth_requires_bearer_key_for_non_loopback_clients() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.allow_lan = true;
         config.settings.lan_api_key = "nr_test".into();
         let remote: SocketAddr = "192.168.1.30:50100".parse().unwrap();
@@ -6004,7 +6540,7 @@ mod tests {
 
     #[test]
     fn lan_auth_skips_loopback_clients() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.allow_lan = true;
         config.settings.lan_api_key = "nr_test".into();
         let remote: SocketAddr = "127.0.0.1:50100".parse().unwrap();
@@ -6057,7 +6593,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let store = AppStore::load(temp.path().to_path_buf()).unwrap();
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.lan_remote_host = "127.0.0.1".into();
         config.settings.lan_remote_port = port;
         config.settings.lan_remote_api_key = "remote-key".into();
@@ -6115,7 +6651,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let store = AppStore::load(temp.path().to_path_buf()).unwrap();
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.codex_injection_mode = CodexInjectionMode::LanShare;
         config.settings.lan_remote_host = "127.0.0.1".into();
         config.settings.lan_remote_port = port;
@@ -6431,6 +6967,7 @@ mod tests {
                 ("anthropic-beta".into(), "oauth-2025-04-20".into()),
             ],
             &request,
+            false,
         );
         let get = |name: &str| {
             headers
@@ -6461,6 +6998,26 @@ mod tests {
         assert!(!headers
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("x-api-key")));
+    }
+
+    #[test]
+    fn mirror_headers_gate_one_million_beta() {
+        let request = json!({});
+        let beta_of = |one_million: bool| {
+            claude_code_mirror_headers(
+                vec![("x-api-key".into(), "sk".into())],
+                &request,
+                one_million,
+            )
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+            .map(|(_, value)| value)
+            .unwrap()
+        };
+        // 订阅默认（非 1M）：不带 context-1m，避免 "Usage credits are required" 被拒。
+        assert!(!beta_of(false).contains("context-1m"));
+        // 显式 1M（[1m] 后缀或窗口 ≥ 1M）：带 context-1m。
+        assert!(beta_of(true).contains("context-1m-2025-08-07"));
     }
 
     #[test]
@@ -7266,6 +7823,8 @@ mod tests {
                 default_reasoning_level: String::new(),
                 supported_reasoning_levels: Vec::new(),
                 codex_alias: None,
+                image_generation: false,
+                image_quality: None,
             },
             provider,
             upstream_model: "deepseek-chat".into(),
@@ -7363,6 +7922,8 @@ mod tests {
                 default_reasoning_level: String::new(),
                 supported_reasoning_levels: Vec::new(),
                 codex_alias: None,
+                image_generation: false,
+                image_quality: None,
             },
             provider,
             upstream_model: "deepseek-chat".into(),
@@ -8334,7 +8895,7 @@ mod tests {
 
     #[test]
     fn direct_proxy_keeps_original_body_without_model_override() {
-        let config = default_config();
+        let config = seeded_config();
         let matched = match_route(&config, "gpt-5.5").unwrap();
         let raw = Bytes::from_static(br#"{"model":"gpt-5.5","stream":true}"#);
         let body = json!({"model": "gpt-5.5", "stream": true});
@@ -8346,7 +8907,7 @@ mod tests {
 
     #[test]
     fn responses_proxy_strips_local_chat_reasoning_before_openai_responses() {
-        let config = default_config();
+        let config = seeded_config();
         let matched = match_route(&config, "gpt-5.5").unwrap();
         let body = json!({
             "model": "gpt-5.5",
@@ -8380,7 +8941,7 @@ mod tests {
 
     #[test]
     fn responses_proxy_strips_local_anthropic_thinking_from_messages() {
-        let config = default_config();
+        let config = seeded_config();
         let matched = match_route(&config, "gpt-5.5").unwrap();
         let body = json!({
             "model": "gpt-5.5",
@@ -8410,7 +8971,7 @@ mod tests {
 
     #[test]
     fn responses_proxy_preserves_unknown_encrypted_reasoning() {
-        let config = default_config();
+        let config = seeded_config();
         let matched = match_route(&config, "gpt-5.5").unwrap();
         let body = json!({
             "model": "gpt-5.5",
@@ -8486,7 +9047,7 @@ mod tests {
             key_ref: None,
             http_proxy: Default::default(),
         };
-        let mut model = default_config().models[0].clone();
+        let mut model = seeded_config().models[0].clone();
         model.id = "gpt-5.5".into();
         model.provider_id = provider.id.clone();
         model.upstream_model = None;
@@ -8544,7 +9105,7 @@ mod tests {
 
     #[test]
     fn direct_proxy_rewrites_only_upstream_model() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config
             .models
             .iter_mut()
@@ -8565,7 +9126,7 @@ mod tests {
 
     #[test]
     fn responses_proxy_preserves_image_and_file_inputs_when_rewriting_model() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config
             .models
             .iter_mut()
@@ -8600,7 +9161,7 @@ mod tests {
 
     #[test]
     fn internal_codex_proxy_rewrites_to_locked_default_model() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(Provider {
             id: "deepseek".into(),
             name: "DeepSeek".into(),
@@ -8632,7 +9193,7 @@ mod tests {
 
     #[test]
     fn upstream_error_keeps_matched_model_for_request_log() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.codex_default_model = Some("claude-opus-4-8".into());
 
         let matched = match_route(&config, "gpt-5.4").unwrap();
@@ -8664,7 +9225,7 @@ mod tests {
             store,
             client: Client::new(),
         };
-        let config = default_config();
+        let config = seeded_config();
         let provider = config
             .providers
             .iter()
@@ -8807,6 +9368,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 context_usage: TokenUsage::default(),
                 cost_usd: None,
+                image_preview: None,
             })
             .await;
     }
@@ -8959,6 +9521,7 @@ data: {"type":"response.failed","response":{"error":{"code":"context_length_exce
                 usage: TokenUsage::default(),
                 context_usage: TokenUsage::default(),
                 cost_usd: None,
+                image_preview: None,
             })
             .await;
         let response = Client::new().post(&url).send().await.unwrap();
@@ -8975,7 +9538,7 @@ data: {"type":"response.failed","response":{"error":{"code":"context_length_exce
 
     #[test]
     fn official_endpoint_uses_token_type() {
-        let config = default_config();
+        let config = seeded_config();
         let provider = config
             .providers
             .iter()

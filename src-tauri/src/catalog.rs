@@ -66,6 +66,8 @@ pub fn catalog_models_for_config(
         .iter()
         .filter(|model| {
             model.enabled
+                // 图片模型不进 Codex 模型列表(Codex 是文本对话，画图走 /neko-image skill)。
+                && !model.image_generation
                 && allowed_model_ids
                     .map(|allowed| allowed.contains(&model.id))
                     .unwrap_or(true)
@@ -294,13 +296,13 @@ mod tests {
     use super::{catalog_json, catalog_json_for_models};
     use crate::codex_alias;
     use crate::types::{
-        default_config, reasoning_defaults_for_protocol, CodexInjectionMode, Provider,
-        ProviderKind, ProviderProtocol,
+        reasoning_defaults_for_protocol, seeded_config, CodexInjectionMode, Provider, ProviderKind,
+        ProviderProtocol,
     };
 
     #[test]
     fn catalog_contains_enabled_models_with_required_fields() {
-        let config = default_config();
+        let config = seeded_config();
         let catalog = catalog_json(&config);
         let models = catalog["models"].as_array().unwrap();
         let gpt = models
@@ -314,7 +316,7 @@ mod tests {
 
     #[test]
     fn catalog_exports_all_models_with_image_input_enabled() {
-        let config = default_config();
+        let config = seeded_config();
         let catalog = catalog_json(&config);
         let models = catalog["models"].as_array().unwrap();
 
@@ -331,7 +333,7 @@ mod tests {
 
     #[test]
     fn catalog_keeps_effective_context_window_at_full_size() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.models[0].context_window = 1_000_000;
         config.models[1].context_window = 258_000;
 
@@ -350,7 +352,7 @@ mod tests {
 
     #[test]
     fn catalog_exports_uniform_auto_compact_limit() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.models[0].context_window = 1_000_000;
         config.models[1].context_window = 258_000;
 
@@ -372,7 +374,7 @@ mod tests {
 
     #[test]
     fn catalog_marks_claude_reasoning_supported_with_max() {
-        let config = default_config();
+        let config = seeded_config();
         let catalog = catalog_json(&config);
         let claude = catalog["models"]
             .as_array()
@@ -394,7 +396,7 @@ mod tests {
 
     #[test]
     fn catalog_marks_chat_completions_reasoning_supported() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(Provider {
             id: "deepseek".into(),
             name: "DeepSeek".into(),
@@ -436,7 +438,7 @@ mod tests {
 
     #[test]
     fn third_party_catalog_exports_claude_with_codex_slot() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
 
         let catalog = catalog_json(&config);
@@ -452,7 +454,7 @@ mod tests {
 
     #[test]
     fn third_party_catalog_skips_overflow_when_slot_pool_is_exhausted() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
         let template = config
             .models

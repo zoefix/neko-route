@@ -18,6 +18,7 @@ pub fn parse_usage(protocol: ProviderProtocol, usage: &Value) -> TokenUsage {
         ProviderProtocol::AnthropicMessages => parse_anthropic(usage),
         ProviderProtocol::OpenAiChatCompletions => parse_openai(usage, true),
         ProviderProtocol::OpenAiResponses => parse_openai(usage, false),
+        ProviderProtocol::OpenAiImages => parse_openai(usage, false),
     }
 }
 

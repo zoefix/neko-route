@@ -38,6 +38,8 @@ import {
   ModelGarden,
   PageProps,
   SettingsModal,
+  visibleUiModelCount,
+  visibleUiProviders,
 } from "./pages";
 import {
   fetchLatestReleaseNotes,
@@ -352,8 +354,20 @@ function App() {
   }, [notify, notifyRaw]);
 
   const triggerCodexRestart = React.useCallback(async () => {
+    // Windows 下检测不到 Codex 进程时直接提示手动启动(无法可靠自动拉起)；其他平台照常重启。
+    if (/win/i.test(navigator.platform)) {
+      try {
+        const status = await api.codexAppStatus();
+        if (!status.running) {
+          notify("codexRestart.notRunning");
+          return;
+        }
+      } catch {
+        // 状态检测失败就照常走确认流程
+      }
+    }
     setCodexRestartConfirmOpen(true);
-  }, []);
+  }, [notify]);
 
   const confirmCodexRestart = React.useCallback(async () => {
     setCodexRestartConfirmOpen(false);
@@ -437,8 +451,8 @@ function App() {
   const navItems = navForMode(config.settings.codex_injection_mode);
   const active = navItems.find((n) => n.page === page) ?? NAV.find((n) => n.page === page) ?? navItems[0];
   const badges: Partial<Record<Page, number>> = {
-    models: config.models.length,
-    keys: config.providers.length,
+    models: visibleUiModelCount(config, snapshot),
+    keys: visibleUiProviders(config, snapshot).length,
     logs: snapshot.request_log_count,
   };
 

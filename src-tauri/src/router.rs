@@ -202,12 +202,12 @@ mod tests {
     };
     use crate::store::normalize_config;
     use crate::types::{
-        default_config, CodexInjectionMode, Provider, ProviderKind, ProviderProtocol,
+        seeded_config, CodexInjectionMode, Provider, ProviderKind, ProviderProtocol,
     };
 
     #[test]
     fn model_controls_provider_selection() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(Provider {
             id: "custom-chat".into(),
             name: "Custom Chat".into(),
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn disabled_model_is_not_routable() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config
             .models
             .iter_mut()
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn provider_scoped_match_chooses_duplicate_model_under_requested_provider() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(Provider {
             id: "openai-account-user".into(),
             name: "User OpenAI".into(),
@@ -279,13 +279,13 @@ mod tests {
 
     #[test]
     fn provider_scoped_match_does_not_fallback_to_same_named_provider() {
-        let config = default_config();
+        let config = seeded_config();
         assert!(match_route_for_provider(&config, "gpt-5.5", "missing-provider").is_err());
     }
 
     #[test]
     fn provider_scoped_match_allows_disabled_model_for_testing() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         let model = config
             .models
             .iter_mut()
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn codex_internal_model_routes_to_locked_fallback_when_default_is_unset() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.fallback_model = Some("claude-opus-4-8".into());
 
         let matched = match_route(&config, "gpt-5.4-mini").unwrap();
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn codex_slot_routes_to_real_model() {
-        let mut config = normalize_config(default_config());
+        let mut config = normalize_config(seeded_config());
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
         config.settings.codex_default_model = Some("claude-opus-4-8".into());
         config.settings.fallback_model = None;
@@ -335,14 +335,14 @@ mod tests {
 
     #[test]
     fn fallback_is_ignored_when_unset() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.fallback_model = None;
         assert!(match_route(&config, "gpt-5.4-mini").is_err());
     }
 
     #[test]
     fn fallback_does_not_mask_itself() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.fallback_model = Some("missing-model".into());
         // Fallback target doesn't exist -> original error, no infinite masking.
         assert!(match_route(&config, "gpt-5.4-mini").is_err());
@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn configured_model_ignores_fallback() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.fallback_model = Some("claude-opus-4-8".into());
         let matched = match_route(&config, "gpt-5.5").unwrap();
         assert_eq!(matched.model.id, "gpt-5.5");
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn unknown_non_internal_model_routes_to_fallback() {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.fallback_model = Some("claude-opus-4-8".into());
 
         let matched = match_route(&config, "unknown-model").unwrap();
@@ -403,7 +403,7 @@ mod tests {
     }
 
     fn config_with_deepseek_default() -> crate::types::AppConfig {
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(Provider {
             id: "deepseek".into(),
             name: "DeepSeek".into(),

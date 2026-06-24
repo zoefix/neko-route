@@ -335,12 +335,84 @@ pub fn inject_into_with_model_filter(
     )
     .map_err(|error| error.to_string())?;
 
+    write_neko_image_skill(codex_home, &config.settings);
+
     Ok(InjectionResult {
         codex_home: codex_home.display().to_string(),
         config_path: config_path.display().to_string(),
         catalog_path: catalog_path.display().to_string(),
         backup_path: backup_path.display().to_string(),
     })
+}
+
+/// 往 `~/.codex/skills/neko-image/SKILL.md` 写画图 skill。配了 image_gen 模型才写,否则清理掉。
+fn write_neko_image_skill(codex_home: &Path, settings: &Settings) {
+    let skill_dir = codex_home.join("skills").join("neko-image");
+    let configured = settings
+        .image_gen_model
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty());
+    if !configured {
+        let _ = fs::remove_dir_all(&skill_dir);
+        return;
+    }
+    if fs::create_dir_all(&skill_dir).is_err() {
+        return;
+    }
+    let base = local_codex_base_url(settings);
+    let endpoint = format!("{}/images/generations", base.trim_end_matches('/'));
+    let _ = fs::write(
+        skill_dir.join("SKILL.md"),
+        neko_image_skill_markdown(&endpoint),
+    );
+}
+
+fn neko_image_skill_markdown(endpoint: &str) -> String {
+    let edits_endpoint = endpoint.replace("/images/generations", "/images/edits");
+    format!(
+        r#"---
+name: neko-image
+description: 通过 Neko Route 创建或编辑图片。当用户要求画图、改图时使用。
+---
+
+# neko-image
+
+当用户要求**创建或编辑图片**(如 `/neko-image <描述>`)时，**不要用内置画图工具**，改用 Neko Route 的本地画图端点(会走用户在 Neko Route 配的画图模型)。
+
+## 创建图片
+把 <描述> 换成用户要画的内容，按需调整 size / n：
+
+```bash
+curl -s {endpoint} \
+  -H "Content-Type: application/json" \
+  -d '{{"prompt": "<描述>", "size": "1024x1024"}}' \
+  | python3 -c "import sys,json,base64,time;d=json.load(sys.stdin)['data'][0];p=f'neko-image-{{int(time.time())}}.png';open(p,'wb').write(base64.b64decode(d['b64_json']));print('saved:',p)"
+```
+
+- `size`：方图 `1024x1024`、横图 `1536x1024`、竖图 `1024x1536`(按用户想要的比例选)；
+- `n`：生成几张(默认 1)；
+- **不要传 `quality` / `model`**，Neko Route 会用配置好的。
+
+把保存的 PNG 路径展示给用户。
+
+## 编辑图片
+用户要"在上一张图基础上改 X"时，用编辑端点(把原图和描述一起发)：
+
+```bash
+curl -s {edits_endpoint} \
+  -F image=@<上一张图路径> \
+  -F prompt="<修改描述>" \
+  | python3 -c "import sys,json,base64,time;d=json.load(sys.stdin)['data'][0];p=f'neko-image-{{int(time.time())}}.png';open(p,'wb').write(base64.b64decode(d['b64_json']));print('saved:',p)"
+```
+
+**记住上一次保存的图片路径**，编辑时传给 `image=@`。
+
+## 注意
+- 若返回 "image_gen not configured"，提示用户去 Neko Route 的 Codex 配置里选一个 image_gen 模型。
+"#,
+        endpoint = endpoint,
+        edits_endpoint = edits_endpoint,
+    )
 }
 
 fn ensure_neko_route_provider(
@@ -515,7 +587,7 @@ mod tests {
     use crate::{
         catalog::CatalogModel,
         store::normalize_config,
-        types::{default_config, CodexInjectionMode, Provider, ProviderKind, ProviderProtocol},
+        types::{seeded_config, CodexInjectionMode, Provider, ProviderKind, ProviderProtocol},
     };
     use std::collections::HashSet;
     use std::fs;
@@ -527,7 +599,7 @@ mod tests {
         fs::write(codex_home.join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
         fs::write(codex_home.join("auth.json"), "{\"token\":\"keep\"}").unwrap();
 
-        let result = inject_into(&default_config(), codex_home, Some("gpt-5.5")).unwrap();
+        let result = inject_into(&seeded_config(), codex_home, Some("gpt-5.5")).unwrap();
         let config = fs::read_to_string(&result.config_path).unwrap();
         assert!(config.contains("model_provider = \"neko-route\""));
         assert!(config.contains("requires_openai_auth = true"));
@@ -554,7 +626,7 @@ mod tests {
     #[test]
     fn inject_uses_selected_claude_reasoning_default() {
         let dir = tempfile::tempdir().unwrap();
-        let result = inject_into(&default_config(), dir.path(), Some("claude-opus-4-8")).unwrap();
+        let result = inject_into(&seeded_config(), dir.path(), Some("claude-opus-4-8")).unwrap();
         let config = fs::read_to_string(&result.config_path).unwrap();
 
         assert!(config.contains("model = \"claude-opus-4-8\""));
@@ -572,7 +644,7 @@ mod tests {
             "model = \"gpt-5.5\"\nmodel_context_window = 200000\nmodel_auto_compact_token_limit = 180000\n",
         )
         .unwrap();
-        let mut config = default_config();
+        let mut config = seeded_config();
         config
             .models
             .iter_mut()
@@ -600,7 +672,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = inject_into(&default_config(), dir.path(), None).unwrap();
+        let result = inject_into(&seeded_config(), dir.path(), None).unwrap();
         let config_toml = fs::read_to_string(&result.config_path).unwrap();
 
         assert!(config_toml.contains("model_context_window = 1000000"));
@@ -610,7 +682,7 @@ mod tests {
     #[test]
     fn inject_uses_chat_completions_reasoning_default() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.providers.push(Provider {
             id: "deepseek".into(),
             name: "DeepSeek".into(),
@@ -644,7 +716,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = inject_into(&default_config(), dir.path(), None).unwrap();
+        let result = inject_into(&seeded_config(), dir.path(), None).unwrap();
         let config = fs::read_to_string(&result.config_path).unwrap();
 
         assert!(config.contains("model = \"claude-opus-4-8\""));
@@ -654,7 +726,7 @@ mod tests {
     #[test]
     fn third_party_injection_writes_no_openai_auth_and_filtered_catalog() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = normalize_config(default_config());
+        let mut config = normalize_config(seeded_config());
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
         config.settings.fallback_model = Some("claude-opus-4-8".into());
         let config = normalize_config(config);
@@ -682,7 +754,7 @@ mod tests {
     #[test]
     fn lan_share_injection_writes_slot_model_with_remote_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let mut settings = default_config().settings;
+        let mut settings = seeded_config().settings;
         settings.port = 9898;
         let models = vec![CatalogModel {
             slug: "gpt-5.5".into(),
@@ -714,7 +786,7 @@ mod tests {
 
     #[test]
     fn local_codex_base_url_uses_current_port_and_loopback_for_public_bind() {
-        let mut settings = default_config().settings;
+        let mut settings = seeded_config().settings;
         settings.bind_host = "0.0.0.0".into();
         settings.port = 9898;
 
@@ -725,7 +797,7 @@ mod tests {
     fn third_party_injection_resolves_existing_slot_model() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
-        let mut config = normalize_config(default_config());
+        let mut config = normalize_config(seeded_config());
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
         config.settings.fallback_model = Some("claude-opus-4-8".into());
         let mut config = normalize_config(config);
@@ -750,7 +822,7 @@ mod tests {
     #[test]
     fn third_party_injection_rejects_unavailable_default_or_fallback() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
         let allowed = HashSet::from(["claude-opus-4-8".to_string()]);
 
@@ -773,7 +845,7 @@ mod tests {
     #[test]
     fn third_party_injection_requires_default_model() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = default_config();
+        let mut config = seeded_config();
         config.settings.codex_injection_mode = CodexInjectionMode::ThirdPartyApi;
         let allowed = HashSet::from(["claude-opus-4-8".to_string()]);
 
