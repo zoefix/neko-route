@@ -259,6 +259,10 @@ function streamStatusDisplay(
   if (record.stream_state === "failed") {
     return { label: streamLabel, tone: "bad", title };
   }
+  // 客户端断开但已 2xx 完成(token 下发完毕)——这类其实是正常完成的，显示最终耗时(绿)而非"已断开"。
+  if (record.stream_state === "client_disconnected" && record.status < 400) {
+    return { label: latency, tone: "good", title };
+  }
   if (
     record.stream_state === "interrupted" ||
     record.stream_state === "incomplete" ||
@@ -620,7 +624,7 @@ export function RequestTable({
                   {hasErrorDetail ? (
                     <button
                       type="button"
-                      className="status-chip bad status-chip-button"
+                      className={`status-chip ${r.status < 400 ? "good" : "bad"} status-chip-button`}
                       onClick={() => setErrorRecord(r)}
                       title={t("logs.errorDetail")}
                     >
@@ -834,12 +838,16 @@ export function Dashboard({ snapshot, config }: PageProps) {
       : Math.round(snapshot.requests.reduce((a, r) => a + Number(r.latency_ms), 0) / total);
   const stats = snapshot.stats;
   const rangeTotals: TokenTotals = stats[range];
+  const totalCost = snapshot.provider_usage.reduce(
+    (sum, provider) => sum + (provider.local_usage.estimated_cost_usd ?? 0),
+    0,
+  );
 
   return (
     <div className="stack page-enter">
       <div className="grid grid-4">
         <Stat icon={<Coins size={15} />} label={t("dash.statTokens")} value={formatTokens(stats.all_time.total_tokens)} foot={t("dash.statTokensFoot", { requests: stats.all_time.requests })} grad />
-        <Stat icon={<Cpu size={15} />} label={t("dash.statModels")} value={enabledModels} foot={t("dash.statModelsFoot", { total: visibleUiModelCount(config, snapshot) })} grad />
+        <Stat icon={<Coins size={15} />} label={t("dash.statTotalCost")} value={formatCost(totalCost)} foot={t("dash.statTotalCostFoot", { models: enabledModels })} grad />
         <Stat icon={<Server size={15} />} label={t("dash.statProviders")} value={providerCount} foot={t("dash.statProvidersFoot", { total: providerCount })} grad />
         <Stat icon={<Gauge size={15} />} label={t("dash.statSuccess")} value={`${success}%`} foot={total === 0 ? t("dash.successIdle") : t("dash.statSuccessFoot", { count: total, ms: avgLatency })} grad />
       </div>

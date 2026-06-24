@@ -1080,11 +1080,11 @@ textarea.input:focus {
   border: 1px solid var(--line);
 }
 .thead, .trow {
-  min-width: 560px;
+  min-width: 0;
   display: grid;
   align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
+  gap: 10px;
+  padding: 11px 14px;
 }
 .thead {
   background: rgba(183, 156, 255, 0.1);
@@ -1104,7 +1104,7 @@ textarea.input:focus {
 
 /* request log columns */
 .cols-req {
-  grid-template-columns: 88px minmax(110px, 1.2fr) minmax(150px, 1.1fr) 80px minmax(116px, 1fr) max-content max-content max-content;
+  grid-template-columns: 74px minmax(94px, 1.4fr) minmax(126px, 1.5fr) 60px minmax(94px, 1fr) minmax(62px, 0.72fr) 52px minmax(66px, 0.88fr);
 }
 
 .req-stream-cell {
@@ -2261,6 +2261,12 @@ body.model-drag-active * {
     flex-direction: column;
   }
 }
+@media (max-width: 1080px) {
+  .cols-req {
+    grid-template-columns: 72px minmax(88px, 1.4fr) minmax(118px, 1.5fr) 56px minmax(88px, 1fr) 50px minmax(62px, 0.9fr);
+  }
+  .cols-req .hide-sm { display: none; }
+}
 @media (max-width: 640px) {
   .cols-req { grid-template-columns: 1fr 1fr; }
   .cols-req .hide-sm { display: none; }
@@ -2827,11 +2833,11 @@ body.model-drag-active * {
 
 /* table horizontal scroll wrapper */
 .table-scroll { overflow-x: auto; border-radius: var(--radius-sm); }
-.table-scroll .table { border: 1px solid var(--line); min-width: 860px; }
+.table-scroll .table { border: 1px solid var(--line); min-width: 0; }
 
 /* request table columns (+ tokens) */
 .cols-req {
-  grid-template-columns: 88px minmax(110px, 1.2fr) minmax(150px, 1.1fr) 80px minmax(116px, 1fr) max-content max-content max-content;
+  grid-template-columns: 74px minmax(94px, 1.4fr) minmax(126px, 1.5fr) 60px minmax(94px, 1fr) minmax(62px, 0.72fr) 52px minmax(66px, 0.88fr);
 }
 
 /* small button variant */

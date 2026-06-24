@@ -150,9 +150,16 @@ impl RequestLog {
             .context_bridge
             .as_ref()
             .and_then(|diagnostics| serde_json::to_string(diagnostics).ok());
+        // 模型 ID 现在是随机的(neko-model-xxx)，查不到市场定价；改用请求方原始模型名
+        // (如 gpt-5.4)来估算消费，回退到 model。
+        let pricing_model = record
+            .requested_model
+            .as_deref()
+            .filter(|model| !model.is_empty())
+            .unwrap_or(record.model.as_str());
         let cost_usd = record.cost_usd.or_else(|| {
             crate::pricing::estimate_model_cost_usd(
-                &record.model,
+                pricing_model,
                 record.usage.input_tokens,
                 record.usage.output_tokens,
                 record.usage.cache_read_tokens,
@@ -233,13 +240,18 @@ impl RequestLog {
         let conn = self.conn.lock().unwrap();
         let cost: Option<f64> = conn
             .query_row(
-                "SELECT model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+                "SELECT model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, requested_model
                  FROM requests WHERE id=?1",
                 params![id],
                 |row| {
                     let model: String = row.get(0)?;
+                    let requested: Option<String> = row.get(5)?;
+                    let pricing_model = requested
+                        .as_deref()
+                        .filter(|model| !model.is_empty())
+                        .unwrap_or(model.as_str());
                     Ok(crate::pricing::estimate_model_cost_usd(
-                        &model,
+                        pricing_model,
                         row.get::<_, i64>(1)? as u64,
                         row.get::<_, i64>(2)? as u64,
                         row.get::<_, i64>(3)? as u64,
@@ -486,12 +498,12 @@ impl RequestLog {
     pub fn provider_local_usage(&self) -> Vec<ProviderLocalUsage> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT COALESCE(provider_id, ''), model,
+            "SELECT COALESCE(provider_id, ''), COALESCE(NULLIF(requested_model, ''), model),
                     SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens),
                     SUM(cache_write_tokens), SUM(total_tokens), COUNT(*)
              FROM requests
              WHERE provider_id IS NOT NULL AND provider_id != ''
-             GROUP BY provider_id, model",
+             GROUP BY provider_id, COALESCE(NULLIF(requested_model, ''), model)",
         ) {
             Ok(stmt) => stmt,
             Err(_) => return Vec::new(),
@@ -683,12 +695,12 @@ fn totals_between(conn: &Connection, start: &str, end: Option<&str>) -> TokenTot
 
 fn model_totals(conn: &Connection) -> Vec<ModelTokens> {
     let mut stmt = match conn.prepare(
-        "SELECT model,
+        "SELECT COALESCE(NULLIF(requested_model, ''), model),
                 COALESCE(SUM(total_tokens),0), COALESCE(SUM(input_tokens),0),
                 COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read_tokens),0),
                 COALESCE(SUM(cache_write_tokens),0), COUNT(*)
          FROM requests WHERE model <> ''
-         GROUP BY model ORDER BY SUM(total_tokens) DESC",
+         GROUP BY COALESCE(NULLIF(requested_model, ''), model) ORDER BY SUM(total_tokens) DESC",
     ) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -712,13 +724,39 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
     let started: String = row.get(1)?;
     let protocol: Option<String> = row.get(5)?;
     let context_bridge_json: Option<String> = row.get(17)?;
+    let model: String = row.get(2)?;
+    let requested_model: Option<String> = row.get(6)?;
+    let usage = TokenUsage {
+        input_tokens: row.get::<_, i64>(18)? as u64,
+        output_tokens: row.get::<_, i64>(19)? as u64,
+        cache_read_tokens: row.get::<_, i64>(20)? as u64,
+        cache_write_tokens: row.get::<_, i64>(21)? as u64,
+        total_tokens: row.get::<_, i64>(22)? as u64,
+    };
+    // cost 为空(旧记录、或随机 model id 写入时算不出)时，查询时用请求方原始模型实时估算定价。
+    let cost_usd = row
+        .get::<_, Option<f64>>(28)?
+        .filter(|cost| *cost > 0.0)
+        .or_else(|| {
+            let pricing_model = requested_model
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or(model.as_str());
+            crate::pricing::estimate_model_cost_usd(
+                pricing_model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+            )
+        });
     Ok(RequestRecord {
         id: row.get(0)?,
         started_at: DateTime::parse_from_rfc3339(&started)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
-        model: row.get(2)?,
-        requested_model: row.get(6)?,
+        model,
+        requested_model,
         route_reason: row.get(7)?,
         provider_id: row.get(3)?,
         provider_name: row.get(4)?,
@@ -735,13 +773,7 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
         context_bridge: context_bridge_json
             .as_deref()
             .and_then(|value| serde_json::from_str::<ContextBridgeDiagnostics>(value).ok()),
-        usage: TokenUsage {
-            input_tokens: row.get::<_, i64>(18)? as u64,
-            output_tokens: row.get::<_, i64>(19)? as u64,
-            cache_read_tokens: row.get::<_, i64>(20)? as u64,
-            cache_write_tokens: row.get::<_, i64>(21)? as u64,
-            total_tokens: row.get::<_, i64>(22)? as u64,
-        },
+        usage,
         context_usage: TokenUsage {
             input_tokens: row.get::<_, i64>(23)? as u64,
             output_tokens: row.get::<_, i64>(24)? as u64,
@@ -749,7 +781,7 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
             cache_write_tokens: row.get::<_, i64>(26)? as u64,
             total_tokens: row.get::<_, i64>(27)? as u64,
         },
-        cost_usd: row.get::<_, Option<f64>>(28)?,
+        cost_usd,
         image_preview: row.get::<_, Option<String>>(29)?,
     })
 }

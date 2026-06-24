@@ -87,6 +87,55 @@ fn price_for_model(model: &str) -> Option<ModelPrice> {
             cache_write_per_million: 2.0,
         });
     }
+    if model.starts_with("gpt-4o-mini") {
+        return Some(ModelPrice {
+            input_per_million: 0.15,
+            output_per_million: 0.60,
+            cache_read_per_million: 0.075,
+            cache_write_per_million: 0.15,
+        });
+    }
+    if model.starts_with("gpt-4o") || model.starts_with("chatgpt-4o") {
+        return Some(ModelPrice {
+            input_per_million: 2.5,
+            output_per_million: 10.0,
+            cache_read_per_million: 1.25,
+            cache_write_per_million: 2.5,
+        });
+    }
+    if model.starts_with("gpt-4-turbo") {
+        return Some(ModelPrice {
+            input_per_million: 10.0,
+            output_per_million: 30.0,
+            cache_read_per_million: 5.0,
+            cache_write_per_million: 10.0,
+        });
+    }
+    if model.starts_with("o3-mini") || model.starts_with("o1-mini") || model.starts_with("o4-mini")
+    {
+        return Some(ModelPrice {
+            input_per_million: 1.1,
+            output_per_million: 4.4,
+            cache_read_per_million: 0.55,
+            cache_write_per_million: 1.1,
+        });
+    }
+    if model.starts_with("o3") {
+        return Some(ModelPrice {
+            input_per_million: 2.0,
+            output_per_million: 8.0,
+            cache_read_per_million: 0.5,
+            cache_write_per_million: 2.0,
+        });
+    }
+    if model.starts_with("o1") {
+        return Some(ModelPrice {
+            input_per_million: 15.0,
+            output_per_million: 60.0,
+            cache_read_per_million: 7.5,
+            cache_write_per_million: 15.0,
+        });
+    }
     // Claude 市场定价（等效 API 价；Max 订阅不实际按 token 扣，仅作参考）。
     if model.starts_with("claude-opus-4") {
         return Some(ModelPrice {
@@ -110,6 +159,43 @@ fn price_for_model(model: &str) -> Option<ModelPrice> {
             output_per_million: 5.0,
             cache_read_per_million: 0.1,
             cache_write_per_million: 1.25,
+        });
+    }
+    // Claude 3.x 系列
+    if model.starts_with("claude-3-7-sonnet")
+        || model.starts_with("claude-3.7-sonnet")
+        || model.starts_with("claude-3-5-sonnet")
+        || model.starts_with("claude-3.5-sonnet")
+    {
+        return Some(ModelPrice {
+            input_per_million: 3.0,
+            output_per_million: 15.0,
+            cache_read_per_million: 0.3,
+            cache_write_per_million: 3.75,
+        });
+    }
+    if model.starts_with("claude-3-5-haiku") || model.starts_with("claude-3.5-haiku") {
+        return Some(ModelPrice {
+            input_per_million: 0.8,
+            output_per_million: 4.0,
+            cache_read_per_million: 0.08,
+            cache_write_per_million: 1.0,
+        });
+    }
+    if model.starts_with("claude-3-opus") {
+        return Some(ModelPrice {
+            input_per_million: 15.0,
+            output_per_million: 75.0,
+            cache_read_per_million: 1.5,
+            cache_write_per_million: 18.75,
+        });
+    }
+    if model.starts_with("claude-3-haiku") {
+        return Some(ModelPrice {
+            input_per_million: 0.25,
+            output_per_million: 1.25,
+            cache_read_per_million: 0.03,
+            cache_write_per_million: 0.30,
         });
     }
     None
