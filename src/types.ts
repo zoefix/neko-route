@@ -10,10 +10,11 @@ export type ProviderProtocol =
   | "open_ai_responses"
   | "open_ai_chat_completions"
   | "anthropic_messages"
-  | "open_ai_images";
+  | "open_ai_images"
+  | "gemini_image";
 
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max";
-export type CodexInjectionMode = "official_account" | "third_party_api" | "lan_share";
+export type CodexInjectionMode = "official_account" | "third_party_api" | "lan_share" | "direct_provider";
 export type StreamState =
   | "pending"
   | "completed"
@@ -56,6 +57,7 @@ export type ModelEntry = {
   codex_alias: string | null;
   image_generation: boolean;
   image_quality: string | null;
+  image_capable: boolean;
 };
 
 export type CodexSlotAssignment = {
@@ -81,6 +83,9 @@ export type SettingsState = {
   codex_internal_model_lock: boolean;
   codex_slots: CodexSlotAssignment[];
   image_gen_model: string | null;
+  aux_model: string | null;
+  memory_model: string | null;
+  direct_provider_id: string | null;
 };
 
 export type AppConfig = {
@@ -127,6 +132,13 @@ export type ContextBridgeDiagnostics = {
   applied_edits: string | null;
   compaction_persisted: boolean;
   compaction_injected: boolean;
+  request_kind?: string | null;
+  instructions_preview?: string | null;
+  instructions_length?: number;
+  tool_count?: number;
+  tool_names?: string[];
+  input_message_count?: number;
+  max_output_tokens?: number | null;
 };
 
 export type RequestRecord = {
@@ -150,6 +162,7 @@ export type RequestRecord = {
   context_bridge: ContextBridgeDiagnostics | null;
   usage: TokenUsage;
   context_usage: TokenUsage;
+  upstream_model: string | null;
   cost_usd: number | null;
   image_preview: string | null;
 };
@@ -188,7 +201,10 @@ export type DayTokens = {
   total_tokens: number;
   input_tokens: number;
   output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
   requests: number;
+  cost_usd: number;
 };
 
 export type ModelTokens = {
@@ -199,6 +215,7 @@ export type ModelTokens = {
   cache_read_tokens: number;
   cache_write_tokens: number;
   requests: number;
+  cost_usd: number;
 };
 
 export type TokenStats = {
@@ -208,6 +225,12 @@ export type TokenStats = {
   all_time: TokenTotals;
   series: DayTokens[];
   by_model: ModelTokens[];
+  model_trends: ModelDaySeries[];
+};
+
+export type ModelDaySeries = {
+  model: string;
+  daily: number[];
 };
 
 export type TestModelResult = {
@@ -359,10 +382,22 @@ export type AppSnapshot = {
   codex_home: string;
 };
 
+export type HealthCell = {
+  status: number;
+  latency_ms: number;
+  stream_state: string | null;
+};
+
+export type ModelHealth = {
+  model: string;
+  cells: HealthCell[];
+};
+
 export type Page =
   | "dashboard"
   | "models"
   | "keys"
   | "logs"
+  | "health"
   | "wizard"
   | "about";

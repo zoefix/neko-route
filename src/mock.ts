@@ -1,5 +1,6 @@
 import type {
   AppSnapshot,
+  ModelHealth,
   ModelTestMode,
   ModelTestStatus,
   StartModelTestResult,
@@ -7,6 +8,24 @@ import type {
   TokenStats,
   UpstreamModel,
 } from "./types";
+
+export function mockModelHealth(models: string[]): ModelHealth[] {
+  // 演示：前几个启用模型有历史(60/48/12 条)，其余暂无请求。
+  const counts = [60, 48, 12];
+  return models.map((model, idx) => {
+    const n = counts[idx] ?? 0;
+    const cells = Array.from({ length: n }, (_, i) => {
+      const bad = i % 13 === 0;
+      const slow = !bad && i % 8 === 0;
+      return {
+        status: bad ? 429 : 200,
+        latency_ms: slow ? 12000 : 1400,
+        stream_state: bad ? "failed" : "completed",
+      };
+    });
+    return { model, cells };
+  });
+}
 
 export function mockUpstreamModels(providerId: string): UpstreamModel[] {
   if (providerId.includes("anthropic") || providerId.includes("claude")) {
@@ -24,6 +43,7 @@ export function mockUpstreamModels(providerId: string): UpstreamModel[] {
   ];
 }
 
+
 function mockStats(): TokenStats {
   const today = new Date();
   const series = Array.from({ length: 7 }, (_, i) => {
@@ -35,7 +55,10 @@ function mockStats(): TokenStats {
       total_tokens: total,
       input_tokens: Math.round(total * 0.62),
       output_tokens: Math.round(total * 0.38),
+      cache_read_tokens: Math.round(total * 0.44),
+      cache_write_tokens: Math.round(total * 0.07),
       requests: Math.round(total / 3500),
+      cost_usd: Math.round(total * 0.000018 * 100) / 100,
     };
   });
   const mk = (t: number, r: number) => ({
@@ -53,9 +76,14 @@ function mockStats(): TokenStats {
     all_time: mk(2940000, 845),
     series,
     by_model: [
-      { model: "gpt-5.5", total_tokens: 1820000, input_tokens: 1100000, output_tokens: 560000, cache_read_tokens: 130000, cache_write_tokens: 30000, requests: 520 },
-      { model: "claude-opus-4-8", total_tokens: 880000, input_tokens: 510000, output_tokens: 300000, cache_read_tokens: 56000, cache_write_tokens: 14000, requests: 240 },
-      { model: "claude-sonnet-4-5", total_tokens: 240000, input_tokens: 150000, output_tokens: 78000, cache_read_tokens: 9000, cache_write_tokens: 3000, requests: 85 },
+      { model: "gpt-5.5", total_tokens: 1820000, input_tokens: 1100000, output_tokens: 560000, cache_read_tokens: 130000, cache_write_tokens: 30000, requests: 520, cost_usd: 6.52 },
+      { model: "claude-opus-4-8", total_tokens: 880000, input_tokens: 510000, output_tokens: 300000, cache_read_tokens: 56000, cache_write_tokens: 14000, requests: 240, cost_usd: 15.10 },
+      { model: "claude-sonnet-4-5", total_tokens: 240000, input_tokens: 150000, output_tokens: 78000, cache_read_tokens: 9000, cache_write_tokens: 3000, requests: 85, cost_usd: 2.04 },
+    ],
+    model_trends: [
+      { model: "gpt-5.5", daily: [26000, 58000, 42000, 82000, 66000, 98000, 50000] },
+      { model: "claude-opus-4-8", daily: [9000, 19000, 14000, 24000, 18000, 30000, 16000] },
+      { model: "claude-sonnet-4-5", daily: [5000, 9000, 7000, 11000, 8000, 11000, 7000] },
     ],
   };
 }
@@ -245,6 +273,7 @@ export function mockSnapshot(): AppSnapshot {
           codex_alias: null,
           image_generation: false,
           image_quality: null,
+          image_capable: false,
         },
         {
           id: "gpt-image-2",
@@ -262,6 +291,7 @@ export function mockSnapshot(): AppSnapshot {
           codex_alias: null,
           image_generation: true,
           image_quality: "high",
+          image_capable: false,
         },
         {
           id: "claude-opus-4-8",
@@ -279,6 +309,7 @@ export function mockSnapshot(): AppSnapshot {
           codex_alias: null,
           image_generation: false,
           image_quality: null,
+          image_capable: false,
         },
         {
           id: "claude-sonnet-4-5",
@@ -296,6 +327,7 @@ export function mockSnapshot(): AppSnapshot {
           codex_alias: null,
           image_generation: false,
           image_quality: null,
+          image_capable: false,
         },
       ],
       settings: {
@@ -314,6 +346,9 @@ export function mockSnapshot(): AppSnapshot {
         codex_internal_model_lock: true,
         codex_slots: [],
         image_gen_model: null,
+        aux_model: null,
+        memory_model: null,
+        direct_provider_id: null,
       },
     },
     keys: [
@@ -332,6 +367,61 @@ export function mockSnapshot(): AppSnapshot {
     server: { bind_url: "http://127.0.0.1:8787/v1", running: true, error: null },
     codex_apply_error: null,
     requests: [
+      {
+        id: "mem1",
+        started_at: new Date(Date.now() - 1500).toISOString(),
+        model: "claude-opus-4-8",
+        requested_model: "gpt-5.4-mini",
+        route_reason: "memory_agent",
+        provider_id: "anthropic-cli",
+        provider_name: "Claude Code CLI Official",
+        provider_protocol: "anthropic_messages",
+        status: 200,
+        latency_ms: 2100,
+        streaming: true,
+        error: null,
+        reasoning_effort: "max",
+        stream_state: "completed",
+        stream_error: null,
+        last_event: "response.completed",
+        stream_bytes: 6100,
+        context_bridge: {
+          original_body_bytes: 757178,
+          final_body_bytes: 757178,
+          original_tool_result_bytes: 0,
+          tool_result_count: 0,
+          context_management: false,
+          last_message_role: "user",
+          last_message_content_type: "text",
+          last_message_text_length: 725077,
+          last_message_preview_head: null,
+          last_message_preview_tail: null,
+          last_message_from_function_call_output: false,
+          single_dot_user_message: false,
+          latest_tool_result_count: 0,
+          latest_tool_result_text_length: 0,
+          latest_tool_result_single_dot: false,
+          tool_results_truncated: 0,
+          tool_results_truncated_bytes: 0,
+          context_management_edits: null,
+          applied_edits: null,
+          compaction_persisted: false,
+          compaction_injected: false,
+          request_kind: "memory_agent",
+          instructions_preview:
+            "## Memory Writing Agent: Phase 1 — convert the agent rollout into durable memories.",
+          instructions_length: 30449,
+          tool_count: 0,
+          tool_names: [],
+          input_message_count: 1,
+          max_output_tokens: 4096,
+        },
+        usage: { input_tokens: 9900, output_tokens: 240, cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 10140 },
+        context_usage: { input_tokens: 9900, output_tokens: 240, cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 10140 },
+        upstream_model: "claude-opus-4-8",
+        cost_usd: 0.18,
+        image_preview: null,
+      },
       {
         id: "img1",
         started_at: new Date(Date.now() - 3000).toISOString(),
@@ -353,6 +443,7 @@ export function mockSnapshot(): AppSnapshot {
         context_bridge: null,
         usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 0 },
         context_usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 0 },
+        upstream_model: null,
         cost_usd: null,
         image_preview: "demo.png",
       },
@@ -374,9 +465,40 @@ export function mockSnapshot(): AppSnapshot {
         stream_error: null,
         last_event: "response.completed",
         stream_bytes: 0,
-        context_bridge: null,
+        context_bridge: {
+          original_body_bytes: 0,
+          final_body_bytes: 0,
+          original_tool_result_bytes: 0,
+          tool_result_count: 0,
+          context_management: false,
+          last_message_role: null,
+          last_message_content_type: null,
+          last_message_text_length: 0,
+          last_message_preview_head: null,
+          last_message_preview_tail: null,
+          last_message_from_function_call_output: false,
+          single_dot_user_message: false,
+          latest_tool_result_count: 0,
+          latest_tool_result_text_length: 0,
+          latest_tool_result_single_dot: false,
+          tool_results_truncated: 0,
+          tool_results_truncated_bytes: 0,
+          context_management_edits: null,
+          applied_edits: null,
+          compaction_persisted: false,
+          compaction_injected: false,
+          request_kind: "main_coding",
+          instructions_preview:
+            "You are Codex, a coding agent running in the Codex CLI. Help with software engineering tasks.",
+          instructions_length: 4820,
+          tool_count: 12,
+          tool_names: ["shell", "apply_patch", "update_plan", "read_file", "view_image"],
+          input_message_count: 24,
+          max_output_tokens: 64000,
+        },
         usage: { input_tokens: 1240, output_tokens: 380, cache_read_tokens: 512, cache_write_tokens: 0, total_tokens: 1620 },
         context_usage: { input_tokens: 1240, output_tokens: 380, cache_read_tokens: 4800, cache_write_tokens: 0, total_tokens: 6420 },
+        upstream_model: null,
         cost_usd: 0.0054,
         image_preview: null,
       },
@@ -420,9 +542,18 @@ export function mockSnapshot(): AppSnapshot {
           applied_edits: null,
           compaction_persisted: false,
           compaction_injected: false,
+          request_kind: "auxiliary",
+          instructions_preview:
+            "Summarize the conversation so far into a concise note for context compaction.",
+          instructions_length: 1840,
+          tool_count: 0,
+          tool_names: [],
+          input_message_count: 38,
+          max_output_tokens: 8192,
         },
         usage: { input_tokens: 860, output_tokens: 540, cache_read_tokens: 3200, cache_write_tokens: 1100, total_tokens: 5700 },
         context_usage: { input_tokens: 7500, output_tokens: 540, cache_read_tokens: 156000, cache_write_tokens: 0, total_tokens: 164040 },
+        upstream_model: null,
         cost_usd: 0.0788,
         image_preview: null,
       },
@@ -447,6 +578,7 @@ export function mockSnapshot(): AppSnapshot {
         context_bridge: null,
         usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 0 },
         context_usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, total_tokens: 0 },
+        upstream_model: null,
         cost_usd: null,
         image_preview: null,
       },

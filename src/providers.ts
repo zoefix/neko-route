@@ -46,6 +46,8 @@ export function protocolKey(protocol: ProviderProtocol): MsgKey {
       return "proto.anthropic";
     case "open_ai_images":
       return "proto.images";
+    case "gemini_image":
+      return "proto.geminiImage";
   }
 }
 
@@ -113,6 +115,7 @@ export function reasoningDefaultsForProtocol(protocol: ProviderProtocol): {
     case "open_ai_chat_completions":
       return { enabled: true, defaultLevel: "xhigh", levels: [...OPENAI_REASONING_LEVELS] };
     case "open_ai_images":
+    case "gemini_image":
       return { enabled: false, defaultLevel: "medium", levels: [] };
   }
 }

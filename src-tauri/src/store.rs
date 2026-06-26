@@ -71,6 +71,18 @@ impl AppStore {
             .map_err(|error| error.to_string())?;
 
         let log = RequestLog::open(&app_data_dir.join("requests.db"))?;
+        // 旧记录写入时没有 upstream_model 列、估价只能用随机路由 id 查不到价；用当前配置补全上游模型。
+        let upstream_map: Vec<(String, String)> = config
+            .models
+            .iter()
+            .map(|model| {
+                (
+                    model.id.clone(),
+                    model.upstream_model.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        log.backfill_upstream_models(&upstream_map);
         let image_dir = app_data_dir.join("image_cache");
         fs::create_dir_all(&image_dir).map_err(|error| error.to_string())?;
 
@@ -182,6 +194,26 @@ impl AppStore {
                 .display()
                 .to_string(),
         }
+    }
+
+    /// 每个传入模型从 DB 取最近 `limit` 条请求的健康格子（不受 snapshot 的小窗口限制）。
+    pub async fn model_health(
+        &self,
+        models: Vec<String>,
+        limit: usize,
+    ) -> Vec<crate::types::ModelHealth> {
+        let log = self.inner.log.clone();
+        tokio::task::spawn_blocking(move || {
+            models
+                .into_iter()
+                .map(|model| {
+                    let cells = log.health_cells(&model, limit);
+                    crate::types::ModelHealth { model, cells }
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     pub fn key_store(&self) -> &KeyStore {
@@ -420,6 +452,10 @@ impl AppStore {
         self.persist_prepared_config(&plan.config).await?;
         self.check_local_codex_route(plan.default_slug.as_deref())
             .await?;
+        // 直连模式：config.toml 的 model 行用上游 /v1/models 第一个真实模型（而非我们的 neko-model id）。
+        // 只覆盖最终写入 Codex config 的 model；prepare / 本地路由校验仍用原 default_model（catalog id）。
+        let direct_model = self.direct_provider_first_model(&plan.config).await;
+        let inject_model = direct_model.as_deref().or(default_model);
         let result = if plan.config.settings.codex_injection_mode == CodexInjectionMode::LanShare {
             crate::codex_config::inject_lan_share_config(
                 &plan.config.settings,
@@ -429,11 +465,22 @@ impl AppStore {
         } else {
             crate::codex_config::inject_with_model_filter(
                 &plan.config,
-                default_model,
+                inject_model,
                 plan.allowed_model_ids.as_ref(),
             )
         };
         result.map_err(enhance_codex_apply_error)
+    }
+
+    /// 直连模式下取上游 `/v1/models` 的第一个模型 id；非直连、未选服务商或拉取失败则返回 None。
+    async fn direct_provider_first_model(&self, config: &AppConfig) -> Option<String> {
+        if config.settings.codex_injection_mode != CodexInjectionMode::DirectProvider {
+            return None;
+        }
+        let provider_id = config.settings.direct_provider_id.as_deref()?;
+        let provider = config.providers.iter().find(|p| p.id == provider_id)?;
+        let models = crate::upstream_models_for(self, provider).await.ok()?;
+        models.into_iter().next().map(|model| model.id)
     }
 
     pub async fn lan_catalog_models(&self) -> Result<Vec<catalog::CatalogModel>, String> {
@@ -1238,6 +1285,32 @@ mod tests {
             saved.settings.fallback_model.as_deref(),
             Some("remote-fallback")
         );
+    }
+
+    #[tokio::test]
+    async fn direct_provider_first_model_uses_official_upstream_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AppStore::load(temp.path().to_path_buf()).unwrap();
+        let mut config = store.config().await;
+        config.providers.push(Provider {
+            id: "openai-account-main".into(),
+            name: "Personal OpenAI".into(),
+            kind: ProviderKind::OfficialOpenAiAccount,
+            protocol: ProviderProtocol::OpenAiResponses,
+            base_url: "https://bad.example/v1".into(),
+            key_ref: None,
+            http_proxy: Default::default(),
+        });
+        config.settings.codex_injection_mode = CodexInjectionMode::DirectProvider;
+        config.settings.direct_provider_id = Some("openai-account-main".into());
+
+        // 官方 provider 走内置列表，第一个 = gpt-5.5，无需联网。
+        let model = store.direct_provider_first_model(&config).await;
+        assert_eq!(model.as_deref(), Some("gpt-5.5"));
+
+        // 非直连模式返回 None（不覆盖 model 行）。
+        config.settings.codex_injection_mode = CodexInjectionMode::OfficialAccount;
+        assert!(store.direct_provider_first_model(&config).await.is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "neko-route"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local AI model router for Codex"
 authors = ["Neko Route"]
 edition = "2021"

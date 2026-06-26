@@ -7,6 +7,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import {
   IconActivity as Activity,
+  IconActivityHeartbeat as HeartPulse,
   IconAlertTriangle as TriangleAlert,
   IconCheck as Check,
   IconCloudDownload as DownloadCloud,
@@ -33,6 +34,7 @@ import {
   CodexWizard,
   About,
   Dashboard,
+  HealthPage,
   KeyVault,
   Logs,
   ModelGarden,
@@ -63,6 +65,7 @@ const NAV: NavItem[] = [
   { page: "models", label: "nav.models", icon: Database },
   { page: "keys", label: "nav.keys", icon: KeyRound },
   { page: "logs", label: "nav.logs", icon: ListTree },
+  { page: "health", label: "nav.health", icon: HeartPulse },
   { page: "wizard", label: "nav.setup", icon: Sparkles },
   { page: "about", label: "nav.about", icon: InfoCircle },
 ];
@@ -512,6 +515,7 @@ function App() {
             {page === "models" && <ModelGarden {...pageProps} />}
             {page === "keys" && <KeyVault {...pageProps} />}
             {page === "logs" && <Logs {...pageProps} />}
+            {page === "health" && <HealthPage {...pageProps} />}
             {page === "wizard" && <CodexWizard {...pageProps} />}
             {page === "about" && <About {...pageProps} />}
           </div>

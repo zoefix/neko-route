@@ -9,6 +9,7 @@ import type {
   ImportResult,
   LanModelList,
   ModelTestMode,
+  ModelHealth,
   ModelTestStatus,
   OAuthStart,
   ProviderCredential,
@@ -17,7 +18,7 @@ import type {
   TestModelResult,
   UpstreamModelList,
 } from "./types";
-import { isTauri, mockCancelModelTest, mockGetModelTestStatus, mockSnapshot, mockStartModelTest, mockTestModel, mockUpstreamModels } from "./mock";
+import { isTauri, mockCancelModelTest, mockGetModelTestStatus, mockModelHealth, mockSnapshot, mockStartModelTest, mockTestModel, mockUpstreamModels } from "./mock";
 
 // In-memory snapshot used only when running in a plain browser (web:dev preview).
 let demo: AppSnapshot | null = null;
@@ -254,6 +255,9 @@ export const api = {
     isTauri
       ? invoke<UpstreamModelList>("list_upstream_models", { providerId })
       : Promise.resolve({ models: mockUpstreamModels(providerId), error: null }),
+
+  modelHealth: (models: string[]) =>
+    isTauri ? invoke<ModelHealth[]>("model_health", { models }) : Promise.resolve(mockModelHealth(models)),
 
   refreshProviderUsage: (providerId: string) =>
     isTauri

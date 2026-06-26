@@ -2,7 +2,9 @@ use crate::{
     catalog,
     catalog::CatalogModel,
     codex_alias,
-    types::{AppConfig, CodexInjectionMode, Settings},
+    types::{
+        codex_catalog_reasoning_level, AppConfig, CodexInjectionMode, ProviderProtocol, Settings,
+    },
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -17,6 +19,9 @@ use toml_edit::{value, DocumentMut, Item, Table};
 /// Pin it to 1M (and auto-compact to 90% of that) so selecting a smaller
 /// default model never caps the usable context of the other models.
 const CODEX_CONTEXT_WINDOW: u64 = 1_000_000;
+/// 直连模式：Codex 连的是上游真实模型(gpt-5.x 约 272K)，按 258K 上报窗口、
+/// 90% 自动压缩(232200)，避免 Codex 以为有 1M 而迟迟不压缩、撑爆上游 context。
+const DIRECT_PROVIDER_CONTEXT_WINDOW: u64 = 258_000;
 
 const RESTORE_FILE_NAME: &str = "neko-route-restore.json";
 
@@ -142,7 +147,7 @@ pub fn inject_lan_share_config_into(
     } else {
         document.as_table_mut().remove("model_reasoning_effort");
     }
-    write_fixed_context_window(&mut document)?;
+    write_fixed_context_window(&mut document, CODEX_CONTEXT_WINDOW)?;
 
     ensure_neko_route_provider(&mut document, settings, false)?;
 
@@ -299,24 +304,47 @@ pub fn inject_into_with_model_filter(
     }
 
     let catalog_path = catalog::write_catalog_for_models(codex_home, config, allowed_model_ids)?;
+    let direct_provider =
+        config.settings.codex_injection_mode == CodexInjectionMode::DirectProvider;
 
     document["model_provider"] = value("neko-route");
-    document["model_catalog_json"] = value(catalog_path.display().to_string());
-    if let Some(model) = default_model
-        .filter(|value| !value.trim().is_empty())
-        .and_then(|model| resolve_config_model_id(config, model, third_party))
-        .or_else(|| third_party.then_some(selected_model).flatten())
-    {
-        let export_slug = catalog::export_slug_for_model(config, allowed_model_ids, model)?;
-        document["model"] = value(export_slug);
+    if direct_provider {
+        // 直连模式：不写模型目录，让 Codex 用上游服务商的真实模型列表（我们的模型不参与）。
+        document.as_table_mut().remove("model_catalog_json");
+    } else {
+        document["model_catalog_json"] = value(catalog_path.display().to_string());
     }
     document["model_reasoning_summary"] = value("none");
-    if let Some(reasoning_effort) = default_reasoning_effort(config, selected_model) {
-        document["model_reasoning_effort"] = value(reasoning_effort);
+    if direct_provider {
+        // 直连模式：default_model 是上游 /v1/models 的真实 slug（install 时拉取第一个），
+        // 原样写入（不经 catalog 解析）；推理等级统一拉到超高(xhigh)。
+        if let Some(slug) = default_model.filter(|value| !value.trim().is_empty()) {
+            document["model"] = value(slug);
+        }
+        document["model_reasoning_effort"] = value("xhigh");
     } else {
-        document.as_table_mut().remove("model_reasoning_effort");
+        if let Some(model) = default_model
+            .filter(|value| !value.trim().is_empty())
+            .and_then(|model| resolve_config_model_id(config, model, third_party))
+            .or_else(|| third_party.then_some(selected_model).flatten())
+        {
+            let export_slug = catalog::export_slug_for_model(config, allowed_model_ids, model)?;
+            document["model"] = value(export_slug);
+        }
+        if let Some(reasoning_effort) = default_reasoning_effort(config, selected_model) {
+            document["model_reasoning_effort"] = value(reasoning_effort);
+        } else {
+            document.as_table_mut().remove("model_reasoning_effort");
+        }
     }
-    write_fixed_context_window(&mut document)?;
+    write_fixed_context_window(
+        &mut document,
+        if direct_provider {
+            DIRECT_PROVIDER_CONTEXT_WINDOW
+        } else {
+            CODEX_CONTEXT_WINDOW
+        },
+    )?;
 
     ensure_neko_route_provider(&mut document, &config.settings, !third_party)?;
 
@@ -562,16 +590,28 @@ fn default_reasoning_effort(config: &AppConfig, default_model: Option<&str>) -> 
         .or_else(|| config.models.iter().find(|entry| entry.enabled))?;
 
     if selected.reasoning_enabled && !selected.default_reasoning_level.trim().is_empty() {
-        Some(selected.default_reasoning_level.trim().to_ascii_lowercase())
+        // Codex catalog 不支持 max：Claude 默认档下移一档(请求转发时再上移回真实档)。
+        let anthropic = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == selected.provider_id)
+            .map(|provider| provider.protocol == ProviderProtocol::AnthropicMessages)
+            .unwrap_or(false);
+        Some(
+            codex_catalog_reasoning_level(&selected.default_reasoning_level, anthropic).to_string(),
+        )
     } else {
         None
     }
 }
 
-fn write_fixed_context_window(document: &mut DocumentMut) -> Result<(), String> {
-    let context_window_value = i64::try_from(CODEX_CONTEXT_WINDOW)
+fn write_fixed_context_window(
+    document: &mut DocumentMut,
+    context_window: u64,
+) -> Result<(), String> {
+    let context_window_value = i64::try_from(context_window)
         .map_err(|_| "Codex model context window is too large".to_string())?;
-    let auto_compact_value = i64::try_from(catalog::auto_compact_token_limit(CODEX_CONTEXT_WINDOW))
+    let auto_compact_value = i64::try_from(catalog::auto_compact_token_limit(context_window))
         .map_err(|_| "Codex auto compact token limit is too large".to_string())?;
     document["model_context_window"] = value(context_window_value);
     document["model_auto_compact_token_limit"] = value(auto_compact_value);
@@ -624,13 +664,39 @@ mod tests {
     }
 
     #[test]
+    fn direct_provider_mode_writes_upstream_model_xhigh_and_258k() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = seeded_config();
+        config.settings.codex_injection_mode = CodexInjectionMode::DirectProvider;
+        config.settings.direct_provider_id = Some(config.providers[0].id.clone());
+        // 直连模式下 default_model 由 install 传入上游 /v1/models 第一个真实 slug。
+        let result = inject_into(&config, dir.path(), Some("gpt-5.5")).unwrap();
+        let toml = fs::read_to_string(&result.config_path).unwrap();
+        // model 行用上游真实 slug 原样写入（不经 catalog 解析成 neko-model id）。
+        assert!(toml.contains("model = \"gpt-5.5\""), "{toml}");
+        // 推理等级统一拉到超高(xhigh)。
+        assert!(
+            toml.contains("model_reasoning_effort = \"xhigh\""),
+            "{toml}"
+        );
+        // 按上游真实窗口 258K 上报、90% 自动压缩(232200)，避免 Codex 以为有 1M 撑爆上游。
+        assert!(toml.contains("model_context_window = 258000"), "{toml}");
+        assert!(
+            toml.contains("model_auto_compact_token_limit = 232200"),
+            "{toml}"
+        );
+        // 直连不写 catalog，让 Codex 用上游真实模型列表。
+        assert!(!toml.contains("model_catalog_json"), "{toml}");
+    }
+
+    #[test]
     fn inject_uses_selected_claude_reasoning_default() {
         let dir = tempfile::tempdir().unwrap();
         let result = inject_into(&seeded_config(), dir.path(), Some("claude-opus-4-8")).unwrap();
         let config = fs::read_to_string(&result.config_path).unwrap();
 
         assert!(config.contains("model = \"claude-opus-4-8\""));
-        assert!(config.contains("model_reasoning_effort = \"max\""));
+        assert!(config.contains("model_reasoning_effort = \"xhigh\""));
         assert!(config.contains("model_reasoning_summary = \"none\""));
         assert!(config.contains("model_context_window = 1000000"));
         assert!(config.contains("model_auto_compact_token_limit = 900000"));
@@ -720,7 +786,7 @@ mod tests {
         let config = fs::read_to_string(&result.config_path).unwrap();
 
         assert!(config.contains("model = \"claude-opus-4-8\""));
-        assert!(config.contains("model_reasoning_effort = \"max\""));
+        assert!(config.contains("model_reasoning_effort = \"xhigh\""));
     }
 
     #[test]
@@ -814,7 +880,7 @@ mod tests {
         let config_toml = fs::read_to_string(&result.config_path).unwrap();
 
         assert!(config_toml.contains("model = \"gpt-5.5\""));
-        assert!(config_toml.contains("model_reasoning_effort = \"max\""));
+        assert!(config_toml.contains("model_reasoning_effort = \"xhigh\""));
         assert!(config_toml.contains("model_context_window = 1000000"));
         assert!(config_toml.contains("model_auto_compact_token_limit = 900000"));
     }

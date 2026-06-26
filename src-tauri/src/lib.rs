@@ -21,8 +21,8 @@ use crate::{
     router::{match_route, match_route_for_provider, RouteMatch},
     store::AppStore,
     types::{
-        AppConfig, AppSnapshot, Provider, ProviderKind, ProviderProtocol, RequestLogPage, Settings,
-        TokenUsage,
+        AppConfig, AppSnapshot, ModelHealth, Provider, ProviderKind, ProviderProtocol,
+        RequestLogPage, Settings, TokenUsage,
     },
     usage::parse_usage,
 };
@@ -145,6 +145,15 @@ fn server_bind_settings_changed(previous: &Settings, next: &Settings) -> bool {
 #[tauri::command]
 async fn get_snapshot(store: tauri::State<'_, AppStore>) -> Result<AppSnapshot, String> {
     Ok(store.snapshot().await)
+}
+
+/// 健康页：每个模型从 DB 取最近 60 条请求的健康格子（不受 snapshot 小窗口限制）。
+#[tauri::command]
+async fn model_health(
+    store: tauri::State<'_, AppStore>,
+    models: Vec<String>,
+) -> Result<Vec<ModelHealth>, String> {
+    Ok(store.model_health(models, 60).await)
 }
 
 #[tauri::command]
@@ -1395,6 +1404,18 @@ fn pressure_test_request_shape(
             headers,
             json!({ "model": upstream_model, "prompt": prompt, "n": 1, "size": "1024x1024" }),
         ),
+        ProviderProtocol::GeminiImage => (
+            format!(
+                "{}/models/{}:generateContent",
+                base_url.trim_end_matches('/'),
+                upstream_model
+            ),
+            gemini_auth_headers(headers),
+            json!({
+                "contents": [{ "parts": [{ "text": prompt }] }],
+                "generationConfig": { "responseModalities": ["IMAGE"] }
+            }),
+        ),
     }
 }
 
@@ -1564,14 +1585,25 @@ async fn test_matched_model(
         .unwrap_or_default();
     // 图片协议测试：把生成图 base64 带回前端预览(小猫)。
     let image_preview = (mode == ModelTestMode::Image
-        || matched.provider.protocol == ProviderProtocol::OpenAiImages)
+        || matched.provider.protocol == ProviderProtocol::OpenAiImages
+        || matched.provider.protocol == ProviderProtocol::GeminiImage)
         .then(|| {
+            // OpenAI: data[0].b64_json；Gemini: candidates[0].content.parts[].inlineData.data
             value
-                .get("data")
-                .and_then(|data| data.as_array())
-                .and_then(|items| items.first())
-                .and_then(|item| item.get("b64_json"))
+                .pointer("/data/0/b64_json")
                 .and_then(|b64| b64.as_str())
+                .or_else(|| {
+                    value
+                        .pointer("/candidates/0/content/parts")
+                        .and_then(|parts| parts.as_array())
+                        .and_then(|parts| {
+                            parts.iter().find_map(|part| {
+                                part.pointer("/inlineData/data")
+                                    .or_else(|| part.pointer("/inline_data/data"))
+                                    .and_then(|b64| b64.as_str())
+                            })
+                        })
+                })
                 .map(|s| s.to_string())
         })
         .flatten();
@@ -1598,6 +1630,20 @@ async fn test_request_parts(
     let upstream = &matched.upstream_model;
     // 图片测试：任意模型都强制走 images/generations 画一张猫，验证是否支持画图。
     if mode == ModelTestMode::Image {
+        if matched.provider.protocol == ProviderProtocol::GeminiImage {
+            return Ok((
+                format!(
+                    "{}/models/{}:generateContent",
+                    base_url.trim_end_matches('/'),
+                    upstream
+                ),
+                gemini_auth_headers(headers),
+                json!({
+                    "contents": [{ "parts": [{ "text": "a cute cat" }] }],
+                    "generationConfig": { "responseModalities": ["IMAGE"] }
+                }),
+            ));
+        }
         return Ok((
             endpoint(&base_url, "images/generations"),
             headers,
@@ -1677,6 +1723,18 @@ async fn test_request_parts(
                 "prompt": "a cute cat",
                 "n": 1,
                 "size": "1024x1024"
+            }),
+        )),
+        ProviderProtocol::GeminiImage => Ok((
+            format!(
+                "{}/models/{}:generateContent",
+                base_url.trim_end_matches('/'),
+                upstream
+            ),
+            gemini_auth_headers(headers),
+            json!({
+                "contents": [{ "parts": [{ "text": "a cute cat" }] }],
+                "generationConfig": { "responseModalities": ["IMAGE"] }
             }),
         )),
     }
@@ -2017,7 +2075,40 @@ fn test_reply_from_value(protocol: &ProviderProtocol, value: &Value) -> String {
                 String::new()
             }
         }
+        ProviderProtocol::GeminiImage => {
+            let has_image = value
+                .pointer("/candidates/0/content/parts")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part.pointer("/inlineData/data").is_some()
+                            || part.pointer("/inline_data/data").is_some()
+                    })
+                });
+            if has_image {
+                "(image generated)".to_string()
+            } else {
+                String::new()
+            }
+        }
     }
+}
+
+/// 把含 `Authorization: Bearer KEY` 的 headers 转成 Gemini 的 `x-goog-api-key`。
+fn gemini_auth_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .map(|(key, value)| {
+            if key.eq_ignore_ascii_case("authorization") {
+                (
+                    "x-goog-api-key".to_string(),
+                    value.strip_prefix("Bearer ").unwrap_or(&value).to_string(),
+                )
+            } else {
+                (key, value)
+            }
+        })
+        .collect()
 }
 
 fn chat_reply_from_value(value: &Value) -> String {
@@ -2114,14 +2205,24 @@ async fn list_upstream_models(
         .find(|p| p.id == provider_id)
         .ok_or_else(|| "Provider not found".to_string())?;
 
+    let models = upstream_models_for(&store, provider).await?;
+    Ok(UpstreamModelList {
+        models,
+        error: None,
+    })
+}
+
+/// 拉取某个上游 provider 暴露的模型列表：OpenAI 官方走内置列表，其余 provider 真打 `/models`。
+/// `list_upstream_models` 命令和直连模式 apply（取第一个模型）都复用它。
+async fn upstream_models_for(
+    store: &AppStore,
+    provider: &Provider,
+) -> Result<Vec<UpstreamModel>, String> {
     if let Some(models) = openai_official_upstream_models(provider) {
-        return Ok(UpstreamModelList {
-            models,
-            error: None,
-        });
+        return Ok(models);
     }
     let default_client = default_http_client()?;
-    let client = client_for_provider(&store, &default_client, provider)?;
+    let client = client_for_provider(store, &default_client, provider)?;
 
     // Resolve base URL + auth headers per provider kind.
     let (base_url, headers, anthropic) = match &provider.kind {
@@ -2153,11 +2254,7 @@ async fn list_upstream_models(
         }
     };
 
-    let models = fetch_upstream_models(&client, &base_url, &headers, anthropic).await?;
-    Ok(UpstreamModelList {
-        models,
-        error: None,
-    })
+    fetch_upstream_models(&client, &base_url, &headers, anthropic).await
 }
 
 fn openai_official_upstream_models(
@@ -3706,6 +3803,7 @@ pub fn run() {
             get_model_test_status,
             cancel_model_test,
             list_upstream_models,
+            model_health,
             refresh_provider_usage,
             export_catalog,
             install_codex_config,

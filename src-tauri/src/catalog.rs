@@ -1,7 +1,8 @@
 use crate::{
     codex_alias,
     types::{
-        AppConfig, CodexInjectionMode, CodexSlotAssignment, ModelEntry, ProviderProtocol, Settings,
+        codex_catalog_reasoning_level, AppConfig, CodexInjectionMode, CodexSlotAssignment,
+        ModelEntry, ProviderProtocol, Settings,
     },
 };
 use serde_json::{json, Value};
@@ -214,8 +215,20 @@ impl CatalogModel {
 }
 
 fn catalog_model_to_codex_json(model: &CatalogModel) -> Value {
-    let supported_reasoning_levels = model
-        .supported_reasoning_levels
+    // Codex 最新版 catalog 不支持 max 档：把档位收敛到四档 [low, medium, high, xhigh]。
+    // Claude(anthropic)整体下移一档(请求转发时再上移回真实档)，其余协议仅收敛 max。
+    let anthropic = matches!(
+        model.provider_protocol,
+        Some(ProviderProtocol::AnthropicMessages)
+    );
+    let mut mapped_levels: Vec<&'static str> = Vec::new();
+    for level in &model.supported_reasoning_levels {
+        let mapped = codex_catalog_reasoning_level(level, anthropic);
+        if !mapped_levels.contains(&mapped) {
+            mapped_levels.push(mapped);
+        }
+    }
+    let supported_reasoning_levels = mapped_levels
         .iter()
         .map(|level| {
             json!({
@@ -227,7 +240,7 @@ fn catalog_model_to_codex_json(model: &CatalogModel) -> Value {
     let default_reasoning_level = if model.default_reasoning_level.trim().is_empty() {
         "medium"
     } else {
-        model.default_reasoning_level.as_str()
+        codex_catalog_reasoning_level(&model.default_reasoning_level, anthropic)
     };
 
     json!({
@@ -373,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_marks_claude_reasoning_supported_with_max() {
+    fn catalog_maps_claude_reasoning_to_four_levels_without_max() {
         let config = seeded_config();
         let catalog = catalog_json(&config);
         let claude = catalog["models"]
@@ -390,8 +403,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(claude["supports_reasoning_summaries"], true);
-        assert_eq!(claude["default_reasoning_level"], "max");
-        assert!(levels.contains(&"max"));
+        // Codex 最新版 catalog 不支持 max：Claude 下移一档(max→xhigh)，档位收敛为四档、无 max。
+        assert_eq!(claude["default_reasoning_level"], "xhigh");
+        assert_eq!(levels, ["low", "medium", "high", "xhigh"]);
+        assert!(!levels.contains(&"max"));
     }
 
     #[test]
@@ -449,7 +464,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(claude["slug"], "gpt-5.5");
-        assert_eq!(claude["default_reasoning_level"], "max");
+        assert_eq!(claude["default_reasoning_level"], "xhigh");
     }
 
     #[test]

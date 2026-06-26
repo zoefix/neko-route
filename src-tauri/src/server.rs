@@ -4,8 +4,8 @@ use crate::{
     router::{match_route, RouteMatch},
     store::{validate_bind_settings, AppStore},
     types::{
-        CodexInjectionMode, ContextBridgeDiagnostics, ModelEntry, Provider, ProviderKind,
-        ProviderProtocol, RequestRecord, Settings, TokenUsage,
+        claude_request_reasoning_effort, CodexInjectionMode, ContextBridgeDiagnostics, ModelEntry,
+        Provider, ProviderKind, ProviderProtocol, RequestRecord, Settings, TokenUsage,
     },
     usage::{parse_usage, usage_from_responses_text},
 };
@@ -81,6 +81,7 @@ struct RouteError {
     message: String,
     record_model: Option<String>,
     requested_model: Option<String>,
+    upstream_model: Option<String>,
     route_reason: Option<String>,
     provider_id: Option<String>,
     provider_name: Option<String>,
@@ -96,6 +97,7 @@ impl RouteError {
             message: redact(&message.into()),
             record_model: None,
             requested_model: None,
+            upstream_model: None,
             route_reason: None,
             provider_id: None,
             provider_name: None,
@@ -108,6 +110,7 @@ impl RouteError {
         self.record_model = Some(matched.model.id.clone());
         self.requested_model =
             (matched.model.id != matched.requested_model).then(|| matched.requested_model.clone());
+        self.upstream_model = Some(matched.upstream_model.clone());
         self.route_reason = Some(matched.route_reason.clone());
         self.provider_id = Some(matched.provider.id.clone());
         self.provider_name = Some(matched.provider.name.clone());
@@ -370,6 +373,7 @@ async fn responses(
                     started_at: Utc::now(),
                     model: String::new(),
                     requested_model: None,
+                    upstream_model: None,
                     route_reason: None,
                     provider_id: None,
                     provider_name: None,
@@ -417,6 +421,7 @@ async fn responses(
         status,
         record_model,
         requested_model,
+        upstream_model,
         route_reason,
         provider_id,
         provider_name,
@@ -429,6 +434,7 @@ async fn responses(
             response.status().as_u16(),
             matched.model.id.clone(),
             (matched.model.id != matched.requested_model).then(|| matched.requested_model.clone()),
+            Some(matched.upstream_model.clone()),
             Some(matched.route_reason.clone()),
             Some(matched.provider.id.clone()),
             Some(matched.provider.name.clone()),
@@ -441,6 +447,7 @@ async fn responses(
             error.status.as_u16(),
             error.record_model.clone().unwrap_or_else(|| model.clone()),
             error.requested_model.clone(),
+            error.upstream_model.clone(),
             error.route_reason.clone(),
             error.provider_id.clone(),
             error.provider_name.clone(),
@@ -452,6 +459,15 @@ async fn responses(
     };
     let stream_state = initial_stream_state(status, provider_protocol.as_ref(), streaming);
 
+    // 日志里的推理强度记录“实际发给上游的档位”：anthropic 会把 Codex 的四档上移回 Claude
+    // 真实档(xhigh→max 等)，这里同步上移，避免日志显示 xhigh 而实际跑的是 max。
+    let reasoning_effort = match provider_protocol.as_ref() {
+        Some(ProviderProtocol::AnthropicMessages) => {
+            reasoning_effort.map(|effort| claude_request_reasoning_effort(&effort).to_string())
+        }
+        _ => reasoning_effort,
+    };
+
     state
         .store
         .push_request(RequestRecord {
@@ -459,6 +475,7 @@ async fn responses(
             started_at: Utc::now(),
             model: record_model,
             requested_model,
+            upstream_model,
             route_reason,
             provider_id,
             provider_name,
@@ -530,9 +547,34 @@ async fn route_response(
         .map_err(|error| error.with_match(&matched))?;
         return Ok((response, matched, None, None));
     }
-    let matched = match_route(&config, &model).map_err(|message| {
-        RouteError::new(StatusCode::NOT_FOUND, "model_not_configured", message)
-    })?;
+    // 直连模式：不匹配 ModelEntry，直接透传到选定上游服务商。
+    let is_direct = config.settings.codex_injection_mode == CodexInjectionMode::DirectProvider
+        && config
+            .settings
+            .direct_provider_id
+            .as_deref()
+            .map(|id| !id.trim().is_empty())
+            .unwrap_or(false);
+    let mut matched = if is_direct {
+        direct_provider_match(&config, &model)?
+    } else {
+        match_route(&config, &model).map_err(|message| {
+            RouteError::new(StatusCode::NOT_FOUND, "model_not_configured", message)
+        })?
+    };
+    // 入站永远是 Codex 的 Responses 请求：在 body 被 move 进转发前先算请求画像（指令/工具/消息
+    // 特征 + 分类）。无条件计算，让 Claude（Anthropic 出站）的请求也能在日志显示分类 badge。
+    let request_profile = responses_request_profile(&body);
+    // 直连模式不做模型重定向；仅非直连时按分类覆盖路由（记忆 agent / 辅助）。
+    // 分类只看入站 body，故记忆/辅助 agent 即使因 gpt-5.x-mini 未配置而兜底到 Claude，也会被
+    // 重定向到 memory_model / aux_model（而不是停在兜底模型上）。
+    if !is_direct {
+        if let Some(override_match) =
+            responses_route_override(&config, Some(&request_profile), &body)
+        {
+            matched = override_match;
+        }
+    }
     let response_result: Result<
         (
             Response,
@@ -594,17 +636,234 @@ async fn route_response(
                 body["model"] = Value::String(matched.upstream_model.clone());
                 forward_anthropic(&state, &matched, body, request_id, &model).await
             }
-            ProviderProtocol::OpenAiImages => Err(RouteError::new(
+            ProviderProtocol::OpenAiImages | ProviderProtocol::GeminiImage => Err(RouteError::new(
                 StatusCode::BAD_REQUEST,
                 "image_model_not_routable",
                 "Image generation models are only used via /v1/images, not /v1/responses.",
             )),
         },
     };
-    let (response, usage, context_bridge) =
-        response_result.map_err(|error| error.with_match(&matched))?;
+    let (response, usage, context_bridge) = response_result.map_err(|error| {
+        let mut error = error.with_match(&matched);
+        error.context_bridge = merge_request_classification(error.context_bridge, &request_profile);
+        error
+    })?;
+
+    // 把入站请求分类（主对话/辅助/记忆增强）合并进 context_bridge：Anthropic 出站会带回截断/
+    // 压缩诊断，分类字段与之不重叠，合并后 Claude 请求也带上分类 badge。
+    let context_bridge = merge_request_classification(context_bridge, &request_profile);
 
     Ok((response, matched, usage, context_bridge))
+}
+
+/// 把入站 Codex 请求的分类画像合并进最终 context_bridge：Anthropic 出站会带回截断/压缩诊断，
+/// 这里补上不重叠的分类字段（request_kind 等）；Responses/chat 出站无诊断则直接用画像。
+fn merge_request_classification(
+    base: Option<ContextBridgeDiagnostics>,
+    profile: &ContextBridgeDiagnostics,
+) -> Option<ContextBridgeDiagnostics> {
+    match base {
+        Some(mut diag) => {
+            diag.request_kind = profile.request_kind.clone();
+            diag.instructions_preview = profile.instructions_preview.clone();
+            diag.instructions_length = profile.instructions_length;
+            diag.tool_count = profile.tool_count;
+            diag.tool_names = profile.tool_names.clone();
+            diag.input_message_count = profile.input_message_count;
+            diag.max_output_tokens = profile.max_output_tokens;
+            Some(diag)
+        }
+        None => Some(profile.clone()),
+    }
+}
+
+const RESP_PROFILE_PREVIEW_CHARS: usize = 160;
+const RESP_PROFILE_MAX_TOOL_NAMES: usize = 8;
+const RESP_MAIN_TOOL_COUNT_THRESHOLD: u64 = 4;
+const RESP_MAIN_INSTRUCTIONS_LEN_THRESHOLD: u64 = 600;
+
+/// 粗分类：主编码对话 vs 内部辅助。tool_count 为主信号，边界用 instructions 长度兜底。
+fn classify_responses_request(tool_count: u64, instructions_length: u64) -> &'static str {
+    if tool_count >= RESP_MAIN_TOOL_COUNT_THRESHOLD {
+        return "main_coding";
+    }
+    if tool_count == 0 {
+        return "auxiliary";
+    }
+    if instructions_length >= RESP_MAIN_INSTRUCTIONS_LEN_THRESHOLD {
+        "main_coding"
+    } else {
+        "auxiliary"
+    }
+}
+
+/// 从 OpenAI Responses 入站 body 提取请求画像（指令摘要、工具、消息数等），并粗分类。
+fn responses_request_profile(body: &Value) -> ContextBridgeDiagnostics {
+    let instructions = body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let instructions_length = instructions.chars().count() as u64;
+    let instructions_preview = (!instructions.is_empty()).then(|| {
+        instructions
+            .chars()
+            .take(RESP_PROFILE_PREVIEW_CHARS)
+            .collect::<String>()
+    });
+
+    let tools = body.get("tools").and_then(Value::as_array);
+    let tool_count = tools.map(|t| t.len() as u64).unwrap_or(0);
+    let tool_names = tools
+        .map(|t| {
+            t.iter()
+                .filter_map(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .or_else(|| tool.pointer("/function/name").and_then(Value::as_str))
+                })
+                .take(RESP_PROFILE_MAX_TOOL_NAMES)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let input_message_count = match body.get("input") {
+        Some(Value::Array(items)) => items.len() as u64,
+        Some(Value::String(_)) => 1,
+        _ => 0,
+    };
+    let max_output_tokens = body.get("max_output_tokens").and_then(Value::as_u64);
+
+    // 记忆写入 agent 优先识别为独立分类（记忆增强），否则粗分主对话/辅助。
+    let request_kind = if is_memory_agent_request(body) {
+        "memory_agent"
+    } else {
+        classify_responses_request(tool_count, instructions_length)
+    };
+
+    ContextBridgeDiagnostics {
+        request_kind: Some(request_kind.to_string()),
+        instructions_preview,
+        instructions_length,
+        tool_count,
+        tool_names,
+        input_message_count,
+        max_output_tokens,
+        ..Default::default()
+    }
+}
+
+/// 请求指令含 "Memory Writing Agent" → 判定为 Codex 记忆写入辅助任务。
+fn is_memory_agent_request(body: &Value) -> bool {
+    body.get("instructions")
+        .and_then(Value::as_str)
+        .map(|text| text.contains("Memory Writing Agent"))
+        .unwrap_or(false)
+}
+
+/// 按请求分类覆盖路由：记忆 agent → memory_model，其他内部辅助 → aux_model。
+/// 入站永远是 Codex 的 Responses 请求，分类只看入站 body，故不论初始路由到哪个出站（含因
+/// gpt-5.x-mini 未配置而兜底到 Claude）都按分类重定向；主对话/未配置时返回 None。
+fn responses_route_override(
+    config: &crate::types::AppConfig,
+    profile: Option<&ContextBridgeDiagnostics>,
+    body: &Value,
+) -> Option<RouteMatch> {
+    // 记忆 agent 精确检测优先。
+    if is_memory_agent_request(body) {
+        if let Some(id) = config
+            .settings
+            .memory_model
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            if let Ok(mut m) = match_route(config, id) {
+                m.route_reason = "memory_agent".into();
+                return Some(m);
+            }
+        }
+    }
+    // 其他内部辅助请求。
+    let is_aux = profile.and_then(|p| p.request_kind.as_deref()) == Some("auxiliary");
+    if is_aux {
+        if let Some(id) = config
+            .settings
+            .aux_model
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            if let Ok(mut m) = match_route(config, id) {
+                m.route_reason = "auxiliary".into();
+                return Some(m);
+            }
+        }
+    }
+    None
+}
+
+/// 直连模式：用 direct_provider_id 找 provider，合成一个把请求原始 model 透传到该上游的 RouteMatch。
+fn direct_provider_match(
+    config: &crate::types::AppConfig,
+    model: &str,
+) -> Result<RouteMatch, RouteError> {
+    let provider_id = config
+        .settings
+        .direct_provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            RouteError::new(
+                StatusCode::BAD_REQUEST,
+                "direct_provider_unset",
+                "Direct mode is on but no upstream provider is selected.",
+            )
+        })?;
+    let provider = config
+        .providers
+        .iter()
+        .find(|p| p.id == provider_id)
+        .cloned()
+        .ok_or_else(|| {
+            RouteError::new(
+                StatusCode::NOT_FOUND,
+                "direct_provider_missing",
+                "Selected upstream provider was not found.",
+            )
+        })?;
+    let model_name = if model.trim().is_empty() {
+        "gpt-5".to_string()
+    } else {
+        model.to_string()
+    };
+    let synthetic = crate::types::ModelEntry {
+        id: model_name.clone(),
+        display_name: model_name.clone(),
+        description: String::new(),
+        context_window: 0,
+        enabled: true,
+        provider_id: provider.id.clone(),
+        upstream_model: Some(model_name.clone()),
+        timeout_ms: 0,
+        retry_count: 0,
+        reasoning_enabled: false,
+        default_reasoning_level: String::new(),
+        supported_reasoning_levels: Vec::new(),
+        codex_alias: None,
+        image_generation: false,
+        image_quality: None,
+        image_capable: false,
+    };
+    Ok(RouteMatch {
+        timeout_ms: synthetic.timeout_ms,
+        retry_count: synthetic.retry_count,
+        upstream_model: model_name.clone(),
+        model: synthetic,
+        provider,
+        requested_model: model_name,
+        route_reason: "direct_provider".to_string(),
+        locked_from_model: None,
+    })
 }
 
 async fn images_generations(
@@ -617,6 +876,82 @@ async fn images_generations(
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
+}
+
+/// 画图 provider 的认证 + base_url，与测试路径(test_provider_upstream)一致：
+/// OpenAI 官方客户端/账号用官方凭证(codex/OAuth)，其余用 key_store Bearer。
+async fn image_provider_auth(
+    state: &ServerState,
+    client: &reqwest::Client,
+    provider: &Provider,
+) -> Result<(String, Vec<(String, String)>), RouteError> {
+    match provider.kind {
+        ProviderKind::OfficialOpenAi => {
+            let auth = official_auth::auth_for_codex_openai(client)
+                .await
+                .map_err(|_| {
+                    RouteError::new(
+                        StatusCode::UNAUTHORIZED,
+                        "needs_codex_auth",
+                        "Codex OpenAI authentication is required for image generation.",
+                    )
+                })?;
+            Ok((auth.base_url, auth.headers))
+        }
+        ProviderKind::OfficialOpenAiAccount => {
+            let auth = official_auth::auth_for_provider(client, provider)
+                .await
+                .map_err(|message| {
+                    RouteError::new(StatusCode::UNAUTHORIZED, "missing_official_auth", message)
+                })?;
+            Ok((auth.base_url, auth.headers))
+        }
+        _ => {
+            let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
+            if let Some(key_ref) = provider.key_ref.as_deref() {
+                let secret = state
+                    .store
+                    .key_store()
+                    .get_secret(key_ref)
+                    .map_err(|message| {
+                        RouteError::new(
+                            StatusCode::FAILED_DEPENDENCY,
+                            "key_store_unavailable",
+                            message,
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        RouteError::new(
+                            StatusCode::UNAUTHORIZED,
+                            "missing_provider_key",
+                            format!(
+                                "Provider '{}' needs an API key in local storage",
+                                provider.name
+                            ),
+                        )
+                    })?;
+                headers.push(("authorization".to_string(), format!("Bearer {secret}")));
+            }
+            Ok((provider.base_url.clone(), headers))
+        }
+    }
+}
+
+/// 把含 Authorization Bearer 的 headers 转成 Gemini 的 x-goog-api-key。
+fn gemini_image_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .map(|(key, value)| {
+            if key.eq_ignore_ascii_case("authorization") {
+                (
+                    "x-goog-api-key".to_string(),
+                    value.strip_prefix("Bearer ").unwrap_or(&value).to_string(),
+                )
+            } else {
+                (key, value)
+            }
+        })
+        .collect()
 }
 
 /// 把 `/v1/images/generations` 请求转发到「image_gen 模型」配置的画图 provider。
@@ -677,7 +1012,7 @@ async fn forward_images_generations(
         .as_deref()
         .unwrap_or(model.id.as_str())
         .to_string();
-    body["model"] = Value::String(upstream);
+    body["model"] = Value::String(upstream.clone());
     // 请求没传 quality 且模型配了 image_quality → 注入(low/medium/high)。
     if body.get("quality").is_none() {
         if let Some(quality) = model
@@ -693,7 +1028,13 @@ async fn forward_images_generations(
         .get("quality")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let out_bytes = serde_json::to_vec(&body)
+    let is_gemini = provider.protocol == ProviderProtocol::GeminiImage;
+    let request_body = if is_gemini {
+        openai_image_req_to_gemini(&body, None)
+    } else {
+        body
+    };
+    let out_bytes = serde_json::to_vec(&request_body)
         .map(Bytes::from)
         .map_err(|error| {
             RouteError::new(
@@ -703,33 +1044,21 @@ async fn forward_images_generations(
             )
         })?;
 
-    let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
-    if let Some(key_ref) = provider.key_ref.as_deref() {
-        let secret = state
-            .store
-            .key_store()
-            .get_secret(key_ref)
-            .map_err(|message| {
-                RouteError::new(
-                    StatusCode::FAILED_DEPENDENCY,
-                    "key_store_unavailable",
-                    message,
-                )
-            })?
-            .ok_or_else(|| {
-                RouteError::new(
-                    StatusCode::UNAUTHORIZED,
-                    "missing_provider_key",
-                    format!(
-                        "Provider '{}' needs an API key in local storage",
-                        provider.name
-                    ),
-                )
-            })?;
-        headers.push(("authorization".to_string(), format!("Bearer {secret}")));
+    // 认证 + base_url 与测试路径一致(官方账号用官方凭证，自定义用 key)，避免 401。
+    let (auth_base_url, mut headers) = image_provider_auth(state, &client, provider).await?;
+    if is_gemini {
+        headers = gemini_image_headers(headers);
     }
 
-    let url = endpoint(&provider.base_url, "images/generations");
+    let url = if is_gemini {
+        format!(
+            "{}/models/{}:generateContent",
+            auth_base_url.trim_end_matches('/'),
+            upstream
+        )
+    } else {
+        endpoint(&auth_base_url, "images/generations")
+    };
     let request_id = Uuid::new_v4().to_string();
     let started = std::time::Instant::now();
     let upstream = post_bytes_with_retries(&client, &url, headers, out_bytes, 0, 0).await?;
@@ -747,6 +1076,17 @@ async fn forward_images_generations(
             error.to_string(),
         )
     })?;
+    // Gemini 响应(candidates.inlineData)转成 OpenAI Images 格式，让 skill 统一解析。
+    let resp_bytes = if is_gemini && status.is_success() {
+        Bytes::from(gemini_image_resp_to_openai(&resp_bytes))
+    } else {
+        resp_bytes
+    };
+    let content_type = if is_gemini && status.is_success() {
+        "application/json".to_string()
+    } else {
+        content_type
+    };
     let usage = serde_json::from_slice::<Value>(&resp_bytes)
         .ok()
         .and_then(|value| value.get("usage").cloned())
@@ -772,10 +1112,11 @@ async fn forward_images_generations(
             started_at: Utc::now(),
             model: model.id.clone(),
             requested_model: None,
+            upstream_model: model.upstream_model.clone(),
             route_reason: Some("image_gen".into()),
             provider_id: Some(provider.id.clone()),
             provider_name: Some(provider.name.clone()),
-            provider_protocol: Some(ProviderProtocol::OpenAiImages),
+            provider_protocol: Some(provider.protocol.clone()),
             status: status.as_u16(),
             latency_ms: started.elapsed().as_millis(),
             streaming: false,
@@ -874,50 +1215,99 @@ async fn forward_images_edits(
         .as_deref()
         .unwrap_or(model.id.as_str())
         .to_string();
-    let body_bytes = match content_type.split("boundary=").nth(1) {
-        Some(raw) => {
-            let boundary = raw
-                .split(';')
+    let is_gemini = provider.protocol == ProviderProtocol::GeminiImage;
+    // codex backend(chatgpt) 的图片端点只收 JSON、不认 multipart，编辑需转成 JSON。
+    let is_codex_backend = matches!(
+        provider.kind,
+        ProviderKind::OfficialOpenAi | ProviderKind::OfficialOpenAiAccount
+    );
+    let boundary = content_type
+        .split("boundary=")
+        .nth(1)
+        .map(|raw| {
+            raw.split(';')
                 .next()
                 .unwrap_or(raw)
                 .trim()
-                .trim_matches('"');
-            Bytes::from(inject_multipart_field(
-                &body_bytes,
-                boundary,
-                "model",
-                &upstream_model,
-            ))
-        }
-        None => body_bytes,
-    };
-    let mut headers = vec![("content-type".to_string(), content_type)];
-    if let Some(key_ref) = provider.key_ref.as_deref() {
-        let secret = state
-            .store
-            .key_store()
-            .get_secret(key_ref)
-            .map_err(|message| {
-                RouteError::new(
-                    StatusCode::FAILED_DEPENDENCY,
-                    "key_store_unavailable",
-                    message,
-                )
-            })?
+                .trim_matches('"')
+                .to_string()
+        })
+        .unwrap_or_default();
+    let (body_bytes, content_type) = if is_gemini {
+        // multipart 原图 + prompt → Gemini inlineData 编辑请求(JSON)。
+        let gemini_body = parse_multipart_image_edit(&body_bytes, &boundary)
+            .map(|(prompt, mime, image)| {
+                let b64 = BASE64_STANDARD.encode(&image);
+                openai_image_req_to_gemini(&json!({ "prompt": prompt }), Some((&mime, &b64)))
+            })
             .ok_or_else(|| {
                 RouteError::new(
-                    StatusCode::UNAUTHORIZED,
-                    "missing_provider_key",
-                    format!(
-                        "Provider '{}' needs an API key in local storage",
-                        provider.name
-                    ),
+                    StatusCode::BAD_REQUEST,
+                    "invalid_image_edit",
+                    "Could not parse image edit multipart body.",
                 )
             })?;
-        headers.push(("authorization".to_string(), format!("Bearer {secret}")));
+        (
+            Bytes::from(serde_json::to_vec(&gemini_body).unwrap_or_default()),
+            "application/json".to_string(),
+        )
+    } else if is_codex_backend {
+        // codex backend 不收 multipart：解析原图+prompt → OpenAI images edits 的 JSON。
+        let json_body = parse_multipart_image_edit(&body_bytes, &boundary)
+            .map(|(prompt, mime, image)| {
+                let b64 = BASE64_STANDARD.encode(&image);
+                json!({
+                    "model": upstream_model,
+                    "prompt": prompt,
+                    "images": [{
+                        "image_url": format!("data:{mime};base64,{b64}"),
+                    }],
+                })
+            })
+            .ok_or_else(|| {
+                RouteError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_image_edit",
+                    "Could not parse image edit multipart body.",
+                )
+            })?;
+        (
+            Bytes::from(serde_json::to_vec(&json_body).unwrap_or_default()),
+            "application/json".to_string(),
+        )
+    } else if boundary.is_empty() {
+        (body_bytes, content_type)
+    } else {
+        (
+            Bytes::from(inject_multipart_field(
+                &body_bytes,
+                &boundary,
+                "model",
+                &upstream_model,
+            )),
+            content_type,
+        )
+    };
+    // 认证 + base_url 与测试路径一致(官方账号用官方凭证)；保留编辑请求自己的 content-type。
+    let (auth_base_url, auth_headers) = image_provider_auth(state, &client, provider).await?;
+    let mut headers: Vec<(String, String)> = auth_headers
+        .into_iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("content-type"))
+        .collect();
+    headers.push(("content-type".to_string(), content_type));
+    if is_gemini {
+        headers = gemini_image_headers(headers);
     }
 
-    let url = endpoint(&provider.base_url, "images/edits");
+    let url = if is_gemini {
+        format!(
+            "{}/models/{}:generateContent",
+            auth_base_url.trim_end_matches('/'),
+            upstream_model
+        )
+    } else {
+        endpoint(&auth_base_url, "images/edits")
+    };
     let request_id = Uuid::new_v4().to_string();
     let started = std::time::Instant::now();
     let upstream = post_bytes_with_retries(&client, &url, headers, body_bytes, 0, 0).await?;
@@ -935,6 +1325,17 @@ async fn forward_images_edits(
             error.to_string(),
         )
     })?;
+    // Gemini 编辑响应转成 OpenAI Images 格式给 skill。
+    let resp_bytes = if is_gemini && status.is_success() {
+        Bytes::from(gemini_image_resp_to_openai(&resp_bytes))
+    } else {
+        resp_bytes
+    };
+    let resp_content_type = if is_gemini && status.is_success() {
+        "application/json".to_string()
+    } else {
+        resp_content_type
+    };
     let usage = serde_json::from_slice::<Value>(&resp_bytes)
         .ok()
         .and_then(|value| value.get("usage").cloned())
@@ -960,10 +1361,11 @@ async fn forward_images_edits(
             started_at: Utc::now(),
             model: model.id.clone(),
             requested_model: None,
+            upstream_model: model.upstream_model.clone(),
             route_reason: Some("image_edit".into()),
             provider_id: Some(provider.id.clone()),
             provider_name: Some(provider.name.clone()),
-            provider_protocol: Some(ProviderProtocol::OpenAiImages),
+            provider_protocol: Some(provider.protocol.clone()),
             status: status.as_u16(),
             latency_ms: started.elapsed().as_millis(),
             streaming: false,
@@ -993,6 +1395,54 @@ async fn forward_images_edits(
         })
 }
 
+/// OpenAI Images 请求 {prompt,...} → Gemini `generateContent` 请求体。
+/// 传 `edit_image`(mime, base64) 则附带原图做图生图编辑。
+fn openai_image_req_to_gemini(body: &Value, edit_image: Option<(&str, &str)>) -> Value {
+    let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("");
+    let mut parts = vec![json!({ "text": prompt })];
+    if let Some((mime, data)) = edit_image {
+        parts.push(json!({ "inlineData": { "mimeType": mime, "data": data } }));
+    }
+    json!({
+        "contents": [{ "parts": parts }],
+        "generationConfig": { "responseModalities": ["IMAGE"] }
+    })
+}
+
+/// Gemini `generateContent` 响应 → OpenAI Images 响应 {data:[{b64_json}]}，统一给 skill 解析。
+fn gemini_image_resp_to_openai(gemini_bytes: &[u8]) -> Vec<u8> {
+    let Ok(value) = serde_json::from_slice::<Value>(gemini_bytes) else {
+        return gemini_bytes.to_vec();
+    };
+    let data: Vec<Value> = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .map(|candidates| {
+            candidates
+                .iter()
+                .filter_map(|candidate| {
+                    candidate
+                        .pointer("/content/parts")?
+                        .as_array()?
+                        .iter()
+                        .find_map(|part| {
+                            part.pointer("/inlineData/data")
+                                .or_else(|| part.pointer("/inline_data/data"))
+                                .and_then(Value::as_str)
+                        })
+                        .map(|b64| json!({ "b64_json": b64 }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let out = json!({
+        "created": Utc::now().timestamp(),
+        "data": data,
+        "usage": value.get("usageMetadata").cloned().unwrap_or_else(|| json!({})),
+    });
+    serde_json::to_vec(&out).unwrap_or_else(|_| gemini_bytes.to_vec())
+}
+
 /// 从画图响应 JSON 取第一张图的 base64(`data[0].b64_json`)。
 fn extract_image_b64(resp_bytes: &[u8]) -> Option<String> {
     serde_json::from_slice::<Value>(resp_bytes)
@@ -1003,6 +1453,52 @@ fn extract_image_b64(resp_bytes: &[u8]) -> Option<String> {
         .get("b64_json")?
         .as_str()
         .map(str::to_string)
+}
+
+/// 从 `/v1/images/edits` 的 multipart body 里解析出 (prompt, 原图 mime, 原图字节)。
+/// 供 Gemini 编辑分支把原图转成 inlineData。
+fn parse_multipart_image_edit(body: &[u8], boundary: &str) -> Option<(String, String, Vec<u8>)> {
+    let sep = format!("--{boundary}");
+    let sep_bytes = sep.as_bytes();
+    let mut prompt = String::new();
+    let mut image: Option<(String, Vec<u8>)> = None;
+    let mut cursor = 0usize;
+    while cursor < body.len() {
+        let Some(rel) = body[cursor..]
+            .windows(sep_bytes.len())
+            .position(|window| window == sep_bytes)
+        else {
+            break;
+        };
+        let part_start = cursor + rel + sep_bytes.len();
+        let part_end = body[part_start..]
+            .windows(sep_bytes.len())
+            .position(|window| window == sep_bytes)
+            .map(|pos| part_start + pos)
+            .unwrap_or(body.len());
+        let part = &body[part_start..part_end];
+        cursor = part_end;
+        let Some(hpos) = part.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let header = String::from_utf8_lossy(&part[..hpos]);
+        let mut data = &part[hpos + 4..];
+        while data.ends_with(b"\r\n") {
+            data = &data[..data.len() - 2];
+        }
+        if header.contains("name=\"prompt\"") {
+            prompt = String::from_utf8_lossy(data).trim().to_string();
+        } else if header.contains("name=\"image\"") {
+            let mime = header
+                .lines()
+                .find(|line| line.to_ascii_lowercase().starts_with("content-type:"))
+                .and_then(|line| line.split(':').nth(1))
+                .map(|mime| mime.trim().to_string())
+                .unwrap_or_else(|| "image/png".to_string());
+            image = Some((mime, data.to_vec()));
+        }
+    }
+    image.map(|(mime, data)| (prompt, mime, data))
 }
 
 /// 在 multipart body 末尾(closing boundary 前)插入一个文本 field。
@@ -1056,6 +1552,7 @@ fn lan_route_match(
             codex_alias: None,
             image_generation: false,
             image_quality: None,
+            image_capable: false,
         },
         provider: Provider {
             id: "lan-share".into(),
@@ -4227,7 +4724,7 @@ fn extract_stream_delta(protocol: &ProviderProtocol, data: &str) -> Option<Strin
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        ProviderProtocol::OpenAiImages => None,
+        ProviderProtocol::OpenAiImages | ProviderProtocol::GeminiImage => None,
     }
 }
 
@@ -4277,8 +4774,10 @@ pub(crate) fn build_anthropic_body(request: &Value, upstream_model: &str, stream
         body["tools"] = Value::Array(tools);
     }
 
-    // effort 跟随 Codex 请求的推理档位；Codex 未指定时保留 Claude Code 默认的 max。
-    let effort = map_reasoning_effort(request).unwrap_or("max");
+    // effort 跟随 Codex 请求的推理档位，并上移回 Claude 的真实档：Codex 最新版 catalog 只暴露
+    // 四档(无 max)，这里把 xhigh→max / high→xhigh / medium→high / low→medium 还原；
+    // Codex 未指定时按最高档 xhigh→max。
+    let effort = claude_request_reasoning_effort(map_reasoning_effort(request).unwrap_or("xhigh"));
     body["thinking"] = json!({ "type": "adaptive" });
     body["output_config"] = json!({ "effort": effort });
     body["max_tokens"] = json!(max_tokens);
@@ -6261,22 +6760,25 @@ mod tests {
         build_chat_completions_body_with_profile, chat_body_without_response_format,
         chat_completion_output_items, chat_completion_response_json,
         chat_completions_compatibility_profile, chat_reasoning_content_from_input_item,
-        chat_tool_call_deltas, classify_raw_stream_finish, claude_code_mirror_headers,
-        context_bridge_diagnostics, converted_anthropic_sse, converted_chat_sse, endpoint,
+        chat_tool_call_deltas, classify_raw_stream_finish, classify_responses_request,
+        claude_code_mirror_headers, claude_request_reasoning_effort, context_bridge_diagnostics,
+        converted_anthropic_sse, converted_chat_sse, direct_provider_match, endpoint,
         event_data_lines, extract_stream_delta, find_sse_boundary, forward_chat_completions,
         forward_responses_proxy, is_public_openai_api_key, json_size, lan_proxy_request_headers,
-        map_openai_chat_reasoning_effort, map_reasoning_effort, official_responses_endpoint,
-        post_bytes_with_retries, proxy_lan_models, proxy_raw, proxy_request_headers,
-        response_stream_done_events, response_stream_start_events, responses_proxy_body,
-        responses_proxy_url, route_response, should_retry_chat_without_response_format,
+        map_openai_chat_reasoning_effort, map_reasoning_effort, merge_request_classification,
+        official_responses_endpoint, post_bytes_with_retries, proxy_lan_models, proxy_raw,
+        proxy_request_headers, response_stream_done_events, response_stream_start_events,
+        responses_proxy_body, responses_proxy_url, responses_request_profile,
+        responses_route_override, route_response, should_retry_chat_without_response_format,
         should_skip_proxy_request_header, validate_lan_authorization,
         ChatCompletionsCompatibilityProfile, RawProxyContext, RawSseObserver, ResponsesAuthMode,
         RouteError, ServerState, CLAUDE_DESKTOP_MESSAGES_BETA, RESPONSES_BODY_LIMIT_BYTES,
     };
     use super::{
         append_anthropic_betas, build_context_management, context_management_edit_names,
-        extract_applied_edits, extract_compaction_summary, inject_compaction_block,
-        inject_multipart_field, is_strong_context_key, truncate_tool_result_with_marker,
+        extract_applied_edits, extract_compaction_summary, gemini_image_resp_to_openai,
+        inject_compaction_block, inject_multipart_field, is_strong_context_key,
+        openai_image_req_to_gemini, parse_multipart_image_edit, truncate_tool_result_with_marker,
         truncate_tool_results_in_body,
     };
     use crate::{
@@ -6303,6 +6805,178 @@ mod tests {
             Arc, Mutex,
         },
     };
+
+    #[test]
+    fn responses_profile_main_coding_with_full_toolset() {
+        let body = json!({
+            "instructions": "You are Codex, a coding agent.",
+            "tools": [
+                {"name": "shell"}, {"name": "apply_patch"}, {"name": "update_plan"},
+                {"name": "read_file"}, {"name": "web_search"}
+            ],
+            "input": [{"role": "user", "content": "fix the bug"}],
+            "max_output_tokens": 64000
+        });
+        let profile = responses_request_profile(&body);
+        assert_eq!(profile.request_kind.as_deref(), Some("main_coding"));
+        assert_eq!(profile.tool_count, 5);
+        assert_eq!(profile.tool_names.len(), 5);
+        assert_eq!(profile.input_message_count, 1);
+        assert_eq!(profile.max_output_tokens, Some(64000));
+    }
+
+    #[test]
+    fn responses_profile_auxiliary_without_tools() {
+        let body = json!({
+            "instructions": "Summarize the following conversation.",
+            "input": [{"role": "user", "content": "..."}],
+            "max_output_tokens": 1024
+        });
+        let profile = responses_request_profile(&body);
+        assert_eq!(profile.request_kind.as_deref(), Some("auxiliary"));
+        assert_eq!(profile.tool_count, 0);
+    }
+
+    #[test]
+    fn responses_profile_detects_memory_agent() {
+        let body = json!({
+            "instructions": "## Memory Writing Agent: Phase 1 — convert rollouts into memories.",
+            "input": [{"role": "user", "content": "..."}],
+        });
+        let profile = responses_request_profile(&body);
+        // 记忆写入 agent 优先识别为独立分类，覆盖主对话/辅助粗分类。
+        assert_eq!(profile.request_kind.as_deref(), Some("memory_agent"));
+    }
+
+    #[test]
+    fn merge_request_classification_adds_kind_to_anthropic_diag() {
+        let profile = responses_request_profile(&json!({
+            "instructions": "## Memory Writing Agent",
+            "input": []
+        }));
+        // 模拟 Claude（Anthropic 出站）返回的截断诊断：带 original_body_bytes、不含分类字段。
+        let anthropic_diag = ContextBridgeDiagnostics {
+            original_body_bytes: 12345,
+            ..Default::default()
+        };
+        let merged = merge_request_classification(Some(anthropic_diag), &profile).unwrap();
+        // 分类被补上，让 Claude 请求也显示 badge。
+        assert_eq!(merged.request_kind.as_deref(), Some("memory_agent"));
+        // 原有截断诊断字段保留、不被覆盖。
+        assert_eq!(merged.original_body_bytes, 12345);
+    }
+
+    #[test]
+    fn memory_agent_redirects_to_memory_model_even_when_fallback_is_claude() {
+        let mut config = seeded_config();
+        // 增强记忆模型设为 gpt-5.5。
+        config.settings.memory_model = Some("gpt-5.5".into());
+        let body = json!({
+            "instructions": "## Memory Writing Agent: Phase 1 — convert rollouts into memories.",
+            "input": []
+        });
+        // 记忆 agent 的 model(gpt-5.4-mini)未配置本会兜底到默认/Claude；分类只看入站 body，
+        // 故应重定向到 memory_model，而不是停在兜底模型上。
+        let matched = responses_route_override(&config, None, &body)
+            .expect("memory agent should redirect to memory_model");
+        assert_eq!(matched.route_reason, "memory_agent");
+        assert_eq!(matched.model.id, "gpt-5.5");
+
+        // 未配 memory_model 时不重定向（保持原路由/兜底）。
+        config.settings.memory_model = None;
+        assert!(responses_route_override(&config, None, &body).is_none());
+    }
+
+    #[test]
+    fn classify_boundary_uses_instructions_length() {
+        // 1..4 个工具时：长指令判主对话、短指令判辅助。
+        assert_eq!(classify_responses_request(2, 1200), "main_coding");
+        assert_eq!(classify_responses_request(2, 80), "auxiliary");
+    }
+
+    #[test]
+    fn responses_profile_input_as_bare_string() {
+        let body = json!({ "instructions": "", "input": "hello" });
+        let profile = responses_request_profile(&body);
+        assert_eq!(profile.input_message_count, 1);
+        assert_eq!(profile.tool_count, 0);
+        assert!(profile.instructions_preview.is_none());
+    }
+
+    #[test]
+    fn context_bridge_deserializes_without_new_fields() {
+        // 旧记录(无新字段)仍能反序列化，新字段走 default。
+        let old = r#"{"original_body_bytes":10,"tool_result_count":2}"#;
+        let parsed: ContextBridgeDiagnostics = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.original_body_bytes, 10);
+        assert!(parsed.request_kind.is_none());
+        assert_eq!(parsed.tool_count, 0);
+    }
+
+    #[test]
+    fn openai_image_req_to_gemini_text_to_image() {
+        let gemini = openai_image_req_to_gemini(&json!({ "prompt": "a cat", "n": 1 }), None);
+        assert_eq!(
+            gemini
+                .pointer("/contents/0/parts/0/text")
+                .and_then(Value::as_str),
+            Some("a cat")
+        );
+        assert_eq!(
+            gemini
+                .pointer("/generationConfig/responseModalities/0")
+                .and_then(Value::as_str),
+            Some("IMAGE")
+        );
+    }
+
+    #[test]
+    fn openai_image_req_to_gemini_edit_attaches_image() {
+        let gemini = openai_image_req_to_gemini(
+            &json!({ "prompt": "make it blue" }),
+            Some(("image/png", "BASE64")),
+        );
+        let parts = gemini
+            .pointer("/contents/0/parts")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[1].pointer("/inlineData/data").and_then(Value::as_str),
+            Some("BASE64")
+        );
+        assert_eq!(
+            parts[1]
+                .pointer("/inlineData/mimeType")
+                .and_then(Value::as_str),
+            Some("image/png")
+        );
+    }
+
+    #[test]
+    fn gemini_image_resp_to_openai_extracts_b64() {
+        let gemini = serde_json::to_vec(&json!({
+            "candidates": [{ "content": { "parts": [{ "inlineData": { "mimeType": "image/png", "data": "ABC123" } }] } }]
+        }))
+        .unwrap();
+        let openai: Value = serde_json::from_slice(&gemini_image_resp_to_openai(&gemini)).unwrap();
+        assert_eq!(
+            openai.pointer("/data/0/b64_json").and_then(Value::as_str),
+            Some("ABC123")
+        );
+    }
+
+    #[test]
+    fn parse_multipart_image_edit_extracts_prompt_and_image() {
+        let boundary = "----neko";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nmake it blue\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nimg\r\n--{boundary}--\r\n"
+        );
+        let (prompt, mime, image) = parse_multipart_image_edit(body.as_bytes(), boundary).unwrap();
+        assert_eq!(prompt, "make it blue");
+        assert_eq!(mime, "image/png");
+        assert_eq!(image, b"img".to_vec());
+    }
 
     #[test]
     fn inject_multipart_field_adds_missing_model() {
@@ -6518,6 +7192,31 @@ mod tests {
         apply_image_gen_override(&mut body, &config);
         assert_eq!(body["tools"][1]["model"], json!(expected));
         assert!(body["tools"][0].get("model").is_none());
+    }
+
+    #[test]
+    fn direct_provider_match_passes_request_model_through() {
+        let mut config = seeded_config();
+        let pid = config.providers[0].id.clone();
+        config.settings.direct_provider_id = Some(pid.clone());
+        let matched = direct_provider_match(&config, "gpt-5.5-codex").unwrap();
+        // 请求的原始 model 原样透传到上游，provider 用选定的，reason 标记直连。
+        assert_eq!(matched.upstream_model, "gpt-5.5-codex");
+        assert_eq!(matched.requested_model, "gpt-5.5-codex");
+        assert_eq!(matched.model.id, "gpt-5.5-codex");
+        assert_eq!(matched.provider.id, pid);
+        assert_eq!(matched.route_reason, "direct_provider");
+    }
+
+    #[test]
+    fn direct_provider_match_errors_when_unset_or_missing() {
+        // 未配 direct_provider_id → 报错
+        let config = seeded_config();
+        assert!(direct_provider_match(&config, "gpt-5.5").is_err());
+        // 配了不存在的 provider → 报错
+        let mut config = seeded_config();
+        config.settings.direct_provider_id = Some("nonexistent-provider".into());
+        assert!(direct_provider_match(&config, "gpt-5.5").is_err());
     }
 
     #[test]
@@ -6895,6 +7594,40 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_body_upshifts_reasoning_to_claude_tiers() {
+        // 纯映射：Codex catalog 的四档上移回 Claude 真实档(含 max)。
+        assert_eq!(claude_request_reasoning_effort("low"), "medium");
+        assert_eq!(claude_request_reasoning_effort("medium"), "high");
+        assert_eq!(claude_request_reasoning_effort("high"), "xhigh");
+        assert_eq!(claude_request_reasoning_effort("xhigh"), "max");
+        assert_eq!(claude_request_reasoning_effort("max"), "max");
+
+        // 端到端：Codex 发 xhigh(catalog 最高档) → Claude body 实际跑 max。
+        let body = build_anthropic_body(
+            &json!({"model":"claude-opus-4-8","input":[],"reasoning":{"effort":"xhigh"}}),
+            "claude-opus-4-8",
+            false,
+        );
+        assert_eq!(body["output_config"]["effort"], "max");
+
+        // Codex 发 high → xhigh。
+        let body = build_anthropic_body(
+            &json!({"model":"claude-opus-4-8","input":[],"reasoning":{"effort":"high"}}),
+            "claude-opus-4-8",
+            false,
+        );
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+
+        // Codex 未指定 → 默认按最高档，xhigh→max。
+        let body = build_anthropic_body(
+            &json!({"model":"claude-opus-4-8","input":[]}),
+            "claude-opus-4-8",
+            false,
+        );
+        assert_eq!(body["output_config"]["effort"], "max");
+    }
+
+    #[test]
     fn chat_completions_uses_openai_reasoning_effort_only() {
         let request = json!({
             "model": "deepseek-v4-pro",
@@ -6931,7 +7664,7 @@ mod tests {
         let body = build_anthropic_body(&request, "claude-opus-4-8", false);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert!(body["thinking"].get("budget_tokens").is_none());
-        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["output_config"]["effort"], "xhigh");
         assert!(body.get("reasoning_effort").is_none());
         assert_eq!(body["max_tokens"], 32000);
         assert!(body.get("context_management").is_none());
@@ -7099,7 +7832,7 @@ mod tests {
 
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert!(body["thinking"].get("budget_tokens").is_none());
-        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["output_config"]["effort"], "xhigh");
         assert!(body.get("reasoning_effort").is_none());
         assert_eq!(body["max_tokens"], 32000);
     }
@@ -7127,14 +7860,14 @@ mod tests {
 
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert!(body["thinking"].get("budget_tokens").is_none());
-        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["output_config"]["effort"], "xhigh");
         assert!(body.get("reasoning_effort").is_none());
         assert_eq!(body["max_tokens"], 64000);
     }
 
     #[test]
     fn anthropic_body_effort_follows_codex_reasoning_tiers() {
-        for (sent, expected) in [("low", "low"), ("medium", "medium"), ("xhigh", "xhigh")] {
+        for (sent, expected) in [("low", "medium"), ("medium", "high"), ("xhigh", "max")] {
             let request = json!({
                 "model": "claude-opus-4-8",
                 "input": "hi",
@@ -7825,6 +8558,7 @@ mod tests {
                 codex_alias: None,
                 image_generation: false,
                 image_quality: None,
+                image_capable: false,
             },
             provider,
             upstream_model: "deepseek-chat".into(),
@@ -7924,6 +8658,7 @@ mod tests {
                 codex_alias: None,
                 image_generation: false,
                 image_quality: None,
+                image_capable: false,
             },
             provider,
             upstream_model: "deepseek-chat".into(),
@@ -9351,6 +10086,7 @@ mod tests {
                 started_at: Utc::now(),
                 model: model.into(),
                 requested_model: None,
+                upstream_model: None,
                 route_reason: Some("direct".into()),
                 provider_id: Some("provider-1".into()),
                 provider_name: Some("Provider 1".into()),
@@ -9504,6 +10240,7 @@ data: {"type":"response.failed","response":{"error":{"code":"context_length_exce
                 started_at: Utc::now(),
                 model: "gpt-5.5".into(),
                 requested_model: None,
+                upstream_model: None,
                 route_reason: Some("direct".into()),
                 provider_id: Some("openai-official".into()),
                 provider_name: Some("OpenAI Official Account".into()),

@@ -2,7 +2,6 @@ import React from "react";
 import { createPortal } from "react-dom";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
-  IconActivity as Activity,
   IconBook2 as BookOpen,
   IconBrandBilibili as BrandBilibili,
   IconBrandGithub as BrandGithub,
@@ -46,6 +45,7 @@ import type {
   ModelTestMode,
   ModelTestStatus,
   ModelEntry,
+  ModelHealth,
   OfficialQuotaWindow,
   Provider,
   ProviderHttpProxy,
@@ -306,7 +306,7 @@ function requestErrorDetail(
   if (record.stream_bytes > 0) {
     lines.push(`${t("tokens.streamBytes")}: ${formatBytes(record.stream_bytes)}`);
   }
-  if (record.context_bridge) {
+  if (record.context_bridge && !record.context_bridge.request_kind) {
     const bridge = record.context_bridge;
     lines.push(
       "",
@@ -335,6 +335,27 @@ function requestErrorDetail(
         bridge.compaction_persisted ? "yes" : "no"
       } · injected=${bridge.compaction_injected ? "yes" : "no"}`,
     );
+  }
+  if (record.context_bridge?.request_kind) {
+    const bridge = record.context_bridge;
+    lines.push(
+      "",
+      `${t("logs.respKind")}: ${t(kindLabelKey(bridge.request_kind))}`,
+      `${t("logs.respTools")}: ${bridge.tool_count ?? 0}${
+        bridge.tool_names && bridge.tool_names.length ? ` · ${bridge.tool_names.join(", ")}` : ""
+      }`,
+      `${t("logs.respMessages")}: ${bridge.input_message_count ?? 0}`,
+    );
+    if (bridge.max_output_tokens != null) {
+      lines.push(`${t("logs.respMaxOutput")}: ${formatTokens(bridge.max_output_tokens)}`);
+    }
+    if (bridge.instructions_preview) {
+      lines.push(
+        `${t("logs.respInstructions")}: ${bridge.instructions_preview}${
+          bridge.instructions_length ? ` (${bridge.instructions_length})` : ""
+        }`,
+      );
+    }
   }
   if (record.error) {
     lines.push("", record.error);
@@ -565,7 +586,7 @@ export function RequestTable({
             const vol = r.context_usage.total_tokens > 0 ? r.context_usage : r.usage;
             const billed = r.usage;
             const streamDisplay = streamStatusDisplay(r, t);
-            const hasErrorDetail = Boolean(r.error || r.stream_error);
+            const hasErrorDetail = Boolean(r.error || r.stream_error || r.context_bridge);
             return (
               <div className="trow cols-req" key={r.id}>
                 <span className="mono">{new Date(r.started_at).toLocaleTimeString()}</span>
@@ -573,6 +594,11 @@ export function RequestTable({
                   <strong>{requestDisplayModel(r, models)}</strong>
                   {r.requested_model && r.requested_model !== r.model ? (
                     <span className="model-alias mono">{t("table.requestedModel", { model: r.requested_model })}</span>
+                  ) : null}
+                  {r.context_bridge?.request_kind ? (
+                    <span className={`kind-chip ${kindClass(r.context_bridge.request_kind)}`}>
+                      {t(kindLabelKey(r.context_bridge.request_kind))}
+                    </span>
                   ) : null}
                 </span>
                 <span className="provider-protocol-cell">
@@ -821,9 +847,18 @@ function TokenBar({ label, value, total, cls }: { label: string; value: number; 
   );
 }
 
+const HEALTH_CELLS = 60;
+const HEALTH_SLOW_MS = 10_000;
+
+function requestHealth(r: { status: number; stream_state: string | null; latency_ms: number }): "good" | "slow" | "bad" {
+  if (r.status >= 400 || r.stream_state === "failed" || r.stream_state === "interrupted") {
+    return "bad";
+  }
+  return Number(r.latency_ms) >= HEALTH_SLOW_MS ? "slow" : "good";
+}
+
 export function Dashboard({ snapshot, config }: PageProps) {
   const { t } = useI18n();
-  const [range, setRange] = React.useState<Range>("today");
   const visibleProviderIds = visibleUiProviderIds(config, snapshot);
   const enabledModels = config.models.filter((m) => m.enabled && visibleProviderIds.has(m.provider_id)).length;
   const providerCount = visibleProviderIds.size;
@@ -837,12 +872,10 @@ export function Dashboard({ snapshot, config }: PageProps) {
       ? 0
       : Math.round(snapshot.requests.reduce((a, r) => a + Number(r.latency_ms), 0) / total);
   const stats = snapshot.stats;
-  const rangeTotals: TokenTotals = stats[range];
   const totalCost = snapshot.provider_usage.reduce(
     (sum, provider) => sum + (provider.local_usage.estimated_cost_usd ?? 0),
     0,
   );
-
   return (
     <div className="stack page-enter">
       <div className="grid grid-4">
@@ -854,46 +887,100 @@ export function Dashboard({ snapshot, config }: PageProps) {
 
       <Panel
         title={t("dash.tokensTitle")}
-        sub={t("dash.tokensSub")}
         icon={<Coins size={18} />}
         color="peach"
-        right={
-          <div className="segmented">
-            {(["today", "yesterday", "last7"] as Range[]).map((r) => (
-              <button
-                key={r}
-                className={`seg ${range === r ? "active" : ""}`}
-                onClick={() => setRange(r)}
-              >
-                {t(r === "today" ? "dash.range.today" : r === "yesterday" ? "dash.range.yesterday" : "dash.range.7d")}
-              </button>
-            ))}
-          </div>
-        }
       >
-        <div className="token-panel">
-          <div className="token-figures">
-            <div className="token-big">
-              <span className="tb-value">{formatTokens(rangeTotals.total_tokens)}</span>
-              <span className="tb-label">{t("tokens.total")}</span>
-            </div>
-            <div className="token-breakdown">
-              <TokenBar label={t("tokens.input")} value={rangeTotals.input_tokens} total={rangeTotals.total_tokens} cls="b-input" />
-              <TokenBar label={t("tokens.output")} value={rangeTotals.output_tokens} total={rangeTotals.total_tokens} cls="b-output" />
-              <TokenBar label={t("tokens.cacheRead")} value={rangeTotals.cache_read_tokens} total={rangeTotals.total_tokens} cls="b-cacheR" />
-              <TokenBar label={t("tokens.cacheWrite")} value={rangeTotals.cache_write_tokens} total={rangeTotals.total_tokens} cls="b-cacheW" />
-            </div>
-          </div>
-          <div className="token-chart">
-            <div className="tc-title">{t("dash.trendTitle")}</div>
-            <TrendChart data={stats.series} emptyLabel={t("chart.noData")} />
-          </div>
-        </div>
+        <TrendChart
+          data={stats.series}
+          modelTrends={stats.model_trends ?? []}
+          emptyLabel={t("chart.noData")}
+          formatCost={formatCost}
+          modelName={(m) =>
+            config.models.find((x) => !!x.upstream_model && x.upstream_model === m)?.display_name ??
+            config.models.find((x) => x.id === m)?.display_name ??
+            m
+          }
+          labels={{
+            total: t("tokens.total"),
+            input: t("tokens.input"),
+            output: t("tokens.output"),
+            cacheRead: t("tokens.cacheRead"),
+            cacheWrite: t("tokens.cacheWrite"),
+            cost: t("tokens.cost"),
+            requests: t("tokens.reqUnit"),
+          }}
+        />
       </Panel>
+    </div>
+  );
+}
 
-      <Panel title={t("dash.recentTitle")} sub={t("dash.recentSub")} icon={<Activity size={18} />} color="lav">
-        <RequestTable requests={snapshot.requests.slice(0, 6)} models={config.models} />
-      </Panel>
+export function HealthPage({ snapshot, config }: PageProps) {
+  const { t } = useI18n();
+  const visibleProviderIds = visibleUiProviderIds(config, snapshot);
+  const enabledModelList = config.models.filter(
+    (m) => m.enabled && visibleProviderIds.has(m.provider_id),
+  );
+  const idsKey = enabledModelList.map((m) => m.id).join(",");
+  const [health, setHealth] = React.useState<ModelHealth[]>([]);
+  React.useEffect(() => {
+    let alive = true;
+    api
+      .modelHealth(idsKey ? idsKey.split(",") : [])
+      .then((h) => {
+        if (alive) setHealth(h);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [idsKey, snapshot.request_log_count]);
+  const healthMap = React.useMemo(
+    () => new Map(health.map((h) => [h.model, h.cells])),
+    [health],
+  );
+
+  return (
+    <div className="stack page-enter">
+      <section className="card card-pad">
+        {enabledModelList.length === 0 ? (
+          <div className="mc-empty">{t("dash.healthEmpty")}</div>
+        ) : (
+          <div className="health-list">
+            {enabledModelList.map((model) => {
+              const reqs = (healthMap.get(model.id) ?? []).slice(0, HEALTH_CELLS);
+              const okCount = reqs.filter((r) => requestHealth(r) !== "bad").length;
+              const uptime = reqs.length === 0 ? null : Math.round((okCount / reqs.length) * 100);
+              const chrono = [...reqs].reverse();
+              const pad = HEALTH_CELLS - chrono.length;
+              return (
+                <div className="health-row" key={model.id}>
+                  <div className="hr-head">
+                    <span className="hr-name">{model.display_name}</span>
+                    <span className="hr-meta">
+                      {uptime === null
+                        ? t("dash.healthNoReq")
+                        : t("dash.healthUptime", { pct: uptime, count: reqs.length })}
+                    </span>
+                  </div>
+                  <div className="hr-track">
+                    {Array.from({ length: pad }).map((_, i) => (
+                      <span key={`pad-${i}`} className="hc hc-empty" />
+                    ))}
+                    {chrono.map((r, i) => (
+                      <span
+                        key={i}
+                        className={`hc ${requestHealth(r)}`}
+                        title={`${r.status} · ${(Number(r.latency_ms) / 1000).toFixed(1)}s`}
+                      />
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
     </div>
   );
 }
@@ -901,6 +988,21 @@ export function Dashboard({ snapshot, config }: PageProps) {
 /* ============================================================
    Model add/edit modal
    ============================================================ */
+const KIND_LABEL_KEYS: Record<string, MsgKey> = {
+  main_coding: "logs.kindMain",
+  auxiliary: "logs.kindAuxiliary",
+  memory_agent: "logs.kindMemory",
+};
+const KIND_CLASSES: Record<string, string> = {
+  main_coding: "kind-main",
+  auxiliary: "kind-aux",
+  memory_agent: "kind-memory",
+};
+const kindLabelKey = (kind: string | null | undefined): MsgKey =>
+  (kind ? KIND_LABEL_KEYS[kind] : undefined) ?? "logs.kindAuxiliary";
+const kindClass = (kind: string | null | undefined): string =>
+  (kind ? KIND_CLASSES[kind] : undefined) ?? "kind-aux";
+
 const REASONING_LABELS: Record<ReasoningEffort, string> = {
   low: "Low",
   medium: "Medium",
@@ -952,6 +1054,7 @@ function EMPTY_MODEL(provider: Provider | undefined): ModelEntry {
     codex_alias: null,
     image_generation: false,
     image_quality: null,
+    image_capable: false,
     ...modelRuntimeDefaults(provider),
   };
 }
@@ -1048,7 +1151,14 @@ function ModelModal({
 
   const selectedProvider = config.providers.find((p) => p.id === draft.provider_id);
   const protocolDefaults = providerReasoningDefaults(selectedProvider);
-  const isImageModel = selectedProvider?.protocol === "open_ai_images";
+  const isImageModel =
+    selectedProvider?.protocol === "open_ai_images" || selectedProvider?.protocol === "gemini_image";
+  // 普通文本模型(OpenAI Responses / 官方账号 / 官方客户端)可开「图片生成」开关。
+  const imageCapableEligible =
+    !isImageModel &&
+    (selectedProvider?.protocol === "open_ai_responses" ||
+      selectedProvider?.kind === "official_open_ai_account" ||
+      selectedProvider?.kind === "official_open_ai");
   const draftModelId = modelIdKey(draft.id);
   const duplicateModels = config.models.filter((model, index) => {
     if (isEdit && editIndex === index) return false;
@@ -1086,6 +1196,7 @@ function ModelModal({
       ...runtimeDefaults,
       image_generation: isImageModel,
       image_quality: isImageModel ? draft.image_quality ?? "high" : null,
+      image_capable: imageCapableEligible ? draft.image_capable : false,
     };
     let addedAsDisabledDuplicate = false;
     if (!isEdit && hasDuplicateModelId) {
@@ -1192,6 +1303,12 @@ function ModelModal({
           </Field>
         </>
       )}
+      {imageCapableEligible ? (
+        <div className="modal-toggle-row">
+          <div className="mtr-title">{t("model.imageCapable")}</div>
+          <Switch checked={draft.image_capable} onChange={(v) => patch({ image_capable: v })} />
+        </div>
+      ) : null}
       <div className="modal-toggle-row">
         <div className="mtr-title">{t("common.enabled")}</div>
         <Switch checked={draft.enabled} onChange={(v) => patch({ enabled: v })} />
@@ -1643,7 +1760,7 @@ export function ModelGarden({ snapshot, config, commit, busy, notifyRaw }: PageP
   return (
     <div className="stack page-enter">
       <div className="row row-between wrap">
-        <div className="page-lead">{t("models.count", { count: displayModels.length })}</div>
+        <div className="page-lead lead-1m">{t("models.count")}</div>
         <Button variant="primary" icon={<Plus size={16} />} onClick={openAdd}>{t("models.add")}</Button>
       </div>
 
@@ -1980,6 +2097,7 @@ function ProviderModal({
     { value: "open_ai_chat_completions", label: t("proto.chat") },
     { value: "anthropic_messages", label: t("proto.anthropic") },
     { value: "open_ai_images", label: t("proto.images") },
+    { value: "gemini_image", label: t("proto.geminiImage") },
   ];
   const providerTypeOptions = [
     { value: "custom", label: t("providerType.custom") },
@@ -3088,6 +3206,8 @@ function modelAvailableForCodexMode(
 ) {
   const provider = config.providers.find((p) => p.id === model.provider_id);
   if (!provider || !model.enabled) return false;
+  // 默认/兜底模型是编码对话模型，排除图片生成协议（OpenAI images / Gemini images）的模型。
+  if (provider.protocol === "open_ai_images" || provider.protocol === "gemini_image") return false;
   if (!providerVisibleInUi(provider, snapshot)) return false;
   if (mode === "official_account") return true;
   if (provider.kind === "official_open_ai") return false;
@@ -3123,6 +3243,7 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
   const { t } = useI18n();
   const mode = config.settings.codex_injection_mode ?? "official_account";
   const lanMode = mode === "lan_share";
+  const directMode = mode === "direct_provider";
   const selectable = lanMode
     ? []
     : config.models.filter((model) => modelAvailableForCodexMode(model, config, snapshot, mode));
@@ -3216,6 +3337,21 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
   async function setImageGenModel(id: string) {
     await commit((d) => {
       d.settings.image_gen_model = id || null;
+    });
+  }
+  async function setAuxModel(id: string) {
+    await commit((d) => {
+      d.settings.aux_model = id || null;
+    });
+  }
+  async function setMemoryModel(id: string) {
+    await commit((d) => {
+      d.settings.memory_model = id || null;
+    });
+  }
+  async function setDirectProvider(id: string) {
+    await commit((d) => {
+      d.settings.direct_provider_id = id || null;
     });
   }
   async function setAutoInject(v: boolean) {
@@ -3334,13 +3470,46 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
   const imageGenOptions = [
     { value: "", label: t("setup.imageGenDefault"), sub: "" },
     ...config.models
-      .filter((m) => m.image_generation)
+      .filter((m) => m.image_generation || m.image_capable)
       .map((m) => ({ value: m.id, label: m.display_name || m.id, sub: m.id })),
   ];
   const imageGenModel =
     config.settings.image_gen_model &&
-    config.models.some((m) => m.id === config.settings.image_gen_model && m.image_generation)
+    config.models.some(
+      (m) => m.id === config.settings.image_gen_model && (m.image_generation || m.image_capable),
+    )
       ? config.settings.image_gen_model
+      : "";
+  // 辅助/记忆模型只能选 1M 上下文窗口的模型（要装得下大输入）。
+  const oneMillionOptions = [
+    { value: "", label: t("setup.routeModelDefault"), sub: "" },
+    ...config.models
+      .filter((m) => m.context_window >= 1_000_000)
+      .map((m) => ({ value: m.id, label: m.display_name || m.id, sub: m.id })),
+  ];
+  const auxModel =
+    config.settings.aux_model &&
+    config.models.some((m) => m.id === config.settings.aux_model && m.context_window >= 1_000_000)
+      ? config.settings.aux_model
+      : "";
+  const memoryModel =
+    config.settings.memory_model &&
+    config.models.some((m) => m.id === config.settings.memory_model && m.context_window >= 1_000_000)
+      ? config.settings.memory_model
+      : "";
+  // 直连模式：只列 OpenAI 协议第三方API / 官方OpenAI账号 / OpenAI官方客户端 三类 provider。
+  const directProviderOptions = config.providers
+    .filter(
+      (p) =>
+        p.kind === "official_open_ai" ||
+        p.kind === "official_open_ai_account" ||
+        (p.kind === "custom" && p.protocol === "open_ai_responses"),
+    )
+    .map((p) => ({ value: p.id, label: p.name, sub: p.id }));
+  const directProvider =
+    config.settings.direct_provider_id &&
+    directProviderOptions.some((o) => o.value === config.settings.direct_provider_id)
+      ? config.settings.direct_provider_id
       : "";
   const defaultModel = lanMode
     ? validCodexOption(config.settings.codex_default_model, modelOptions)
@@ -3364,7 +3533,7 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
       <Panel title={t("nav.setup")} sub={t("setup.sub")} icon={<FileJson size={18} />} color="lav" className="setup-panel">
         <Field label={t("setup.mode")}>
           <div className="segmented setup-mode">
-            {(["official_account", "third_party_api", "lan_share"] as CodexInjectionMode[]).map((item) => (
+            {(["official_account", "third_party_api", "lan_share", "direct_provider"] as CodexInjectionMode[]).map((item) => (
               <button
                 key={item}
                 className={`seg ${mode === item ? "active" : ""}`}
@@ -3375,7 +3544,9 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
                     ? "setup.modeOfficial"
                     : item === "third_party_api"
                       ? "setup.modeThirdParty"
-                      : "setup.modeLanShare",
+                      : item === "lan_share"
+                        ? "setup.modeLanShare"
+                        : "setup.modeDirect",
                 )}
               </button>
             ))}
@@ -3405,17 +3576,33 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
             </div>
           </div>
         )}
-        <div className="grid grid-2" style={{ marginBottom: 16 }}>
-          <Field label={t("setup.defaultModel")}>
-            <Dropdown value={defaultModel} options={modelOptions} onChange={setDefaultModel} />
+        {directMode ? (
+          <Field label={t("setup.upstreamProvider")} hint={t("setup.upstreamProviderHint")}>
+            <Dropdown value={directProvider} options={directProviderOptions} onChange={setDirectProvider} />
           </Field>
-          <Field label={t("settings.fallback")}>
-            <Dropdown value={fallback} options={fallbackOptions} onChange={setFallback} />
-          </Field>
-        </div>
-        <Field label={t("setup.imageGenModel")} hint={t("setup.imageGenModelHint")}>
-          <Dropdown value={imageGenModel} options={imageGenOptions} onChange={setImageGenModel} />
-        </Field>
+        ) : (
+          <>
+            <div className="grid grid-2" style={{ marginBottom: 16 }}>
+              <Field label={t("setup.defaultModel")}>
+                <Dropdown value={defaultModel} options={modelOptions} onChange={setDefaultModel} />
+              </Field>
+              <Field label={t("settings.fallback")}>
+                <Dropdown value={fallback} options={fallbackOptions} onChange={setFallback} />
+              </Field>
+            </div>
+            <div className="grid grid-2" style={{ marginBottom: 16 }}>
+              <Field label={t("setup.auxModel")}>
+                <Dropdown value={auxModel} options={oneMillionOptions} onChange={setAuxModel} />
+              </Field>
+              <Field label={t("setup.memoryModel")}>
+                <Dropdown value={memoryModel} options={oneMillionOptions} onChange={setMemoryModel} />
+              </Field>
+            </div>
+            <Field label={t("setup.imageGenModel")} hint={t("setup.imageGenModelHint")}>
+              <Dropdown value={imageGenModel} options={imageGenOptions} onChange={setImageGenModel} />
+            </Field>
+          </>
+        )}
 
         <div className="modal-toggle-row" style={{ marginBottom: 16 }}>
           <div>

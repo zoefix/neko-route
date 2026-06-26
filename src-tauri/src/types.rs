@@ -19,6 +19,7 @@ pub enum ProviderProtocol {
     OpenAiChatCompletions,
     AnthropicMessages,
     OpenAiImages,
+    GeminiImage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub enum CodexInjectionMode {
     OfficialAccount,
     ThirdPartyApi,
     LanShare,
+    DirectProvider,
 }
 
 impl Default for CodexInjectionMode {
@@ -84,6 +86,10 @@ pub struct ModelEntry {
     /// 图片质量(low/medium/high)。仅图片模型用，转发 /v1/images 时若请求没传则注入。
     #[serde(default)]
     pub image_quality: Option<String>,
+    /// 普通文本模型(OpenAI Responses/官方账号/官方客户端)是否也支持图片生成。
+    /// 开启后该模型可被选为「图片生成模型」，画图走 /v1/images。
+    #[serde(default)]
+    pub image_capable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,6 +141,15 @@ pub struct Settings {
     /// 覆盖默认路由。None = 默认，不改变路由。三种应用模式(官方/第三方/局域网)都生效。
     #[serde(default)]
     pub image_gen_model: Option<String>,
+    /// 精确检测为「内部辅助请求」时强制路由到该模型(None=不覆盖)。要求 1M 上下文窗口。
+    #[serde(default)]
+    pub aux_model: Option<String>,
+    /// 精确检测为「记忆写入 agent」时强制路由到该模型(None=不覆盖)。要求 1M 上下文窗口。
+    #[serde(default)]
+    pub memory_model: Option<String>,
+    /// 直连模式选定的上游服务商 id；Codex 请求透传到该 provider，不做模型重定向。
+    #[serde(default)]
+    pub direct_provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +238,28 @@ pub struct ContextBridgeDiagnostics {
     pub compaction_persisted: bool,
     #[serde(default)]
     pub compaction_injected: bool,
+    // === OpenAI Responses 请求画像（仅 Responses 协议填充，用于日志识别请求用途）===
+    /// 粗分类："main_coding"（主编码对话）| "auxiliary"（内部辅助请求）。
+    #[serde(default)]
+    pub request_kind: Option<String>,
+    /// instructions 开头摘要。
+    #[serde(default)]
+    pub instructions_preview: Option<String>,
+    /// instructions 总字符数（分类信号 + 展示）。
+    #[serde(default)]
+    pub instructions_length: u64,
+    /// 工具数量。
+    #[serde(default)]
+    pub tool_count: u64,
+    /// 前若干个工具名。
+    #[serde(default)]
+    pub tool_names: Vec<String>,
+    /// input 消息条数。
+    #[serde(default)]
+    pub input_message_count: u64,
+    /// 请求声明的最大输出 token。
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +300,9 @@ pub struct RequestRecord {
     /// 清理前的真实上下文体积（给 Codex 判断占用 + UI TOKEN 列）。
     #[serde(default)]
     pub context_usage: TokenUsage,
+    /// 路由命中的真实上游模型名；model 是随机路由 id 查不到市场定价，估价优先用它。
+    #[serde(default)]
+    pub upstream_model: Option<String>,
     /// 按上游模型市场定价估算的等效消费金额（基于清理后 usage）。
     #[serde(default)]
     pub cost_usd: Option<f64>,
@@ -295,7 +335,13 @@ pub struct DayTokens {
     pub total_tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub requests: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +353,9 @@ pub struct ModelTokens {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub requests: u64,
+    /// 按上游模型市场定价估算的累计消费。
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -317,6 +366,16 @@ pub struct TokenStats {
     pub all_time: TokenTotals,
     pub series: Vec<DayTokens>,
     pub by_model: Vec<ModelTokens>,
+    /// 每个模型最近 7 天的每日总 token，用于折线图多条线。
+    #[serde(default)]
+    pub model_trends: Vec<ModelDaySeries>,
+}
+
+/// 单个模型最近 7 天的每日总 token（与 series 同序、同长度）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDaySeries {
+    pub model: String,
+    pub daily: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -361,6 +420,21 @@ pub struct ProviderUsageStatus {
     pub updated_at: Option<DateTime<Utc>>,
     pub source: String,
     pub error: Option<String>,
+}
+
+/// 健康页一个格子的最小数据：用于前端按 status/stream_state/latency 着色。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthCell {
+    pub status: u16,
+    pub latency_ms: u64,
+    pub stream_state: Option<String>,
+}
+
+/// 某个模型最近 N 条请求的健康格子（按时间倒序，最新在前）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelHealth {
+    pub model: String,
+    pub cells: Vec<HealthCell>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,6 +502,9 @@ pub fn default_config() -> AppConfig {
             codex_internal_model_lock: true,
             codex_slots: Vec::new(),
             image_gen_model: None,
+            aux_model: None,
+            memory_model: None,
+            direct_provider_id: None,
         },
     }
 }
@@ -505,6 +582,7 @@ fn model(
         codex_alias: None,
         image_generation: false,
         image_quality: None,
+        image_capable: false,
     }
 }
 
@@ -526,12 +604,45 @@ pub fn reasoning_defaults_for_protocol(protocol: &ProviderProtocol) -> (bool, St
             reasoning_levels(&["low", "medium", "high", "xhigh"]),
         ),
         // 画图模型无推理档位。
-        ProviderProtocol::OpenAiImages => (false, String::new(), Vec::new()),
+        ProviderProtocol::OpenAiImages | ProviderProtocol::GeminiImage => {
+            (false, String::new(), Vec::new())
+        }
     }
 }
 
 fn reasoning_levels(levels: &[&str]) -> Vec<String> {
     levels.iter().map(|level| (*level).to_string()).collect()
+}
+
+/// Codex 最新版的 `model_catalog_json` 不再支持 `max` 档。把模型存储的推理档位收敛到
+/// Codex 的四档 `[low, medium, high, xhigh]`：Claude(anthropic)整体下移一档
+/// (max→xhigh, xhigh→high, high→medium, medium→low, low 保持)，因为请求转发时
+/// [`claude_request_reasoning_effort`] 会反向上移回 Claude 的真实档(含 max)；其余协议
+/// 仅把越界的 `max` 收敛到 `xhigh`。两者互逆，保证档位往返一致。
+pub fn codex_catalog_reasoning_level(level: &str, anthropic: bool) -> &'static str {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "max" => "xhigh",
+        "xhigh" if anthropic => "high",
+        "high" if anthropic => "medium",
+        "medium" if anthropic => "low",
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        _ => "medium",
+    }
+}
+
+/// 与 [`codex_catalog_reasoning_level`] 互逆：把 Codex 发来的四档上移回 Claude 的真实档。
+/// 仅用于 anthropic 协议的请求转发。`max` 已是顶档，原样保留。
+pub fn claude_request_reasoning_effort(level: &str) -> &'static str {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "low" => "medium",
+        "medium" => "high",
+        "high" => "xhigh",
+        "xhigh" => "max",
+        _ => "max",
+    }
 }
 
 #[cfg(test)]

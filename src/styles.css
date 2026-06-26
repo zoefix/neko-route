@@ -2541,6 +2541,8 @@ body.model-drag-active * {
   font-weight: 600;
   color: var(--ink-soft);
 }
+.page-lead.lead-1m { color: #5a7cf0; }
+:root[data-theme="dark"] .page-lead.lead-1m { color: #93b4ff; }
 
 .page-size-picker {
   flex: 0 0 136px;
@@ -2755,6 +2757,209 @@ body.model-drag-active * {
 }
 .tc-title { font-size: 12px; font-weight: 600; color: var(--muted); }
 
+/* 按模型消费 */
+.model-cost {
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+.mc-head { display: flex; align-items: baseline; justify-content: space-between; }
+.mc-head-title { font-size: 12.5px; font-weight: 700; color: var(--ink-soft); letter-spacing: 0.01em; }
+.mc-head-sum {
+  font-size: 16px;
+  font-weight: 800;
+  background: var(--grad-primary);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.mc-list { display: flex; flex-direction: column; gap: 10px; }
+.mc-row {
+  display: grid;
+  grid-template-columns: minmax(96px, 1.2fr) auto minmax(60px, 1.8fr) auto minmax(56px, auto);
+  align-items: center;
+  gap: 13px;
+}
+.mc-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mc-req { font-size: 11.5px; color: var(--muted); font-weight: 600; white-space: nowrap; }
+.mc-bar {
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(150, 120, 180, 0.12);
+  overflow: hidden;
+}
+.mc-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--grad-primary);
+  transition: width 0.6s var(--ease);
+}
+.mc-tokens { font-size: 12px; color: var(--muted); font-weight: 600; text-align: right; white-space: nowrap; }
+.mc-cost {
+  font-size: 13.5px;
+  font-weight: 800;
+  color: var(--ink);
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.mc-empty { font-size: 12.5px; color: var(--muted); padding: 16px 0; text-align: center; }
+
+/* 发光 Token 走势图 */
+.glow-chart {
+  --gc-bg:
+    radial-gradient(130% 90% at 82% -20%, rgba(150, 110, 245, 0.14), transparent 58%),
+    radial-gradient(110% 100% at -5% 120%, rgba(40, 200, 170, 0.1), transparent 55%),
+    linear-gradient(155deg, #f4effc 0%, #eaeefb 72%);
+  --gc-ring: rgba(120, 90, 180, 0.12);
+  --gc-text: #2c2440;
+  --gc-text-soft: rgba(80, 64, 110, 0.64);
+  --gc-text-faint: rgba(80, 64, 110, 0.46);
+  --gc-total-glow: 0 0 18px rgba(150, 130, 230, 0.22);
+  --gc-vline: rgba(90, 70, 130, 0.22);
+  border-radius: 18px;
+  padding: 20px 22px 14px;
+  background: var(--gc-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px var(--gc-ring);
+}
+:root[data-theme="dark"] .glow-chart {
+  --gc-bg:
+    radial-gradient(130% 90% at 82% -20%, rgba(128, 96, 220, 0.42), transparent 58%),
+    radial-gradient(110% 100% at -5% 120%, rgba(56, 206, 178, 0.22), transparent 55%),
+    linear-gradient(155deg, #241b3e 0%, #181230 72%);
+  --gc-ring: rgba(255, 255, 255, 0.06);
+  --gc-text: #fff;
+  --gc-text-soft: rgba(255, 255, 255, 0.5);
+  --gc-text-faint: rgba(255, 255, 255, 0.4);
+  --gc-total-glow: 0 0 20px rgba(138, 180, 255, 0.55);
+  --gc-vline: rgba(255, 255, 255, 0.2);
+}
+.gc-readout {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 22px;
+  flex-wrap: wrap;
+}
+.gc-main { display: flex; flex-direction: column; gap: 2px; }
+.gc-day {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--gc-text-soft);
+  letter-spacing: 0.05em;
+}
+.gc-today-tag { color: #14b8a6; font-style: normal; margin-left: 4px; }
+.gc-total {
+  font-size: 33px;
+  font-weight: 800;
+  line-height: 1.04;
+  color: var(--gc-text);
+  text-shadow: var(--gc-total-glow);
+  font-variant-numeric: tabular-nums;
+}
+.gc-total-label { font-size: 11.5px; font-weight: 600; color: var(--gc-text-soft); }
+.gc-metrics { display: flex; gap: 18px 22px; flex-wrap: wrap; }
+.gc-metric { display: flex; align-items: center; gap: 8px; }
+.gcm-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  box-shadow: 0 0 9px currentColor;
+  flex-shrink: 0;
+}
+.m-in .gcm-dot { background: #ff6fa5; color: #ff6fa5; }
+.m-out .gcm-dot { background: #5aa6f0; color: #5aa6f0; }
+.m-cr .gcm-dot { background: #14b8a6; color: #14b8a6; }
+.m-cw .gcm-dot { background: #8b6df0; color: #8b6df0; }
+.m-cost .gcm-dot { background: #e6962a; color: #e6962a; }
+.gcm-text { display: flex; flex-direction: column; line-height: 1.18; }
+.gcm-label { font-size: 10.5px; font-weight: 600; color: var(--gc-text-faint); }
+.gcm-value {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--gc-text);
+  font-variant-numeric: tabular-nums;
+}
+.gc-plot { position: relative; }
+.gc-svg { width: 100%; height: 200px; display: block; overflow: visible; }
+.gc-line { animation: gcFade 0.85s var(--ease) both; }
+.gc-area { animation: gcFade 1s 0.15s var(--ease) both; }
+.gc-dot { fill: #fff; stroke: #8ab4ff; stroke-width: 1.4; }
+.gc-dot-m { transition: opacity 0.15s var(--ease); }
+.gc-vline { stroke: var(--gc-vline); stroke-width: 1; stroke-dasharray: 2 3; }
+.gc-axis { display: flex; justify-content: space-between; margin-top: 9px; padding: 0 2px; }
+.gc-axis span {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--gc-text-faint);
+  cursor: pointer;
+  transition: color 0.15s var(--ease);
+}
+.gc-axis span:hover,
+.gc-axis span.active { color: var(--gc-text); }
+.gc-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding-top: 2px;
+}
+.gcl-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--gc-text-soft);
+}
+.gcl-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  box-shadow: 0 0 8px currentColor;
+  flex-shrink: 0;
+}
+@keyframes gcFade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* 服务健康格子条 */
+.health-list { display: flex; flex-direction: column; gap: 17px; }
+.health-row { display: flex; flex-direction: column; gap: 7px; }
+.hr-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.hr-name { font-size: 13px; font-weight: 700; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hr-meta { font-size: 11.5px; font-weight: 600; color: var(--muted); white-space: nowrap; }
+.hr-track {
+  display: grid;
+  grid-template-columns: repeat(60, minmax(0, 1fr));
+  grid-auto-rows: 26px;
+  gap: 3px;
+  width: 100%;
+}
+.hc {
+  border-radius: 3px;
+  transition: transform 0.12s var(--ease);
+}
+.hc:hover { transform: scaleY(1.14); }
+.hc.good { background: linear-gradient(180deg, #4ade9b, #2bbd84); }
+.hc.slow { background: linear-gradient(180deg, #f7c660, #f0a23a); }
+.hc.bad { background: linear-gradient(180deg, #ff7a9c, #f25c84); }
+.hc.hc-empty { background: rgba(150, 120, 180, 0.13); }
+
 /* trend chart */
 .trend { display: flex; flex-direction: column; gap: 6px; flex: 1; }
 .trend-plot { position: relative; flex: 1; min-height: 96px; }
@@ -2812,6 +3017,19 @@ body.model-drag-active * {
 .model-cell { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .model-cell strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--ink); }
 .model-alias { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10.5px; color: var(--muted); }
+.kind-chip {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.kind-chip.kind-main { color: #5a7cf0; background: rgba(110, 130, 240, 0.15); }
+.kind-chip.kind-aux { color: var(--warn); background: var(--warn-soft); }
+.kind-chip.kind-memory { color: #a855f7; background: rgba(168, 85, 247, 0.15); }
 .provider-protocol-cell { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .provider-protocol-cell strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--ink-soft); font-weight: 700; }
 .provider-protocol-cell span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }

@@ -1,6 +1,6 @@
 use crate::types::{
-    ClaudeContextPressureSample, ContextBridgeDiagnostics, DayTokens, ModelTokens,
-    OfficialAccountQuota, ProviderLocalUsage, ProviderProtocol, ProviderUsageStatus,
+    ClaudeContextPressureSample, ContextBridgeDiagnostics, DayTokens, HealthCell, ModelDaySeries,
+    ModelTokens, OfficialAccountQuota, ProviderLocalUsage, ProviderProtocol, ProviderUsageStatus,
     RequestLogPage, RequestRecord, TokenStats, TokenTotals, TokenUsage,
 };
 use chrono::{DateTime, Local, Utc};
@@ -54,7 +54,8 @@ impl RequestLog {
                 ctx_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
                 ctx_total_tokens INTEGER NOT NULL DEFAULT 0,
                 cost_usd REAL,
-                image_preview TEXT
+                image_preview TEXT,
+                upstream_model TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_requests_started_at ON requests(started_at DESC);
             CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
@@ -110,6 +111,7 @@ impl RequestLog {
         }
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN cost_usd REAL", []);
         let _ = conn.execute("ALTER TABLE requests ADD COLUMN image_preview TEXT", []);
+        let _ = conn.execute("ALTER TABLE requests ADD COLUMN upstream_model TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE claude_context_pressure ADD COLUMN requires_precompression INTEGER NOT NULL DEFAULT 0",
             [],
@@ -153,9 +155,15 @@ impl RequestLog {
         // 模型 ID 现在是随机的(neko-model-xxx)，查不到市场定价；改用请求方原始模型名
         // (如 gpt-5.4)来估算消费，回退到 model。
         let pricing_model = record
-            .requested_model
+            .upstream_model
             .as_deref()
             .filter(|model| !model.is_empty())
+            .or_else(|| {
+                record
+                    .requested_model
+                    .as_deref()
+                    .filter(|model| !model.is_empty())
+            })
             .unwrap_or(record.model.as_str());
         let cost_usd = record.cost_usd.or_else(|| {
             crate::pricing::estimate_model_cost_usd(
@@ -172,8 +180,8 @@ impl RequestLog {
                status, latency_ms, streaming, error, reasoning_effort,
                stream_state, stream_error, last_event,
                stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
-               ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd, image_preview)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)",
+               ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd, image_preview, upstream_model)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)",
             params![
                 record.id,
                 record.started_at.to_rfc3339(),
@@ -205,6 +213,7 @@ impl RequestLog {
                 record.context_usage.total_tokens as i64,
                 cost_usd,
                 record.image_preview,
+                record.upstream_model,
             ],
         );
     }
@@ -240,15 +249,17 @@ impl RequestLog {
         let conn = self.conn.lock().unwrap();
         let cost: Option<f64> = conn
             .query_row(
-                "SELECT model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, requested_model
+                "SELECT model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, requested_model, upstream_model
                  FROM requests WHERE id=?1",
                 params![id],
                 |row| {
                     let model: String = row.get(0)?;
                     let requested: Option<String> = row.get(5)?;
-                    let pricing_model = requested
+                    let upstream: Option<String> = row.get(6)?;
+                    let pricing_model = upstream
                         .as_deref()
                         .filter(|model| !model.is_empty())
+                        .or_else(|| requested.as_deref().filter(|model| !model.is_empty()))
                         .unwrap_or(model.as_str());
                     Ok(crate::pricing::estimate_model_cost_usd(
                         pricing_model,
@@ -292,6 +303,21 @@ impl RequestLog {
         );
     }
 
+    /// 用当前配置把历史记录里缺失的 upstream_model 补上（旧记录写入时没这列，估价查不到价）。
+    pub fn backfill_upstream_models(&self, mappings: &[(String, String)]) {
+        let conn = self.conn.lock().unwrap();
+        for (model_id, upstream) in mappings {
+            if model_id.is_empty() || upstream.is_empty() {
+                continue;
+            }
+            let _ = conn.execute(
+                "UPDATE requests SET upstream_model=?1
+                 WHERE model=?2 AND (upstream_model IS NULL OR upstream_model='')",
+                params![upstream, model_id],
+            );
+        }
+    }
+
     pub fn recent(&self, limit: usize) -> Vec<RequestRecord> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
@@ -299,7 +325,7 @@ impl RequestLog {
                     requested_model, route_reason, status, latency_ms, streaming, error, reasoning_effort,
                     stream_state, stream_error, last_event,
                     stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
-                    ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd, image_preview
+                    ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd, image_preview, upstream_model
              FROM requests ORDER BY started_at DESC LIMIT ?1",
         ) {
             Ok(stmt) => stmt,
@@ -310,6 +336,27 @@ impl RequestLog {
             .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
             .unwrap_or_default();
         rows
+    }
+
+    /// 某模型最近 `limit` 条请求的健康格子（status/latency/stream_state），按时间倒序、最新在前。
+    pub fn health_cells(&self, model: &str, limit: usize) -> Vec<HealthCell> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT status, latency_ms, stream_state FROM requests
+             WHERE model = ?1 ORDER BY started_at DESC LIMIT ?2",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![model, limit as i64], |row| {
+            Ok(HealthCell {
+                status: row.get::<_, i64>(0)? as u16,
+                latency_ms: row.get::<_, i64>(1)? as u64,
+                stream_state: row.get::<_, Option<String>>(2)?,
+            })
+        })
+        .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
+        .unwrap_or_default()
     }
 
     pub fn count(&self) -> u64 {
@@ -341,7 +388,7 @@ impl RequestLog {
                     requested_model, route_reason, status, latency_ms, streaming, error, reasoning_effort,
                     stream_state, stream_error, last_event,
                     stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
-                    ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd, image_preview
+                    ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd, image_preview, upstream_model
              FROM requests ORDER BY started_at DESC LIMIT ?1 OFFSET ?2",
         ) {
             Ok(stmt) => stmt,
@@ -474,16 +521,21 @@ impl RequestLog {
             let start = day_start_rfc3339(day);
             let end = day_start_rfc3339(day + chrono::Duration::days(1));
             let t = totals_between(&conn, &start, Some(&end));
+            let cost = cost_between(&conn, &start, &end);
             series.push(DayTokens {
                 date: day.format("%Y-%m-%d").to_string(),
                 total_tokens: t.total_tokens,
                 input_tokens: t.input_tokens,
                 output_tokens: t.output_tokens,
+                cache_read_tokens: t.cache_read_tokens,
+                cache_write_tokens: t.cache_write_tokens,
                 requests: t.requests,
+                cost_usd: cost,
             });
         }
 
         let by_model = model_totals(&conn);
+        let model_trends = model_day_trends(&conn, today);
 
         TokenStats {
             today: today_totals,
@@ -492,18 +544,19 @@ impl RequestLog {
             all_time,
             series,
             by_model,
+            model_trends,
         }
     }
 
     pub fn provider_local_usage(&self) -> Vec<ProviderLocalUsage> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT COALESCE(provider_id, ''), COALESCE(NULLIF(requested_model, ''), model),
+            "SELECT COALESCE(provider_id, ''), COALESCE(NULLIF(upstream_model, ''), NULLIF(requested_model, ''), model),
                     SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens),
                     SUM(cache_write_tokens), SUM(total_tokens), COUNT(*)
              FROM requests
              WHERE provider_id IS NOT NULL AND provider_id != ''
-             GROUP BY provider_id, COALESCE(NULLIF(requested_model, ''), model)",
+             GROUP BY provider_id, COALESCE(NULLIF(upstream_model, ''), NULLIF(requested_model, ''), model)",
         ) {
             Ok(stmt) => stmt,
             Err(_) => return Vec::new(),
@@ -693,27 +746,112 @@ fn totals_between(conn: &Connection, start: &str, end: Option<&str>) -> TokenTot
     result.unwrap_or_default()
 }
 
+/// 某时间段内的估算消费：按上游模型分组聚合 token 再按市场定价求和。
+fn cost_between(conn: &Connection, start: &str, end: &str) -> f64 {
+    let mut stmt = match conn.prepare(
+        "SELECT COALESCE(NULLIF(upstream_model, ''), NULLIF(requested_model, ''), model),
+                COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0)
+         FROM requests WHERE started_at >= ?1 AND started_at < ?2
+         GROUP BY COALESCE(NULLIF(upstream_model, ''), NULLIF(requested_model, ''), model)",
+    ) {
+        Ok(s) => s,
+        Err(_) => return 0.0,
+    };
+    let rows = stmt.query_map(params![start, end], |row| {
+        let model: String = row.get(0)?;
+        let input = row.get::<_, i64>(1)? as u64;
+        let output = row.get::<_, i64>(2)? as u64;
+        let cache_read = row.get::<_, i64>(3)? as u64;
+        let cache_write = row.get::<_, i64>(4)? as u64;
+        Ok(
+            crate::pricing::estimate_model_cost_usd(&model, input, output, cache_read, cache_write)
+                .unwrap_or(0.0),
+        )
+    });
+    match rows {
+        Ok(iter) => iter.filter_map(Result::ok).sum(),
+        Err(_) => 0.0,
+    }
+}
+
+/// 每个模型最近 7 天的每日总 token（旧到新，与 series 对齐），按累计量降序。
+fn model_day_trends(conn: &Connection, today: chrono::NaiveDate) -> Vec<ModelDaySeries> {
+    let mut map: HashMap<String, Vec<u64>> = HashMap::new();
+    for i in 0..7usize {
+        let day = today - chrono::Duration::days(6 - i as i64);
+        let start = day_start_rfc3339(day);
+        let end = day_start_rfc3339(day + chrono::Duration::days(1));
+        let mut stmt = match conn.prepare(
+            "SELECT COALESCE(NULLIF(upstream_model, ''), NULLIF(requested_model, ''), model),
+                    COALESCE(SUM(total_tokens), 0)
+             FROM requests
+             WHERE started_at >= ?1 AND started_at < ?2 AND total_tokens > 0
+             GROUP BY COALESCE(NULLIF(upstream_model, ''), NULLIF(requested_model, ''), model)",
+        ) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let rows = stmt.query_map(params![start, end], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        });
+        if let Ok(iter) = rows {
+            for entry in iter.flatten() {
+                map.entry(entry.0).or_insert_with(|| vec![0u64; 7])[i] = entry.1;
+            }
+        }
+    }
+    let mut out: Vec<ModelDaySeries> = map
+        .into_iter()
+        .map(|(model, daily)| ModelDaySeries { model, daily })
+        .filter(|s| s.daily.iter().sum::<u64>() > 0)
+        .collect();
+    out.sort_by(|a, b| {
+        b.daily
+            .iter()
+            .sum::<u64>()
+            .cmp(&a.daily.iter().sum::<u64>())
+    });
+    out
+}
+
 fn model_totals(conn: &Connection) -> Vec<ModelTokens> {
     let mut stmt = match conn.prepare(
-        "SELECT COALESCE(NULLIF(requested_model, ''), model),
+        "SELECT COALESCE(NULLIF(upstream_model, ''), NULLIF(requested_model, ''), model),
                 COALESCE(SUM(total_tokens),0), COALESCE(SUM(input_tokens),0),
                 COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read_tokens),0),
                 COALESCE(SUM(cache_write_tokens),0), COUNT(*)
          FROM requests WHERE model <> ''
-         GROUP BY COALESCE(NULLIF(requested_model, ''), model) ORDER BY SUM(total_tokens) DESC",
+         GROUP BY COALESCE(NULLIF(upstream_model, ''), NULLIF(requested_model, ''), model) ORDER BY SUM(total_tokens) DESC",
     ) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
     stmt.query_map([], |row| {
+        let model: String = row.get(0)?;
+        let total_tokens = row.get::<_, i64>(1)? as u64;
+        let input_tokens = row.get::<_, i64>(2)? as u64;
+        let output_tokens = row.get::<_, i64>(3)? as u64;
+        let cache_read_tokens = row.get::<_, i64>(4)? as u64;
+        let cache_write_tokens = row.get::<_, i64>(5)? as u64;
+        let requests = row.get::<_, i64>(6)? as u64;
+        let cost_usd = crate::pricing::estimate_model_cost_usd(
+            &model,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        )
+        .unwrap_or(0.0);
         Ok(ModelTokens {
-            model: row.get(0)?,
-            total_tokens: row.get::<_, i64>(1)? as u64,
-            input_tokens: row.get::<_, i64>(2)? as u64,
-            output_tokens: row.get::<_, i64>(3)? as u64,
-            cache_read_tokens: row.get::<_, i64>(4)? as u64,
-            cache_write_tokens: row.get::<_, i64>(5)? as u64,
-            requests: row.get::<_, i64>(6)? as u64,
+            model,
+            total_tokens,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            requests,
+            cost_usd,
         })
     })
     .and_then(|m| m.collect())
@@ -726,6 +864,7 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
     let context_bridge_json: Option<String> = row.get(17)?;
     let model: String = row.get(2)?;
     let requested_model: Option<String> = row.get(6)?;
+    let upstream_model: Option<String> = row.get(30)?;
     let usage = TokenUsage {
         input_tokens: row.get::<_, i64>(18)? as u64,
         output_tokens: row.get::<_, i64>(19)? as u64,
@@ -738,9 +877,10 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
         .get::<_, Option<f64>>(28)?
         .filter(|cost| *cost > 0.0)
         .or_else(|| {
-            let pricing_model = requested_model
+            let pricing_model = upstream_model
                 .as_deref()
                 .filter(|value| !value.is_empty())
+                .or_else(|| requested_model.as_deref().filter(|value| !value.is_empty()))
                 .unwrap_or(model.as_str());
             crate::pricing::estimate_model_cost_usd(
                 pricing_model,
@@ -781,6 +921,7 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
             cache_write_tokens: row.get::<_, i64>(26)? as u64,
             total_tokens: row.get::<_, i64>(27)? as u64,
         },
+        upstream_model,
         cost_usd,
         image_preview: row.get::<_, Option<String>>(29)?,
     })
@@ -807,6 +948,7 @@ fn protocol_to_str(p: &ProviderProtocol) -> &'static str {
         ProviderProtocol::OpenAiChatCompletions => "open_ai_chat_completions",
         ProviderProtocol::AnthropicMessages => "anthropic_messages",
         ProviderProtocol::OpenAiImages => "open_ai_images",
+        ProviderProtocol::GeminiImage => "gemini_image",
     }
 }
 
@@ -830,6 +972,7 @@ mod tests {
             started_at: Utc::now() + Duration::seconds(offset),
             model: format!("model-{id}"),
             requested_model: None,
+            upstream_model: None,
             route_reason: Some("direct".into()),
             provider_id: Some("provider-1".into()),
             provider_name: Some("Provider 1".into()),
@@ -966,6 +1109,50 @@ mod tests {
 
         assert_eq!(records[0].id, "old");
         assert_eq!(records[0].stream_bytes, 0);
+    }
+
+    #[test]
+    fn estimates_cost_from_upstream_model_when_id_is_random() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = RequestLog::open(&temp.path().join("requests.db")).unwrap();
+        // 真实直连场景：model 是随机路由 id、requested_model 为空，只有 upstream_model 能查到价。
+        let mut rec = record("r1", 0);
+        rec.model = "neko-model-87ec675d".into();
+        rec.requested_model = None;
+        rec.upstream_model = Some("gpt-5.5".into());
+        rec.usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            total_tokens: 2_000_000,
+        };
+        log.insert(&rec);
+        // gpt-5.5: 1M input @ $1.25 + 1M output @ $10 = $11.25。
+        assert!((log.recent(1)[0].cost_usd.unwrap() - 11.25).abs() < 0.0001);
+    }
+
+    #[test]
+    fn backfill_fills_upstream_and_enables_pricing() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = RequestLog::open(&temp.path().join("requests.db")).unwrap();
+        // 旧记录：没有 upstream_model，随机 id 查不到价。
+        let mut rec = record("r1", 0);
+        rec.model = "neko-model-abc".into();
+        rec.requested_model = None;
+        rec.upstream_model = None;
+        rec.usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            total_tokens: 2_000_000,
+        };
+        log.insert(&rec);
+        assert!(log.recent(1)[0].cost_usd.is_none());
+        // 用当前配置补全上游后即可估价。
+        log.backfill_upstream_models(&[("neko-model-abc".into(), "gpt-5.5".into())]);
+        assert!((log.recent(1)[0].cost_usd.unwrap() - 11.25).abs() < 0.0001);
     }
 
     #[test]
