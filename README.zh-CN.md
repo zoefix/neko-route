@@ -129,3 +129,9 @@ git diff --check
 ```
 
 Windows 安装包只在明确需要安装包产物时，通过项目发布或构建脚本生成。
+
+---
+
+## 友情链接
+
+- [LINUX DO — 新的理想型社区](https://linux.do/)

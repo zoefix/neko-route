@@ -129,3 +129,9 @@ git diff --check
 ```
 
 Windows installers are produced only through the project release/build scripts when an installer artifact is needed.
+
+---
+
+## Friends
+
+- [LINUX DO — A New Ideal Community](https://linux.do/)
