@@ -4,8 +4,8 @@ use crate::{
     router::{match_route, RouteMatch},
     store::{validate_bind_settings, AppStore},
     types::{
-        claude_request_reasoning_effort, CodexInjectionMode, ContextBridgeDiagnostics, ModelEntry,
-        Provider, ProviderKind, ProviderProtocol, RequestRecord, Settings, TokenUsage,
+        claude_request_reasoning_effort, AppConfig, CodexInjectionMode, ContextBridgeDiagnostics,
+        ModelEntry, Provider, ProviderKind, ProviderProtocol, RequestRecord, Settings, TokenUsage,
     },
     usage::{parse_usage, usage_from_responses_text},
 };
@@ -63,6 +63,9 @@ const COMPACT_BETA: &str = "compact-2026-01-12";
 /// max_tokens 容纳「思考 + 正文」；Codex 常只发 1024，会被思考占满导致无正文。
 const ANTHROPIC_THINKING_MIN_MAX_TOKENS: u64 = 32_000;
 const TOOL_RESULT_TRUNCATE_CHARS: usize = 32_000;
+/// 最近 N 条 tool_result（与 `clear_tool_uses` 的 keep 对齐）用更宽的上限，让 Claude 完整看到
+/// 正在处理的工具输出；只对单条病态巨大(>该值)才截断。更旧的仍按 32K（且会被官方 clear 清掉）。
+const TOOL_RESULT_RECENT_TRUNCATE_CHARS: usize = 256_000;
 const CONTEXT_EDITING_TRIGGER_TOKENS: u64 = 100_000;
 const CONTEXT_EDITING_KEEP_TOOL_USES: u64 = 3;
 const COMPACTION_TRIGGER_TOKENS: u64 = 150_000;
@@ -236,7 +239,36 @@ async fn ensure_lan_request_authorized(
     headers: &HeaderMap,
 ) -> Result<(), RouteError> {
     let config = state.store.config().await;
+    // 共享请求（经隧道、带 X-Neko-Share）用分享令牌鉴权，不享受 loopback 豁免、也不看 lan_api_key。
+    if let Some(result) = share_request_token(&config, headers) {
+        return result.map(|_| ());
+    }
     validate_lan_authorization(&config.settings, remote_addr, headers)
+}
+
+/// 共享请求（带 `X-Neko-Share` 头）→ 校验 `Authorization` 里的分享令牌，返回匹配到的令牌；
+/// 非共享请求 → `None`（调用方走原有 LAN 鉴权，含 loopback 豁免）。
+fn share_request_token(
+    config: &AppConfig,
+    headers: &HeaderMap,
+) -> Option<Result<crate::types::ShareToken, RouteError>> {
+    headers.get("x-neko-share")?;
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(crate::share::extract_presented_token)
+        .unwrap_or_default();
+    Some(
+        crate::share::find_token(&config.settings.share_tokens, presented)
+            .cloned()
+            .ok_or_else(|| {
+                RouteError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "share_token_invalid",
+                    "Invalid or missing share token",
+                )
+            }),
+    )
 }
 
 fn validate_lan_authorization(
@@ -289,6 +321,33 @@ async fn proxy_lan_models(state: &ServerState, settings: &Settings) -> Response 
     }
 }
 
+/// 共享请求专用的 `/models`：把 config.models 过滤成令牌授权的，按 **model.id** 暴露
+/// （朋友请求与令牌限权都用 model.id，`resolve_direct_model` 也按 id 路由）。
+fn share_models_response(config: &AppConfig, token: &crate::types::ShareToken) -> Response {
+    let data: Vec<Value> = config
+        .models
+        .iter()
+        .filter(|model| {
+            model.enabled
+                && !model.image_generation
+                && token.allowed_model_ids.iter().any(|id| id == &model.id)
+        })
+        .map(|model| {
+            json!({
+                "id": crate::share::display_model_id(token, &model.id),
+                "object": "model",
+                "created": 0,
+                "owned_by": "neko-route",
+                "display_name": model.display_name,
+                "description": model.description,
+                "context_window": model.context_window,
+                "max_context_window": model.context_window,
+            })
+        })
+        .collect();
+    Json(json!({ "object": "list", "data": data })).into_response()
+}
+
 fn models_response(models: Vec<catalog::CatalogModel>) -> Response {
     Json(json!({
         "object": "list",
@@ -324,6 +383,13 @@ async fn models(
         return error.into_response();
     }
     let config = state.store.config().await;
+    // 共享请求：只返回该令牌授权的模型（按 model.id），朋友据此选 model。
+    if let Some(result) = share_request_token(&config, &headers) {
+        return match result {
+            Ok(token) => share_models_response(&config, &token),
+            Err(error) => error.into_response(),
+        };
+    }
     if config.settings.codex_injection_mode == CodexInjectionMode::LanShare {
         return proxy_lan_models(&state, &config.settings).await;
     }
@@ -402,6 +468,21 @@ async fn responses(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // 共享请求：鉴权已在入口完成，这里做模型限权——仅放行令牌授权的模型。
+    {
+        let config = state.store.config().await;
+        if let Some(Ok(token)) = share_request_token(&config, &headers) {
+            // 接受内部 ID 或自定义别名；都不匹配才拒绝。
+            if crate::share::resolve_shared_model(&token, &model).is_none() {
+                return RouteError::new(
+                    StatusCode::FORBIDDEN,
+                    "share_model_forbidden",
+                    format!("Share token does not permit model '{model}'"),
+                )
+                .into_response();
+            }
+        }
+    }
     let streaming = parsed_body
         .get("stream")
         .and_then(Value::as_bool)
@@ -518,7 +599,7 @@ async fn route_response(
     ),
     RouteError,
 > {
-    let model = body
+    let mut model = body
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| {
@@ -526,6 +607,21 @@ async fn route_response(
         })?
         .to_string();
     let config = state.store.config().await;
+    // 共享请求(经隧道、带 X-Neko-Share)：什么模型就用什么模型，不受 Codex 默认/兜底/辅助/记忆
+    // 路由影响（授权已在入口按令牌校验）。
+    let is_share = headers.get("x-neko-share").is_some();
+    // 共享请求：把下游看到的模型 ID(可能是用户给该令牌设的自定义别名)解析回内部 neko-model ID，
+    // 之后的路由匹配 + 上游转发都用内部 ID。
+    if is_share {
+        if let Some(Ok(token)) = share_request_token(&config, &headers) {
+            if let Some(internal) = crate::share::resolve_shared_model(&token, &model) {
+                if internal != model {
+                    body["model"] = json!(internal);
+                    model = internal;
+                }
+            }
+        }
+    }
     apply_image_gen_override(&mut body, &config);
     if config.settings.codex_injection_mode == CodexInjectionMode::LanShare {
         let lan_model = state
@@ -555,7 +651,7 @@ async fn route_response(
             .as_deref()
             .map(|id| !id.trim().is_empty())
             .unwrap_or(false);
-    let mut matched = if is_direct {
+    let mut matched = if is_direct && !is_share {
         direct_provider_match(&config, &model)?
     } else {
         match_route(&config, &model).map_err(|message| {
@@ -564,11 +660,30 @@ async fn route_response(
     };
     // 入站永远是 Codex 的 Responses 请求：在 body 被 move 进转发前先算请求画像（指令/工具/消息
     // 特征 + 分类）。无条件计算，让 Claude（Anthropic 出站）的请求也能在日志显示分类 badge。
-    let request_profile = responses_request_profile(&body);
-    // 直连模式不做模型重定向；仅非直连时按分类覆盖路由（记忆 agent / 辅助）。
-    // 分类只看入站 body，故记忆/辅助 agent 即使因 gpt-5.x-mini 未配置而兜底到 Claude，也会被
-    // 重定向到 memory_model / aux_model（而不是停在兜底模型上）。
-    if !is_direct {
+    let mut request_profile = responses_request_profile(&body);
+    // 守卫存活到本函数返回（请求处理完）→ 归还一个并发位。
+    let mut _share_guard: Option<crate::share::ShareGuard> = None;
+    // 共享请求标记为「共享」分类（而非误判成辅助），不走辅助/记忆/兜底覆盖；并强制 额度/并发/RPM 限额。
+    if is_share {
+        request_profile.request_kind = Some("share".to_string());
+        if let Some(Ok(token)) = share_request_token(&config, &headers) {
+            request_profile.share_token = Some(token.token.clone());
+            let spend = state.store.share_token_spend(&token.token).await;
+            _share_guard = Some(
+                crate::share::share_limiter()
+                    .acquire(&token, spend)
+                    .map_err(|reason| {
+                        RouteError::new(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "share_limit_exceeded",
+                            reason,
+                        )
+                    })?,
+            );
+        }
+    }
+    // 直连模式不做模型重定向；仅非直连、非共享时按分类覆盖路由（记忆 agent / 辅助）。
+    if !is_direct && !is_share {
         if let Some(override_match) =
             responses_route_override(&config, Some(&request_profile), &body)
         {
@@ -665,6 +780,7 @@ fn merge_request_classification(
     match base {
         Some(mut diag) => {
             diag.request_kind = profile.request_kind.clone();
+            diag.share_token = profile.share_token.clone();
             diag.instructions_preview = profile.instructions_preview.clone();
             diag.instructions_length = profile.instructions_length;
             diag.tool_count = profile.tool_count;
@@ -954,6 +1070,48 @@ fn gemini_image_headers(headers: Vec<(String, String)>) -> Vec<(String, String)>
         .collect()
 }
 
+/// 共享画图请求的令牌管控：校验令牌是否授权了 image_gen 模型，并占用并发/RPM/额度位。
+/// 返回 (share_token, guard)；非共享请求返回 (None, None)。守卫由调用方持有到请求结束（归还并发位）。
+async fn enforce_share_for_images(
+    state: &ServerState,
+    config: &AppConfig,
+    headers: &HeaderMap,
+    image_gen_id: &str,
+) -> Result<(Option<String>, Option<crate::share::ShareGuard>), RouteError> {
+    if headers.get("x-neko-share").is_none() {
+        return Ok((None, None));
+    }
+    let token = match share_request_token(config, headers) {
+        Some(Ok(token)) => token,
+        Some(Err(error)) => return Err(error),
+        None => return Ok((None, None)),
+    };
+    // 令牌必须授权了当前 image_gen 模型才能画图，否则报「此模型未授权」。
+    if crate::share::resolve_shared_model(&token, image_gen_id).is_none() {
+        return Err(RouteError::new(
+            StatusCode::FORBIDDEN,
+            "share_model_forbidden",
+            "此模型未授权",
+        ));
+    }
+    let spend = state.store.share_token_spend(&token.token).await;
+    let guard = crate::share::share_limiter()
+        .acquire(&token, spend)
+        .map_err(|reason| {
+            RouteError::new(StatusCode::TOO_MANY_REQUESTS, "share_limit_exceeded", reason)
+        })?;
+    Ok((Some(token.token), Some(guard)))
+}
+
+/// 画图日志的共享归属：有令牌则标 `request_kind=share` + `share_token`，供计费/过滤/徽章。
+fn share_image_context_bridge(share_token: &Option<String>) -> Option<ContextBridgeDiagnostics> {
+    share_token.as_ref().map(|tok| ContextBridgeDiagnostics {
+        request_kind: Some("share".to_string()),
+        share_token: Some(tok.clone()),
+        ..Default::default()
+    })
+}
+
 /// 把 `/v1/images/generations` 请求转发到「image_gen 模型」配置的画图 provider。
 /// 供 neko-image skill（Codex 主动 curl）使用，让画图走第三方画图 API。
 async fn forward_images_generations(
@@ -999,6 +1157,9 @@ async fn forward_images_generations(
             )
         })?;
     let client = client_for_provider(state, provider)?;
+    // 共享画图：校验令牌授权了 image_gen 模型 + 占用并发/RPM/额度位（守卫持到函数返回）。
+    let (share_token, _share_guard) =
+        enforce_share_for_images(state, &config, inbound_headers, image_gen_id).await?;
 
     let mut body: Value = serde_json::from_slice(&body_bytes).map_err(|error| {
         RouteError::new(
@@ -1028,6 +1189,14 @@ async fn forward_images_generations(
         .get("quality")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // 画图成本（按质量/尺寸/张数估算），用于共享额度计费与日志消费列。
+    let image_size = body.get("size").and_then(Value::as_str).map(str::to_string);
+    let image_n = body.get("n").and_then(Value::as_u64).unwrap_or(1);
+    let image_cost = crate::pricing::estimate_image_cost_usd(
+        image_quality.as_deref(),
+        image_size.as_deref(),
+        image_n,
+    );
     let is_gemini = provider.protocol == ProviderProtocol::GeminiImage;
     let request_body = if is_gemini {
         openai_image_req_to_gemini(&body, None)
@@ -1126,10 +1295,10 @@ async fn forward_images_generations(
             stream_error: None,
             last_event: None,
             stream_bytes: resp_bytes.len() as u64,
-            context_bridge: None,
+            context_bridge: share_image_context_bridge(&share_token),
             usage,
             context_usage: usage,
-            cost_usd: None,
+            cost_usd: Some(image_cost),
             image_preview,
         })
         .await;
@@ -1202,6 +1371,12 @@ async fn forward_images_edits(
             )
         })?;
     let client = client_for_provider(state, provider)?;
+    // 共享画图(编辑)：校验令牌授权 + 占用限额位（守卫持到函数返回）；按模型质量估算成本
+    // （multipart 难解析尺寸/张数，取默认）。
+    let (share_token, _share_guard) =
+        enforce_share_for_images(state, &config, inbound_headers, image_gen_id).await?;
+    let image_cost =
+        crate::pricing::estimate_image_cost_usd(model.image_quality.as_deref(), None, 1);
 
     // multipart 透传：保留入站 content-type(含 boundary)。
     let content_type = inbound_headers
@@ -1375,10 +1550,10 @@ async fn forward_images_edits(
             stream_error: None,
             last_event: None,
             stream_bytes: resp_bytes.len() as u64,
-            context_bridge: None,
+            context_bridge: share_image_context_bridge(&share_token),
             usage,
             context_usage: usage,
-            cost_usd: None,
+            cost_usd: Some(image_cost),
             image_preview,
         })
         .await;
@@ -1695,6 +1870,27 @@ async fn forward_responses_proxy(
     request_id: String,
 ) -> Result<(Response, Option<TokenUsage>), RouteError> {
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    // 共享请求(经隧道、带 X-Neko-Share)路由到官方后端时，把标准 Responses 请求归一化成官方后端
+    // 要的形式（input 字符串→数组、store→false），让对外分享地址兼容标准 OpenAI 客户端。
+    // 直连 / 用户自己的 Codex 不动，保持透传。
+    let share_official = inbound_headers.get("x-neko-share").is_some()
+        && matches!(
+            matched.provider.kind,
+            ProviderKind::OfficialOpenAi | ProviderKind::OfficialOpenAiAccount
+        );
+    let (body, body_bytes) = if share_official {
+        let mut body = body;
+        if normalize_official_responses_body(&mut body) {
+            let bytes = serde_json::to_vec(&body)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| body_bytes.clone());
+            (body, bytes)
+        } else {
+            (body, body_bytes)
+        }
+    } else {
+        (body, body_bytes)
+    };
     let upstream_body = responses_proxy_body(body, body_bytes, requested_model, matched)?;
     let url = responses_proxy_url(auth_mode, inbound_headers, &matched.provider)?;
     let client = client_for_provider(state, &matched.provider)?;
@@ -1731,10 +1927,105 @@ async fn forward_responses_proxy(
                 .await;
         }
     }
+    // 共享请求 + 客户端要的是非流式：官方后端只支持 stream:true，这里把它的 SSE 聚合成
+    // 标准的单个 Responses JSON 返回，让分享地址对非流式 OpenAI 客户端也兼容。
+    if share_official && !streaming {
+        return aggregate_official_responses_to_json(upstream).await;
+    }
     let context = RawProxyContext::from_response(&upstream, request_id.clone(), streaming);
     // Tap the passthrough stream to record token usage once it finishes,
     // without buffering the whole body in memory.
     Ok((proxy_raw(upstream, state.store.clone(), context), None))
+}
+
+/// 把标准 Responses API 请求归一化成官方 ChatGPT/Codex 后端要的形式：
+/// `input` 字符串 → `[{role:user, content:<text>}]`（协议允许字符串，官方后端要数组）；
+/// 强制 `store:false`、`stream:true`（官方后端只支持流式、且拒绝 store=true）。返回是否有改动。
+/// 客户端原本要非流式时，由 `aggregate_official_responses_to_json` 把 SSE 聚合回单个 JSON。
+fn normalize_official_responses_body(body: &mut Value) -> bool {
+    let mut changed = false;
+    if let Some(text) = body.get("input").and_then(Value::as_str).map(str::to_string) {
+        body["input"] = json!([{ "role": "user", "content": text }]);
+        changed = true;
+    }
+    if body.get("store").and_then(Value::as_bool) != Some(false) {
+        body["store"] = json!(false);
+        changed = true;
+    }
+    if body.get("stream").and_then(Value::as_bool) != Some(true) {
+        body["stream"] = json!(true);
+        changed = true;
+    }
+    // 官方 ChatGPT/Codex 后端拒收 `max_output_tokens`（Codex 自己从不发，所以原生没事；但标准
+    // Responses 客户端的"模型测试/连通检测"普遍会带它 → 报 Unsupported parameter）。剥离掉，让分享
+    // 地址对这些客户端也兼容。
+    if body.get("max_output_tokens").is_some() {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("max_output_tokens");
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// 官方 Codex 后端只支持 `stream:true`。当共享端的客户端要非流式响应时，把后端的 SSE 聚合成
+/// 标准的单个 Responses JSON（取 `response.completed` 的 response，output 从 `response.output_item.done`
+/// 拼齐），让分享地址对非流式 OpenAI 客户端也兼容。
+async fn aggregate_official_responses_to_json(
+    upstream: reqwest::Response,
+) -> Result<(Response, Option<TokenUsage>), RouteError> {
+    let status = upstream.status();
+    let bytes = upstream.bytes().await.map_err(|error| {
+        RouteError::new(
+            StatusCode::BAD_GATEWAY,
+            "upstream_read_failed",
+            error.to_string(),
+        )
+    })?;
+    let text = String::from_utf8_lossy(&bytes);
+    if !status.is_success() {
+        let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let value: Value =
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({ "error": text.to_string() }));
+        return Ok(((code, Json(value)).into_response(), None));
+    }
+    let mut final_response: Option<Value> = None;
+    let mut output_items: Vec<Value> = Vec::new();
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.completed") => final_response = value.get("response").cloned(),
+            Some("response.output_item.done") => {
+                if let Some(item) = value.get("item").cloned() {
+                    output_items.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut response = final_response.ok_or_else(|| {
+        RouteError::new(
+            StatusCode::BAD_GATEWAY,
+            "aggregate_failed",
+            "upstream stream had no response.completed event",
+        )
+    })?;
+    if response
+        .get("output")
+        .and_then(Value::as_array)
+        .map(|items| items.is_empty())
+        .unwrap_or(true)
+        && !output_items.is_empty()
+    {
+        response["output"] = Value::Array(output_items);
+    }
+    let usage = usage_from_responses_text(&text);
+    Ok((Json(response).into_response(), usage))
 }
 
 fn responses_proxy_body(
@@ -1795,6 +2086,13 @@ fn official_responses_endpoint(
     inbound_headers: &HeaderMap,
     provider: &Provider,
 ) -> Result<String, RouteError> {
+    // 共享请求：鉴权恒用本机 auth.json 的 OAuth token（见 proxy_request_headers 的 CodexOfficial
+    // 分支），与朋友的入站 token 无关。端点必须走 chatgpt 后端——否则朋友若用 sk- 形态的共享秘钥，
+    // 会被下面的 is_public_openai_api_key 误判为「公开 API key」而路由到 api.openai.com/v1，OAuth
+    // token 在平台 API 上缺 api.responses.write scope → 401。
+    if inbound_headers.get("x-neko-share").is_some() {
+        return Ok("https://chatgpt.com/backend-api/codex/responses".to_string());
+    }
     let auth = inbound_headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -1870,26 +2168,48 @@ async fn proxy_request_headers(
 
     match auth_mode {
         ResponsesAuthMode::CodexOfficial => {
-            let auth = inbound_headers
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| {
-                    RouteError::new(
-                        StatusCode::UNAUTHORIZED,
-                        "missing_openai_auth",
-                        "This model uses OpenAI Official Account, but Codex did not send Authorization",
-                    )
-                })?;
-            headers.push(("authorization".to_string(), auth.to_string()));
-            if !is_public_openai_api_key(auth)
-                && !headers
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case("openai-beta"))
-            {
-                headers.push((
-                    "openai-beta".to_string(),
-                    "responses_websockets=2026-02-06".to_string(),
-                ));
+            // 共享请求经隧道而来、带的是分享令牌——朋友没有也不该有官方凭证。
+            // 改用本机 auth.json 的官方 token + account_id 注入官方头（而非透传朋友的令牌）。
+            if inbound_headers.get("x-neko-share").is_some() {
+                let (_, token, account_id) = official_auth::openai_token_for_codex(client)
+                    .await
+                    .map_err(|message| {
+                        RouteError::new(
+                            StatusCode::FAILED_DEPENDENCY,
+                            "codex_official_auth",
+                            message,
+                        )
+                    })?;
+                for (name, value) in
+                    official_auth::openai_codex_headers(&token.access_token, &account_id)
+                {
+                    if name.eq_ignore_ascii_case("content-type") {
+                        continue;
+                    }
+                    set_proxy_header(&mut headers, &name, &value);
+                }
+            } else {
+                let auth = inbound_headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| {
+                        RouteError::new(
+                            StatusCode::UNAUTHORIZED,
+                            "missing_openai_auth",
+                            "This model uses OpenAI Official Account, but Codex did not send Authorization",
+                        )
+                    })?;
+                headers.push(("authorization".to_string(), auth.to_string()));
+                if !is_public_openai_api_key(auth)
+                    && !headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("openai-beta"))
+                {
+                    headers.push((
+                        "openai-beta".to_string(),
+                        "responses_websockets=2026-02-06".to_string(),
+                    ));
+                }
             }
         }
         ResponsesAuthMode::StoredOfficialAccount => {
@@ -2341,40 +2661,63 @@ fn truncate_tool_result_with_marker(content: &str, max_chars: usize) -> String {
 }
 
 /// 遍历最终 body 的所有 tool_result，按字符预算逐条截断。统计写入 diagnostics。
+/// 最近 `keep_recent` 条（与官方 clear_tool_uses 的 keep 对齐）用 `recent_max_chars`，其余用
+/// `old_max_chars`——让 Claude 完整看到正在处理的工具输出，只对更旧的下狠手。
 fn truncate_tool_results_in_body(
     body: &mut Value,
-    max_chars: usize,
+    old_max_chars: usize,
+    recent_max_chars: usize,
+    keep_recent: usize,
     diagnostics: &mut ContextBridgeDiagnostics,
 ) {
-    if max_chars == 0 {
-        return;
-    }
-    let mut truncated = 0u64;
-    let mut truncated_bytes = 0u64;
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    for message in messages.iter_mut() {
-        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+    // 先按出现顺序收集所有 tool_result 的位置（message_idx, part_idx）。
+    let mut positions: Vec<(usize, usize)> = Vec::new();
+    for (mi, message) in messages.iter().enumerate() {
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
             continue;
         };
-        for part in parts.iter_mut() {
-            if part.get("type").and_then(Value::as_str) != Some("tool_result") {
-                continue;
+        for (pi, part) in parts.iter().enumerate() {
+            if part.get("type").and_then(Value::as_str) == Some("tool_result") {
+                positions.push((mi, pi));
             }
-            // 本项目生成的 tool_result content 是 String。
-            let Some(text) = part.get("content").and_then(Value::as_str) else {
-                continue;
-            };
-            if text.chars().count() <= max_chars {
-                continue;
-            }
-            let before = text.len();
-            let truncated_text = truncate_tool_result_with_marker(text, max_chars);
-            truncated += 1;
-            truncated_bytes += before.saturating_sub(truncated_text.len()) as u64;
-            part["content"] = Value::String(truncated_text);
         }
+    }
+    let recent_start = positions.len().saturating_sub(keep_recent);
+    let mut truncated = 0u64;
+    let mut truncated_bytes = 0u64;
+    for (idx, (mi, pi)) in positions.into_iter().enumerate() {
+        // 最近 keep_recent 条用高上限，其余用旧上限。
+        let max_chars = if idx >= recent_start {
+            recent_max_chars
+        } else {
+            old_max_chars
+        };
+        if max_chars == 0 {
+            continue;
+        }
+        let Some(part) = messages
+            .get_mut(mi)
+            .and_then(|message| message.get_mut("content"))
+            .and_then(Value::as_array_mut)
+            .and_then(|parts| parts.get_mut(pi))
+        else {
+            continue;
+        };
+        // 本项目生成的 tool_result content 是 String。
+        let Some(text) = part.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        if text.chars().count() <= max_chars {
+            continue;
+        }
+        let before = text.len();
+        let truncated_text = truncate_tool_result_with_marker(text, max_chars);
+        truncated += 1;
+        truncated_bytes += before.saturating_sub(truncated_text.len()) as u64;
+        part["content"] = Value::String(truncated_text);
     }
     diagnostics.tool_results_truncated = truncated;
     diagnostics.tool_results_truncated_bytes = truncated_bytes;
@@ -2499,7 +2842,13 @@ fn finalize_outgoing_body(
     context_key: &str,
     inject_official: bool,
 ) {
-    truncate_tool_results_in_body(body, TOOL_RESULT_TRUNCATE_CHARS, diagnostics);
+    truncate_tool_results_in_body(
+        body,
+        TOOL_RESULT_TRUNCATE_CHARS,
+        TOOL_RESULT_RECENT_TRUNCATE_CHARS,
+        CONTEXT_EDITING_KEEP_TOOL_USES as usize,
+        diagnostics,
+    );
     if diagnostics.tool_results_truncated > 0 {
         eprintln!(
             "[neko-route][trunc] tool_results_truncated={} bytes={}",
@@ -2567,6 +2916,7 @@ fn should_skip_proxy_request_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "authorization"
+            | "x-neko-share"
             | "content-type"
             | "host"
             | "connection"
@@ -3451,6 +3801,7 @@ fn converted_chat_sse(
         let mut text_output_index: Option<usize> = None;
         let mut tool_calls: Vec<StreamingToolCall> = Vec::new();
         let mut pending = String::new();
+        let mut carry: Vec<u8> = Vec::new();
         let mut captured_usage: Option<TokenUsage> = None;
         let mut finish_reason: Option<String> = None;
         let mut last_stream_event: Option<String> = None;
@@ -3485,7 +3836,7 @@ fn converted_chat_sse(
                 }
             };
             progress.observe_bytes(&bytes).await;
-            pending.push_str(&String::from_utf8_lossy(&bytes));
+            pending.push_str(&decode_utf8_streaming(&mut carry, &bytes));
             while let Some((index, boundary_len)) = find_sse_boundary(&pending) {
                 let event = pending[..index].to_string();
                 pending = pending[index + boundary_len..].to_string();
@@ -3863,6 +4214,7 @@ fn converted_anthropic_sse(
         let mut compaction_block_indices: HashSet<usize> = HashSet::new();
         let mut compaction_text = String::new();
         let mut pending = String::new();
+        let mut carry: Vec<u8> = Vec::new();
         let mut anthropic_usage = serde_json::Map::new();
         let mut context_usage: Option<TokenUsage> = None;
         let mut saw_message_stop = false;
@@ -3881,7 +4233,7 @@ fn converted_anthropic_sse(
                 }
             };
             progress.observe_bytes(&bytes).await;
-            pending.push_str(&String::from_utf8_lossy(&bytes));
+            pending.push_str(&decode_utf8_streaming(&mut carry, &bytes));
             while let Some((index, boundary_len)) = find_sse_boundary(&pending) {
                 let event = pending[..index].to_string();
                 pending = pending[index + boundary_len..].to_string();
@@ -4685,6 +5037,34 @@ fn chat_tool_call_deltas(value: &Value) -> Vec<ChatToolCallDelta> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 流式 UTF-8 解码：新字节接到 `carry`，解码出完整 UTF-8 部分返回；末尾不完整的多字节字符
+/// 留在 `carry` 等下一个 chunk，避免跨 chunk 的字符被 lossy 解码成 U+FFFD（乱码）。
+fn decode_utf8_streaming(carry: &mut Vec<u8>, bytes: &[u8]) -> String {
+    carry.extend_from_slice(bytes);
+    match std::str::from_utf8(carry) {
+        Ok(text) => {
+            let out = text.to_string();
+            carry.clear();
+            out
+        }
+        Err(error) => {
+            let valid = error.valid_up_to();
+            let out = std::str::from_utf8(&carry[..valid]).unwrap_or("").to_string();
+            match error.error_len() {
+                // 末尾不完整的多字节序列：留到下一个 chunk 再解。
+                None => {
+                    carry.drain(..valid);
+                }
+                // 中途真正非法的字节：丢弃，避免卡死（正常流不会走到这）。
+                Some(bad) => {
+                    carry.drain(..valid + bad);
+                }
+            }
+            out
+        }
+    }
 }
 
 fn find_sse_boundary(input: &str) -> Option<(usize, usize)> {
@@ -6762,10 +7142,12 @@ mod tests {
         chat_completions_compatibility_profile, chat_reasoning_content_from_input_item,
         chat_tool_call_deltas, classify_raw_stream_finish, classify_responses_request,
         claude_code_mirror_headers, claude_request_reasoning_effort, context_bridge_diagnostics,
-        converted_anthropic_sse, converted_chat_sse, direct_provider_match, endpoint,
+        converted_anthropic_sse, converted_chat_sse, decode_utf8_streaming, direct_provider_match,
+        endpoint,
         event_data_lines, extract_stream_delta, find_sse_boundary, forward_chat_completions,
         forward_responses_proxy, is_public_openai_api_key, json_size, lan_proxy_request_headers,
         map_openai_chat_reasoning_effort, map_reasoning_effort, merge_request_classification,
+        normalize_official_responses_body,
         official_responses_endpoint, post_bytes_with_retries, proxy_lan_models, proxy_raw,
         proxy_request_headers, response_stream_done_events, response_stream_start_events,
         responses_proxy_body, responses_proxy_url, responses_request_profile,
@@ -7006,6 +7388,35 @@ mod tests {
     }
 
     #[test]
+    fn decode_utf8_streaming_handles_split_multibyte() {
+        // "中" = E4 B8 AD，拆在两个 chunk 边界：前半截不完整、后半截补齐。
+        let mut carry: Vec<u8> = Vec::new();
+        let part1 = decode_utf8_streaming(&mut carry, &[0xE4, 0xB8]);
+        assert_eq!(part1, ""); // 不完整，留在 carry
+        let part2 = decode_utf8_streaming(&mut carry, &[0xAD]);
+        assert_eq!(part2, "中"); // 补齐后解出完整字符，不再是 ��
+        assert!(carry.is_empty());
+
+        // 完整输入原样返回。
+        let mut carry2: Vec<u8> = Vec::new();
+        assert_eq!(
+            decode_utf8_streaming(&mut carry2, "hello 世界".as_bytes()),
+            "hello 世界"
+        );
+
+        // 中文+emoji 串按 2 字节切碎喂入，拼回必须无损、无 U+FFFD。
+        let mut carry3: Vec<u8> = Vec::new();
+        let full = "流式中文测试😀";
+        let mut out = String::new();
+        for chunk in full.as_bytes().chunks(2) {
+            out.push_str(&decode_utf8_streaming(&mut carry3, chunk));
+        }
+        assert_eq!(out, full);
+        assert!(!out.contains('\u{FFFD}'));
+        assert!(carry3.is_empty());
+    }
+
+    #[test]
     fn truncate_tool_result_with_marker_keeps_head_tail() {
         assert_eq!(truncate_tool_result_with_marker("hello", 100), "hello");
         let long = "a".repeat(500) + &"b".repeat(500);
@@ -7017,25 +7428,69 @@ mod tests {
     }
 
     #[test]
-    fn truncate_tool_results_in_body_truncates_large_results() {
+    fn truncate_tool_results_keeps_recent_full_truncates_old() {
+        let make = |id: &str| {
+            json!({ "type": "tool_result", "tool_use_id": id, "content": "x".repeat(5000) })
+        };
         let mut body = json!({
             "messages": [{
                 "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": "t1",
-                    "content": "x".repeat(5000)
-                }]
+                "content": [make("t1"), make("t2"), make("t3"), make("t4"), make("t5")]
             }]
         });
         let mut diag = ContextBridgeDiagnostics::default();
-        truncate_tool_results_in_body(&mut body, 1000, &mut diag);
-        assert_eq!(diag.tool_results_truncated, 1);
-        let content = body["messages"][0]["content"][0]["content"]
-            .as_str()
-            .unwrap();
-        assert!(content.contains("[truncated"));
-        assert!(content.chars().count() < 5000);
+        // 旧上限 1000、最近上限 10000、保留最近 3 条。
+        truncate_tool_results_in_body(&mut body, 1000, 10_000, 3, &mut diag);
+        // 只有前 2 条（旧）被截断；最近 3 条 5000 < 10000，完整保留。
+        assert_eq!(diag.tool_results_truncated, 2);
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        let len = |i: usize| parts[i]["content"].as_str().unwrap().chars().count();
+        assert!(len(0) < 5000);
+        assert!(parts[0]["content"].as_str().unwrap().contains("[truncated"));
+        assert!(len(1) < 5000);
+        assert_eq!(len(2), 5000);
+        assert_eq!(len(3), 5000);
+        assert_eq!(len(4), 5000);
+    }
+
+    #[test]
+    fn official_responses_normalizes_for_backend() {
+        let mut body = json!({ "model": "gpt-5.4", "input": "hello there" });
+        assert!(normalize_official_responses_body(&mut body));
+        assert_eq!(body["input"], json!([{ "role": "user", "content": "hello there" }]));
+        assert_eq!(body["store"], json!(false));
+        assert_eq!(body["stream"], json!(true));
+    }
+
+    #[test]
+    fn official_responses_leaves_compliant_body_unchanged() {
+        let mut body =
+            json!({ "input": [{ "role": "user", "content": "hi" }], "store": false, "stream": true });
+        assert!(!normalize_official_responses_body(&mut body));
+    }
+
+    #[test]
+    fn official_responses_forces_store_false_and_stream_true() {
+        let mut body =
+            json!({ "input": [{ "role": "user", "content": "hi" }], "store": true, "stream": false });
+        assert!(normalize_official_responses_body(&mut body));
+        assert_eq!(body["store"], json!(false));
+        assert_eq!(body["stream"], json!(true));
+    }
+
+    #[test]
+    fn official_responses_strips_max_output_tokens() {
+        // 标准 Responses 客户端的模型测试常带 max_output_tokens，官方 ChatGPT 后端拒收 → 必须剥离。
+        let mut body = json!({
+            "input": [{ "role": "user", "content": "hi" }],
+            "store": false,
+            "stream": true,
+            "max_output_tokens": 128
+        });
+        assert!(normalize_official_responses_body(&mut body));
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["store"], json!(false));
+        assert_eq!(body["stream"], json!(true));
     }
 
     #[test]

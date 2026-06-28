@@ -86,6 +86,44 @@ export type SettingsState = {
   aux_model: string | null;
   memory_model: string | null;
   direct_provider_id: string | null;
+  share_enabled: boolean;
+  share_identity: string;
+  share_secret: string;
+  share_tokens: ShareToken[];
+  /** 用户是否已点「我已了解」共享介绍卡片（true = 永不再提示）。 */
+  share_intro_acknowledged: boolean;
+};
+
+export type ShareToken = {
+  token: string;
+  label: string;
+  allowed_model_ids: string[];
+  /** 金额额度上限（美元）；null = 无限制。 */
+  amount_limit_usd: number | null;
+  /** 并发请求上限；0 = 无限制。 */
+  concurrency_limit: number;
+  /** 每分钟请求上限(RPM)；0 = 无限制。 */
+  rpm_limit: number;
+  /** 内部模型 ID → 下游可见的自定义模型 ID（别名）。空 = 下游直接看到内部 ID。 */
+  model_aliases: Record<string, string>;
+};
+
+export type ShareTunnelStatus = {
+  state: "disabled" | "connecting" | "connected" | "error";
+  message: string | null;
+};
+
+export type ShareOverview = {
+  enabled: boolean;
+  identity: string;
+  domain: string;
+  base_url: string;
+  tokens: ShareToken[];
+  status: ShareTunnelStatus;
+  /** 每个令牌的历史累计消费（令牌串 → 美元），用于「已用 / 上限」展示。 */
+  token_spend: Record<string, number>;
+  /** 各令牌当前正在处理的请求数（令牌串 → 数量），用于「正在使用 / 总并发」如 2/10。 */
+  token_active: Record<string, number>;
 };
 
 export type AppConfig = {
@@ -133,6 +171,8 @@ export type ContextBridgeDiagnostics = {
   compaction_persisted: boolean;
   compaction_injected: boolean;
   request_kind?: string | null;
+  /** 共享请求命中的令牌串（用于日志展示/过滤）；null = 非共享。 */
+  share_token?: string | null;
   instructions_preview?: string | null;
   instructions_length?: number;
   tool_count?: number;
@@ -399,5 +439,6 @@ export type Page =
   | "keys"
   | "logs"
   | "health"
+  | "share"
   | "wizard"
   | "about";

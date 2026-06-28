@@ -463,7 +463,13 @@ mod tests {
             .find(|model| model["display_name"] == "Claude Opus 4.8")
             .unwrap();
 
-        assert_eq!(claude["slug"], "gpt-5.5");
+        // 放行官方账号模型后，seeded 的官方 gpt-5.5(fallback、id 即 slot 名)会占用 gpt-5.5 slot，
+        // Claude 顺延到下一个 slot。这里只关心 Claude 被导出为「某个 Codex slot」而非裸 id。
+        let slug = claude["slug"].as_str().unwrap();
+        assert!(
+            codex_alias::is_codex_slot(slug),
+            "Claude 应导出为某个 Codex slot，实际 {slug}"
+        );
         assert_eq!(claude["default_reasoning_level"], "xhigh");
     }
 

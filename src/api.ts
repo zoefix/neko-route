@@ -14,11 +14,12 @@ import type {
   OAuthStart,
   ProviderCredential,
   RequestLogPage,
+  ShareOverview,
   StartModelTestResult,
   TestModelResult,
   UpstreamModelList,
 } from "./types";
-import { isTauri, mockCancelModelTest, mockGetModelTestStatus, mockModelHealth, mockSnapshot, mockStartModelTest, mockTestModel, mockUpstreamModels } from "./mock";
+import { isTauri, mockCancelModelTest, mockCreateShareToken, mockDeleteShareToken, mockGetModelTestStatus, mockModelHealth, mockSetShareEnabled, mockShareOverview, mockUpdateShareToken, mockSnapshot, mockStartModelTest, mockTestModel, mockUpstreamModels } from "./mock";
 
 // In-memory snapshot used only when running in a plain browser (web:dev preview).
 let demo: AppSnapshot | null = null;
@@ -30,6 +31,79 @@ function demoSnap(): AppSnapshot {
 export const api = {
   getSnapshot: () =>
     isTauri ? invoke<AppSnapshot>("get_snapshot") : Promise.resolve(demoSnap()),
+  shareOverview: () =>
+    isTauri ? invoke<ShareOverview>("share_overview") : Promise.resolve(mockShareOverview()),
+  setShareEnabled: (enabled: boolean) =>
+    isTauri
+      ? invoke<ShareOverview>("set_share_enabled", { enabled })
+      : Promise.resolve(mockSetShareEnabled(enabled)),
+  createShareToken: (
+    token: string,
+    label: string,
+    allowedModelIds: string[],
+    amountLimitUsd: number | null,
+    concurrencyLimit: number,
+    rpmLimit: number,
+    modelAliases: Record<string, string>,
+  ) =>
+    isTauri
+      ? invoke<ShareOverview>("create_share_token", {
+          token,
+          label,
+          allowedModelIds,
+          amountLimitUsd,
+          concurrencyLimit,
+          rpmLimit,
+          modelAliases,
+        })
+      : Promise.resolve(
+          mockCreateShareToken(
+            token,
+            label,
+            allowedModelIds,
+            amountLimitUsd,
+            concurrencyLimit,
+            rpmLimit,
+            modelAliases,
+          ),
+        ),
+  updateShareToken: (
+    token: string,
+    newToken: string,
+    label: string,
+    allowedModelIds: string[],
+    amountLimitUsd: number | null,
+    concurrencyLimit: number,
+    rpmLimit: number,
+    modelAliases: Record<string, string>,
+  ) =>
+    isTauri
+      ? invoke<ShareOverview>("update_share_token", {
+          token,
+          newToken,
+          label,
+          allowedModelIds,
+          amountLimitUsd,
+          concurrencyLimit,
+          rpmLimit,
+          modelAliases,
+        })
+      : Promise.resolve(
+          mockUpdateShareToken(
+            token,
+            newToken,
+            label,
+            allowedModelIds,
+            amountLimitUsd,
+            concurrencyLimit,
+            rpmLimit,
+            modelAliases,
+          ),
+        ),
+  deleteShareToken: (token: string) =>
+    isTauri
+      ? invoke<ShareOverview>("delete_share_token", { token })
+      : Promise.resolve(mockDeleteShareToken(token)),
 
   saveConfig: (config: AppConfig) => {
     if (!isTauri) {
@@ -324,9 +398,20 @@ export const api = {
           codex_home: "/demo/.codex",
         } as ImportResult),
 
-  getRequestLogs: (page: number, pageSize: number) => {
+  getRequestLogs: (
+    page: number,
+    pageSize: number,
+    shareToken?: string | null,
+  ) => {
     if (!isTauri) {
-      const requests = demoSnap().requests;
+      let requests = demoSnap().requests;
+      if (shareToken === "__local__") {
+        requests = requests.filter((r) => !r.context_bridge?.share_token);
+      } else if (shareToken) {
+        requests = requests.filter(
+          (r) => r.context_bridge?.share_token === shareToken,
+        );
+      }
       const offset = (Math.max(1, page) - 1) * pageSize;
       return Promise.resolve({
         records: requests.slice(offset, offset + pageSize),
@@ -335,7 +420,11 @@ export const api = {
         page_size: pageSize,
       } as RequestLogPage);
     }
-    return invoke<RequestLogPage>("get_request_logs", { page, pageSize });
+    return invoke<RequestLogPage>("get_request_logs", {
+      page,
+      pageSize,
+      shareToken: shareToken ?? null,
+    });
   },
 
   clearRequestLogs: () => {

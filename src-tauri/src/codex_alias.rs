@@ -1,4 +1,4 @@
-use crate::types::{AppConfig, CodexInjectionMode, CodexSlotAssignment, ModelEntry, ProviderKind};
+use crate::types::{AppConfig, CodexInjectionMode, CodexSlotAssignment, ModelEntry};
 use std::collections::{HashMap, HashSet};
 
 pub const CODEX_SLOT_POOL: &[&str] = &[
@@ -82,13 +82,6 @@ pub fn local_slot_targets(
             allowed_model_ids
                 .map(|allowed| allowed.contains(&model.id))
                 .unwrap_or(true)
-        })
-        .filter(|model| {
-            config
-                .providers
-                .iter()
-                .find(|provider| provider.id == model.provider_id)
-                .is_some_and(|provider| provider.kind != ProviderKind::OfficialOpenAi)
         })
         .map(|model| CodexSlotTarget {
             source: local_slot_source(model),
@@ -431,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn local_targets_ignore_official_openai_provider() {
+    fn local_targets_include_official_openai_provider() {
         let mut config = seeded_config();
         config.providers.push(Provider {
             id: "custom-chat".into(),
@@ -449,10 +442,11 @@ mod tests {
 
         let targets = local_slot_targets(&config, None);
 
+        // 第三方模式下，Custom 与官方账号(OfficialOpenAi)的 enabled 模型都应进 slot 分配。
         assert!(targets
             .iter()
             .any(|target| target.target_model_id == "deepseek-v4-pro"));
-        assert!(!targets
+        assert!(targets
             .iter()
             .any(|target| target.target_model_id == "gpt-5.5"));
     }

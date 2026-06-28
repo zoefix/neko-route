@@ -451,11 +451,21 @@ export function Modal({
   if (!mounted) return null;
 
   return createPortal(
-    <div className={`modal-overlay ${visible ? "show" : ""}`} onMouseDown={closeOnOverlay ? onClose : undefined}>
+    <div
+      className={`modal-overlay ${visible ? "show" : ""}`}
+      onMouseDown={
+        closeOnOverlay
+          ? (e) => {
+              // 仅当直接点击遮罩层(而非模态内容)时关闭；不再 stopPropagation，
+              // 这样模态内的 mousedown 能冒泡到 document，下拉框的点击外部关闭才生效。
+              if (e.target === e.currentTarget) onClose();
+            }
+          : undefined
+      }
+    >
       <div
         className={`modal ${visible ? "show" : ""}`}
         style={{ maxWidth: width }}
-        onMouseDown={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
       >

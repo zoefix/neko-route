@@ -48,25 +48,17 @@ impl AppStore {
     pub fn load(app_data_dir: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(&app_data_dir).map_err(|error| error.to_string())?;
         let config_path = app_data_dir.join("config.json");
-        let (mut config, prior_version) = if config_path.exists() {
+        let config = if config_path.exists() {
             let raw = fs::read_to_string(&config_path).map_err(|error| error.to_string())?;
             match serde_json::from_str::<AppConfig>(&raw) {
-                Ok(parsed) => {
-                    let prior = parsed.version;
-                    (normalize_config(parsed), prior)
-                }
-                Err(_) => (normalize_config(reset_config_preserving_settings(&raw)), 0),
+                Ok(parsed) => normalize_config(parsed),
+                Err(_) => normalize_config(reset_config_preserving_settings(&raw)),
             }
         } else {
-            (normalize_config(default_config()), CURRENT_CONFIG_VERSION)
+            normalize_config(default_config())
         };
 
         let key_store = KeyStore::new(&app_data_dir);
-        // 一次性迁移：清掉挂在「未登录内置客户端 provider」上的历史预设模型——
-        // 这些模型在 UI 里被隐藏、删不掉、又不可用，是一堆 BUG 的根源。
-        if prior_version < 15 {
-            drop_unavailable_preset_models(&mut config, &key_store);
-        }
         fs::write(&config_path, to_string_pretty(&config).unwrap())
             .map_err(|error| error.to_string())?;
 
@@ -354,16 +346,47 @@ impl AppStore {
         }
     }
 
+    /// 无过滤分页便捷封装（现仅单测使用；生产路径走 `request_log_page_filtered`）。
+    #[cfg(test)]
     pub async fn request_log_page(&self, page: usize, page_size: usize) -> RequestLogPage {
+        self.request_log_page_filtered(page, page_size, None).await
+    }
+
+    /// 分页 + 可选共享令牌过滤（见 `RequestLog::page_filtered`）。
+    pub async fn request_log_page_filtered(
+        &self,
+        page: usize,
+        page_size: usize,
+        share_token: Option<String>,
+    ) -> RequestLogPage {
         let log = self.inner.log.clone();
-        tokio::task::spawn_blocking(move || log.page(page, page_size))
+        tokio::task::spawn_blocking(move || {
+            log.page_filtered(page, page_size, share_token.as_deref())
+        })
+        .await
+        .unwrap_or_else(|_| RequestLogPage {
+            records: Vec::new(),
+            total: 0,
+            page: page.max(1),
+            page_size: page_size.clamp(1, 200),
+        })
+    }
+
+    /// 某共享令牌的历史累计消费（美元），用于额度强制。
+    pub async fn share_token_spend(&self, token: &str) -> f64 {
+        let log = self.inner.log.clone();
+        let token = token.to_string();
+        tokio::task::spawn_blocking(move || log.share_token_spend(&token))
             .await
-            .unwrap_or_else(|_| RequestLogPage {
-                records: Vec::new(),
-                total: 0,
-                page: page.max(1),
-                page_size: page_size.clamp(1, 200),
-            })
+            .unwrap_or(0.0)
+    }
+
+    /// 改秘钥时迁移请求日志里的 `share_token`，保留消费/统计连续性。
+    pub async fn rename_share_token(&self, old: &str, new: &str) {
+        let log = self.inner.log.clone();
+        let old = old.to_string();
+        let new = new.to_string();
+        let _ = tokio::task::spawn_blocking(move || log.rename_share_token(&old, &new)).await;
     }
 
     pub async fn update_provider_usage_snapshot(
@@ -735,7 +758,12 @@ impl AppStore {
 
     fn third_party_provider_available(&self, provider: &Provider) -> Result<bool, String> {
         match provider.kind {
-            ProviderKind::OfficialOpenAi => Ok(false),
+            ProviderKind::OfficialOpenAi => {
+                // 与其它官方 kind 一致：第三方模式下也按登录状态(auth.json)放行，
+                // 而非一刀切排除——否则用户挂在官方账号下的模型永远进不了 catalog。
+                let status = official_auth::codex_openai_status(provider);
+                Ok(status.present && status.available)
+            }
             ProviderKind::OfficialOpenAiAccount | ProviderKind::OfficialAnthropicAccount => {
                 let status = official_auth::status_for_provider(provider);
                 Ok(status.present && status.available)
@@ -881,43 +909,19 @@ pub fn validate_bind_settings(config: &AppConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// 清理挂在「未登录内置客户端 provider」上的模型(历史预设遗留)。
-/// 这些 provider(OpenAI/Claude CLI/Claude Desktop)未登录时在 UI 被隐藏、模型删不掉、
-/// 又不可用——直接移除。已登录在用的保留；兜底若指向被删模型则置空。
-fn drop_unavailable_preset_models(config: &mut AppConfig, key_store: &KeyStore) {
-    let unavailable: HashSet<String> = config
-        .providers
-        .iter()
-        .filter(|provider| {
-            matches!(
-                provider.kind,
-                ProviderKind::OfficialOpenAi
-                    | ProviderKind::OfficialAnthropicCli
-                    | ProviderKind::OfficialAnthropicDesktop
-            )
-        })
-        .filter(|provider| !key_store.status_for_provider(provider).present)
-        .map(|provider| provider.id.clone())
-        .collect();
-    if unavailable.is_empty() {
-        return;
-    }
-    config
-        .models
-        .retain(|model| !unavailable.contains(&model.provider_id));
-    if let Some(fallback) = config.settings.fallback_model.clone() {
-        if !config.models.iter().any(|model| model.id == fallback) {
-            config.settings.fallback_model = None;
-        }
-    }
-}
-
 pub fn normalize_config(mut config: AppConfig) -> AppConfig {
     config.version = CURRENT_CONFIG_VERSION;
     if config.settings.lan_api_key.trim().is_empty() {
         config.settings.lan_api_key = lan_share::generate_api_key();
     } else {
         config.settings.lan_api_key = config.settings.lan_api_key.trim().to_string();
+    }
+    // 共享身份/密钥首次启动生成、之后持久不变（身份即公网子域名）。
+    if config.settings.share_identity.trim().is_empty() {
+        config.settings.share_identity = crate::share::generate_identity();
+    }
+    if config.settings.share_secret.trim().is_empty() {
+        config.settings.share_secret = crate::share::generate_secret();
     }
     config.settings.lan_remote_host = config.settings.lan_remote_host.trim().to_string();
     config.settings.lan_remote_api_key = config.settings.lan_remote_api_key.trim().to_string();

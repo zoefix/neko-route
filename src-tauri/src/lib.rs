@@ -13,6 +13,8 @@ mod request_log;
 mod router;
 mod server;
 mod session_import;
+mod share;
+mod share_tunnel;
 mod store;
 mod types;
 mod usage;
@@ -3081,8 +3083,11 @@ async fn get_request_logs(
     store: tauri::State<'_, AppStore>,
     page: usize,
     page_size: usize,
+    share_token: Option<String>,
 ) -> Result<RequestLogPage, String> {
-    Ok(store.request_log_page(page, page_size).await)
+    Ok(store
+        .request_log_page_filtered(page, page_size, share_token)
+        .await)
 }
 
 #[cfg(test)]
@@ -3730,6 +3735,211 @@ fn setup_tray(app: &mut tauri::App, exit_requested: Arc<AtomicBool>) -> tauri::R
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct ShareOverview {
+    enabled: bool,
+    identity: String,
+    domain: String,
+    base_url: String,
+    tokens: Vec<crate::types::ShareToken>,
+    status: share_tunnel::ShareTunnelStatus,
+    /// 每个令牌的历史累计消费（令牌串 → 美元），UI 显示「已用 / 上限」。
+    token_spend: std::collections::HashMap<String, f64>,
+    /// 各令牌当前正在处理的请求数（令牌串 → 数量），UI 显示「正在使用 / 总并发」如 2/10。
+    token_active: std::collections::HashMap<String, u32>,
+}
+
+/// 朋友访问用的公网主机（默认 share.neko.arm.moe；NEKO_SHARE_HOST 覆盖，便于联调）。
+fn share_host() -> String {
+    std::env::var("NEKO_SHARE_HOST").unwrap_or_else(|_| "share.neko.arm.moe".to_string())
+}
+
+/// 朋友添加服务商时填的基础 URL：https://share.neko.arm.moe/<id>/v1（路径式路由）。
+fn share_base_url(identity: &str) -> String {
+    if identity.trim().is_empty() {
+        return String::new();
+    }
+    format!("https://{}/{identity}/v1", share_host())
+}
+
+/// 隧道控制端点（默认 server.neko.arm.moe:443；NEKO_SHARE_SERVER=host:port 覆盖）。
+fn share_server_endpoint() -> (String, u16) {
+    let raw = std::env::var("NEKO_SHARE_SERVER")
+        .unwrap_or_else(|_| "server.neko.arm.moe:443".to_string());
+    match raw.rsplit_once(':') {
+        Some((host, port)) => (host.to_string(), port.parse().unwrap_or(443)),
+        None => (raw, 443),
+    }
+}
+
+fn build_tunnel_config(settings: &crate::types::Settings) -> Option<share_tunnel::ShareTunnelConfig> {
+    if !share::valid_identity(&settings.share_identity) || settings.share_secret.trim().is_empty() {
+        return None;
+    }
+    let (server_host, server_port) = share_server_endpoint();
+    Some(share_tunnel::ShareTunnelConfig {
+        server_host,
+        server_port,
+        identity: settings.share_identity.clone(),
+        secret: settings.share_secret.clone(),
+        local_port: settings.port,
+        insecure_skip_verify: std::env::var("NEKO_SHARE_INSECURE").is_ok(),
+    })
+}
+
+/// 按当前配置启停隧道：开启且身份/密钥就绪 → 启动；否则停止。
+async fn apply_share_tunnel(store: &AppStore, tunnel: &share_tunnel::ShareTunnel) {
+    let config = store.config().await;
+    if config.settings.share_enabled {
+        if let Some(cfg) = build_tunnel_config(&config.settings) {
+            tunnel.start(cfg).await;
+            return;
+        }
+    }
+    tunnel.stop().await;
+}
+
+async fn build_share_overview(
+    store: &AppStore,
+    tunnel: &share_tunnel::ShareTunnel,
+) -> ShareOverview {
+    let config = store.config().await;
+    let settings = &config.settings;
+    let mut token_spend = std::collections::HashMap::new();
+    for token in &settings.share_tokens {
+        token_spend.insert(
+            token.token.clone(),
+            store.share_token_spend(&token.token).await,
+        );
+    }
+    ShareOverview {
+        enabled: settings.share_enabled,
+        identity: settings.share_identity.clone(),
+        domain: share_host(),
+        base_url: share_base_url(&settings.share_identity),
+        tokens: settings.share_tokens.clone(),
+        status: tunnel.status().await,
+        token_spend,
+        token_active: share::share_limiter().active_counts(),
+    }
+}
+
+#[tauri::command]
+async fn share_overview(
+    store: tauri::State<'_, AppStore>,
+    tunnel: tauri::State<'_, share_tunnel::ShareTunnel>,
+) -> Result<ShareOverview, String> {
+    Ok(build_share_overview(store.inner(), tunnel.inner()).await)
+}
+
+#[tauri::command]
+async fn set_share_enabled(
+    enabled: bool,
+    store: tauri::State<'_, AppStore>,
+    tunnel: tauri::State<'_, share_tunnel::ShareTunnel>,
+) -> Result<ShareOverview, String> {
+    let mut config = store.config().await;
+    config.settings.share_enabled = enabled;
+    store.replace_config(config).await?;
+    apply_share_tunnel(store.inner(), tunnel.inner()).await;
+    Ok(build_share_overview(store.inner(), tunnel.inner()).await)
+}
+
+#[tauri::command]
+async fn create_share_token(
+    token: String,
+    label: String,
+    allowed_model_ids: Vec<String>,
+    amount_limit_usd: Option<f64>,
+    concurrency_limit: u32,
+    rpm_limit: u32,
+    model_aliases: std::collections::HashMap<String, String>,
+    store: tauri::State<'_, AppStore>,
+    tunnel: tauri::State<'_, share_tunnel::ShareTunnel>,
+) -> Result<ShareOverview, String> {
+    let mut config = store.config().await;
+    // 自定义秘钥；留空则自动生成 sk-xxx。
+    let token = token.trim();
+    let token = if token.is_empty() {
+        share::generate_token()
+    } else {
+        token.to_string()
+    };
+    if config.settings.share_tokens.iter().any(|t| t.token == token) {
+        return Err("该秘钥已存在，请换一个".into());
+    }
+    config.settings.share_tokens.push(crate::types::ShareToken {
+        token,
+        label: label.trim().to_string(),
+        allowed_model_ids,
+        amount_limit_usd,
+        concurrency_limit,
+        rpm_limit,
+        model_aliases,
+    });
+    store.replace_config(config).await?;
+    Ok(build_share_overview(store.inner(), tunnel.inner()).await)
+}
+
+/// 编辑已存在令牌（按原 `token` 定位）：可改秘钥(`new_token`) / 名称 / 授权模型 / 额度 / 并发 / RPM。
+#[tauri::command]
+async fn update_share_token(
+    token: String,
+    new_token: String,
+    label: String,
+    allowed_model_ids: Vec<String>,
+    amount_limit_usd: Option<f64>,
+    concurrency_limit: u32,
+    rpm_limit: u32,
+    model_aliases: std::collections::HashMap<String, String>,
+    store: tauri::State<'_, AppStore>,
+    tunnel: tauri::State<'_, share_tunnel::ShareTunnel>,
+) -> Result<ShareOverview, String> {
+    let mut config = store.config().await;
+    // 新秘钥留空 = 不改；改了则不能与其它令牌冲突。
+    let new_token = new_token.trim();
+    let new_token = if new_token.is_empty() {
+        token.clone()
+    } else {
+        new_token.to_string()
+    };
+    if new_token != token && config.settings.share_tokens.iter().any(|t| t.token == new_token) {
+        return Err("该秘钥已存在，请换一个".into());
+    }
+    if let Some(item) = config
+        .settings
+        .share_tokens
+        .iter_mut()
+        .find(|item| item.token == token)
+    {
+        item.token = new_token.clone();
+        item.label = label.trim().to_string();
+        item.allowed_model_ids = allowed_model_ids;
+        item.amount_limit_usd = amount_limit_usd;
+        item.concurrency_limit = concurrency_limit;
+        item.rpm_limit = rpm_limit;
+        item.model_aliases = model_aliases;
+    }
+    store.replace_config(config).await?;
+    // 秘钥改了：把请求日志里旧秘钥的记录迁移到新秘钥，保留消费/统计连续性。
+    if new_token != token {
+        store.rename_share_token(&token, &new_token).await;
+    }
+    Ok(build_share_overview(store.inner(), tunnel.inner()).await)
+}
+
+#[tauri::command]
+async fn delete_share_token(
+    token: String,
+    store: tauri::State<'_, AppStore>,
+    tunnel: tauri::State<'_, share_tunnel::ShareTunnel>,
+) -> Result<ShareOverview, String> {
+    let mut config = store.config().await;
+    config.settings.share_tokens.retain(|item| item.token != token);
+    store.replace_config(config).await?;
+    Ok(build_share_overview(store.inner(), tunnel.inner()).await)
+}
+
 pub fn run() {
     let exit_requested = Arc::new(AtomicBool::new(false));
     let setup_exit_requested = exit_requested.clone();
@@ -3753,9 +3963,13 @@ pub fn run() {
                 .map_err(|error| format!("Failed to resolve app data dir: {error}"))?;
             let store = AppStore::load(app_data_dir)?;
             let catalog_store = store.clone();
+            let share_store = store.clone();
             let server_runtime = ServerRuntime::new(store.clone());
+            let share_tunnel = share_tunnel::ShareTunnel::new();
+            let share_startup = share_tunnel.clone();
             app.manage(store);
             app.manage(server_runtime.clone());
+            app.manage(share_tunnel);
             app.manage(OpenAiOAuthSessions::default());
             app.manage(ClaudeOAuthSessions::default());
             app.manage(ModelTestSessions::default());
@@ -3765,6 +3979,10 @@ pub fn run() {
             });
             tauri::async_runtime::spawn(async move {
                 server_runtime.start().await;
+            });
+            // 启动时若共享已开，自动拉起隧道。
+            tauri::async_runtime::spawn(async move {
+                apply_share_tunnel(&share_store, &share_startup).await;
             });
             Ok(())
         })
@@ -3813,7 +4031,12 @@ pub fn run() {
             import_sessions,
             clear_request_logs,
             read_image_preview,
-            get_request_logs
+            get_request_logs,
+            share_overview,
+            set_share_enabled,
+            create_share_token,
+            update_share_token,
+            delete_share_token
         ])
         .run(tauri::generate_context!())
         .expect("error while running Neko Route");

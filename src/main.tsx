@@ -18,6 +18,7 @@ import {
   IconMinus as Minus,
   IconRefresh as RotateCcw,
   IconSettings as Settings2,
+  IconWorldShare as Share2,
   IconSparkles as Sparkles,
   IconSquare as Square,
   IconX as X,
@@ -40,6 +41,7 @@ import {
   ModelGarden,
   PageProps,
   SettingsModal,
+  SharePage,
   visibleUiModelCount,
   visibleUiProviders,
 } from "./pages";
@@ -66,6 +68,7 @@ const NAV: NavItem[] = [
   { page: "keys", label: "nav.keys", icon: KeyRound },
   { page: "logs", label: "nav.logs", icon: ListTree },
   { page: "health", label: "nav.health", icon: HeartPulse },
+  { page: "share", label: "nav.share", icon: Share2 },
   { page: "wizard", label: "nav.setup", icon: Sparkles },
   { page: "about", label: "nav.about", icon: InfoCircle },
 ];
@@ -516,6 +519,7 @@ function App() {
             {page === "keys" && <KeyVault {...pageProps} />}
             {page === "logs" && <Logs {...pageProps} />}
             {page === "health" && <HealthPage {...pageProps} />}
+            {page === "share" && <SharePage {...pageProps} />}
             {page === "wizard" && <CodexWizard {...pageProps} />}
             {page === "about" && <About {...pageProps} />}
           </div>

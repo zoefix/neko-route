@@ -3,6 +3,7 @@ import type {
   ModelHealth,
   ModelTestMode,
   ModelTestStatus,
+  ShareOverview,
   StartModelTestResult,
   TestModelResult,
   TokenStats,
@@ -349,6 +350,11 @@ export function mockSnapshot(): AppSnapshot {
         aux_model: null,
         memory_model: null,
         direct_provider_id: null,
+        share_enabled: false,
+        share_identity: "ab12cd34ef56gh78",
+        share_secret: "demo-secret",
+        share_tokens: [],
+        share_intro_acknowledged: false,
       },
     },
     keys: [
@@ -665,6 +671,95 @@ export function mockSnapshot(): AppSnapshot {
     ],
     codex_home: "/Users/neko/.codex",
   };
+}
+
+let demoShare: ShareOverview = {
+  enabled: false,
+  identity: "ab12cd34ef56gh78",
+  domain: "share.neko.arm.moe",
+  base_url: "https://share.neko.arm.moe/ab12cd34ef56gh78/v1",
+  tokens: [],
+  status: { state: "disabled", message: null },
+  token_spend: {},
+  token_active: {},
+};
+
+export function mockShareOverview(): ShareOverview {
+  return demoShare;
+}
+
+export function mockSetShareEnabled(enabled: boolean): ShareOverview {
+  demoShare = {
+    ...demoShare,
+    enabled,
+    status: { state: enabled ? "connected" : "disabled", message: null },
+  };
+  return demoShare;
+}
+
+export function mockCreateShareToken(
+  customToken: string,
+  label: string,
+  allowedModelIds: string[],
+  amountLimitUsd: number | null,
+  concurrencyLimit: number,
+  rpmLimit: number,
+  modelAliases: Record<string, string>,
+): ShareOverview {
+  const token = customToken.trim() || `sk-${Math.random().toString(16).slice(2, 10)}`;
+  demoShare = {
+    ...demoShare,
+    tokens: [
+      ...demoShare.tokens,
+      {
+        token,
+        label,
+        allowed_model_ids: allowedModelIds,
+        amount_limit_usd: amountLimitUsd,
+        concurrency_limit: concurrencyLimit,
+        rpm_limit: rpmLimit,
+        model_aliases: modelAliases,
+      },
+    ],
+    token_spend: { ...demoShare.token_spend, [token]: 0 },
+  };
+  return demoShare;
+}
+
+export function mockUpdateShareToken(
+  token: string,
+  newToken: string,
+  label: string,
+  allowedModelIds: string[],
+  amountLimitUsd: number | null,
+  concurrencyLimit: number,
+  rpmLimit: number,
+  modelAliases: Record<string, string>,
+): ShareOverview {
+  const next = newToken.trim() || token;
+  demoShare = {
+    ...demoShare,
+    tokens: demoShare.tokens.map((tok) =>
+      tok.token === token
+        ? {
+            ...tok,
+            token: next,
+            label,
+            allowed_model_ids: allowedModelIds,
+            amount_limit_usd: amountLimitUsd,
+            concurrency_limit: concurrencyLimit,
+            rpm_limit: rpmLimit,
+            model_aliases: modelAliases,
+          }
+        : tok,
+    ),
+  };
+  return demoShare;
+}
+
+export function mockDeleteShareToken(token: string): ShareOverview {
+  demoShare = { ...demoShare, tokens: demoShare.tokens.filter((tok) => tok.token !== token) };
+  return demoShare;
 }
 
 export const isTauri = typeof (window as any).__TAURI_INTERNALS__ !== "undefined";

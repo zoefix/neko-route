@@ -1,6 +1,6 @@
 [package]
 name = "neko-route"
-version = "0.2.1"
+version = "0.2.2"
 description = "Local AI model router for Codex"
 authors = ["Neko Route"]
 edition = "2021"
@@ -38,11 +38,17 @@ sha1 = "0.10"
 sha2 = "0.10"
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+# 只用 ring 加密后端（代码里走 crypto::ring，见 share_tunnel.rs）。关掉默认的 aws_lc_rs，
+# 否则拉入 aws-lc-sys，其 C/汇编在 cargo-xwin 交叉编译 Windows 时编不过（hrss.c 报错）。
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["compat"] }
 toml_edit = { version = "0.22", features = ["serde"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+webpki-roots = "0.26"
+yamux = "0.13"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-opener = "2.5.4"

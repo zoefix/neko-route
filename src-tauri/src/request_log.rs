@@ -4,7 +4,7 @@ use crate::types::{
     RequestLogPage, RequestRecord, TokenStats, TokenTotals, TokenUsage,
 };
 use chrono::{DateTime, Local, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{named_params, params, Connection};
 use std::{
     collections::{BTreeSet, HashMap},
     path::Path,
@@ -221,9 +221,36 @@ impl RequestLog {
     pub fn update_stream_progress(&self, id: &str, stream_bytes: u64, usage: Option<&TokenUsage>) {
         let conn = self.conn.lock().unwrap();
         if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
+            // 按上游真实模型 + 最新 usage 重算 cost：流式透传(proxy_raw)不走 finalize，
+            // 否则 cost 永远停留在 insert 时的 0（流式 insert 时 usage 尚为空）。
+            // COALESCE 保护：未知模型(pricing 返回 None)时不清空已有 cost。
+            let cost: Option<f64> = conn
+                .query_row(
+                    "SELECT model, requested_model, upstream_model FROM requests WHERE id=?1",
+                    params![id],
+                    |row| {
+                        let model: String = row.get(0)?;
+                        let requested: Option<String> = row.get(1)?;
+                        let upstream: Option<String> = row.get(2)?;
+                        let pricing_model = upstream
+                            .as_deref()
+                            .filter(|m| !m.is_empty())
+                            .or_else(|| requested.as_deref().filter(|m| !m.is_empty()))
+                            .unwrap_or(model.as_str());
+                        Ok(crate::pricing::estimate_model_cost_usd(
+                            pricing_model,
+                            usage.input_tokens,
+                            usage.output_tokens,
+                            usage.cache_read_tokens,
+                            usage.cache_write_tokens,
+                        ))
+                    },
+                )
+                .unwrap_or(None);
             let _ = conn.execute(
                 "UPDATE requests SET stream_bytes=?2, input_tokens=?3, output_tokens=?4,
-                    cache_read_tokens=?5, cache_write_tokens=?6, total_tokens=?7
+                    cache_read_tokens=?5, cache_write_tokens=?6, total_tokens=?7,
+                    cost_usd=COALESCE(?8, cost_usd)
                  WHERE id=?1",
                 params![
                     id,
@@ -233,6 +260,7 @@ impl RequestLog {
                     usage.cache_read_tokens as i64,
                     usage.cache_write_tokens as i64,
                     usage.total_tokens as i64,
+                    cost,
                 ],
             );
             return;
@@ -368,7 +396,20 @@ impl RequestLog {
         .unwrap_or(0)
     }
 
+    /// 无过滤分页便捷封装（现仅单测使用；生产路径走 `page_filtered`）。
+    #[cfg(test)]
     pub fn page(&self, page: usize, page_size: usize) -> RequestLogPage {
+        self.page_filtered(page, page_size, None)
+    }
+
+    /// 分页 + 可选的共享令牌过滤：
+    /// `None` = 全部；`Some("__local__")` = 仅本机请求（无共享令牌）；`Some(token)` = 该令牌的请求。
+    pub fn page_filtered(
+        &self,
+        page: usize,
+        page_size: usize,
+        share_token: Option<&str>,
+    ) -> RequestLogPage {
         let page = page.max(1);
         let page_size = if page_size == 0 {
             50
@@ -377,20 +418,38 @@ impl RequestLog {
         };
         let offset = (page - 1).saturating_mul(page_size);
         let conn = self.conn.lock().unwrap();
-        let total = conn
-            .query_row("SELECT COUNT(*) FROM requests", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map(|count| count.max(0) as u64)
-            .unwrap_or(0);
-        let mut stmt = match conn.prepare(
+
+        let where_sql = match share_token {
+            None => "",
+            Some("__local__") => {
+                " WHERE json_extract(context_bridge_json, '$.share_token') IS NULL"
+            }
+            Some(_) => " WHERE json_extract(context_bridge_json, '$.share_token') = :tok",
+        };
+        let count_sql = format!("SELECT COUNT(*) FROM requests{where_sql}");
+        let select_sql = format!(
             "SELECT id, started_at, model, provider_id, provider_name, provider_protocol,
                     requested_model, route_reason, status, latency_ms, streaming, error, reasoning_effort,
                     stream_state, stream_error, last_event,
                     stream_bytes, context_bridge_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
                     ctx_input_tokens, ctx_output_tokens, ctx_cache_read_tokens, ctx_cache_write_tokens, ctx_total_tokens, cost_usd, image_preview, upstream_model
-             FROM requests ORDER BY started_at DESC LIMIT ?1 OFFSET ?2",
-        ) {
+             FROM requests{where_sql} ORDER BY started_at DESC LIMIT :limit OFFSET :offset"
+        );
+        let filter_token = match share_token {
+            Some(tok) if tok != "__local__" => Some(tok),
+            _ => None,
+        };
+
+        let total = match filter_token {
+            Some(tok) => conn.query_row(&count_sql, named_params! { ":tok": tok }, |row| {
+                row.get::<_, i64>(0)
+            }),
+            None => conn.query_row(&count_sql, [], |row| row.get::<_, i64>(0)),
+        }
+        .map(|count| count.max(0) as u64)
+        .unwrap_or(0);
+
+        let mut stmt = match conn.prepare(&select_sql) {
             Ok(stmt) => stmt,
             Err(_) => {
                 return RequestLogPage {
@@ -401,10 +460,18 @@ impl RequestLog {
                 }
             }
         };
-        let records = stmt
-            .query_map(params![page_size as i64, offset as i64], row_to_record)
-            .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
-            .unwrap_or_default();
+        let records = match filter_token {
+            Some(tok) => stmt.query_map(
+                named_params! { ":limit": page_size as i64, ":offset": offset as i64, ":tok": tok },
+                row_to_record,
+            ),
+            None => stmt.query_map(
+                named_params! { ":limit": page_size as i64, ":offset": offset as i64 },
+                row_to_record,
+            ),
+        }
+        .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
+        .unwrap_or_default();
 
         RequestLogPage {
             records,
@@ -412,6 +479,30 @@ impl RequestLog {
             page,
             page_size,
         }
+    }
+
+    /// 某共享令牌的历史累计消费（美元）：对带该令牌串的请求求和 `cost_usd`。
+    /// 用于令牌金额额度强制（启动后即从持久日志恢复，重启不丢）。
+    pub fn share_token_spend(&self, token: &str) -> f64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM requests \
+             WHERE json_extract(context_bridge_json, '$.share_token') = :tok",
+            named_params! { ":tok": token },
+            |row| row.get::<_, f64>(0),
+        )
+        .unwrap_or(0.0)
+    }
+
+    /// 改秘钥时把请求日志里 `share_token` 从 `old` 迁到 `new`，保留消费/统计连续性。
+    pub fn rename_share_token(&self, old: &str, new: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE requests SET context_bridge_json = \
+                 json_set(context_bridge_json, '$.share_token', ?2) \
+             WHERE json_extract(context_bridge_json, '$.share_token') = ?1",
+            params![old, new],
+        );
     }
 
     pub fn clear(&self) {
@@ -1019,6 +1110,79 @@ mod tests {
         assert_eq!(second.total, 3);
         assert_eq!(second.records.len(), 1);
         assert_eq!(second.records[0].id, "old");
+    }
+
+    #[test]
+    fn share_token_spend_and_filter_via_json_extract() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = RequestLog::open(&temp.path().join("requests.db")).unwrap();
+
+        let mut shared = record("shared", 2);
+        shared.cost_usd = Some(2.5);
+        shared.context_bridge = Some(ContextBridgeDiagnostics {
+            request_kind: Some("share".into()),
+            share_token: Some("nrs-friend".into()),
+            ..Default::default()
+        });
+        log.insert(&shared);
+
+        let mut shared2 = record("shared2", 3);
+        shared2.cost_usd = Some(1.0);
+        shared2.context_bridge = Some(ContextBridgeDiagnostics {
+            request_kind: Some("share".into()),
+            share_token: Some("nrs-friend".into()),
+            ..Default::default()
+        });
+        log.insert(&shared2);
+
+        let local = record("local", 1); // context_bridge None → 无 share_token = 本机请求
+        log.insert(&local);
+
+        // 金额累计（json_extract 求和）：仅该令牌的请求
+        assert!((log.share_token_spend("nrs-friend") - 3.5).abs() < 1e-9);
+        assert_eq!(log.share_token_spend("nrs-none"), 0.0);
+
+        // 按令牌过滤
+        let by_token = log.page_filtered(1, 50, Some("nrs-friend"));
+        assert_eq!(by_token.total, 2);
+        assert!(by_token.records.iter().all(|r| r.id != "local"));
+
+        // 仅本机
+        let local_only = log.page_filtered(1, 50, Some("__local__"));
+        assert_eq!(local_only.total, 1);
+        assert_eq!(local_only.records[0].id, "local");
+
+        // 全部
+        assert_eq!(log.page_filtered(1, 50, None).total, 3);
+    }
+
+    #[test]
+    fn streaming_progress_recomputes_cost() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = RequestLog::open(&temp.path().join("requests.db")).unwrap();
+
+        // 流式请求：insert 时 usage 尚空 → cost 应为 0。
+        let mut rec = record("s1", 1);
+        rec.upstream_model = Some("gpt-5.5".into());
+        rec.usage = TokenUsage::default();
+        rec.cost_usd = None;
+        log.insert(&rec);
+
+        // 流式过程中收到真实 usage（含 8000 缓存）。
+        let usage = TokenUsage {
+            input_tokens: 10_000,
+            output_tokens: 0,
+            cache_read_tokens: 8_000,
+            cache_write_tokens: 0,
+            total_tokens: 10_000,
+        };
+        log.update_stream_progress("s1", 1234, Some(&usage));
+
+        let page = log.page(1, 10);
+        let r = page.records.iter().find(|r| r.id == "s1").unwrap();
+        // cost 被重算且扣除缓存：2000*1.25 + 8000*0.125 = $0.0035（不再停留在 0）。
+        let cost = r.cost_usd.expect("cost recomputed on stream progress");
+        assert!((cost - 0.0035).abs() < 1e-9, "{cost}");
     }
 
     #[test]

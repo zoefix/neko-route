@@ -31,6 +31,7 @@ import {
   IconServer as Server,
   IconSettings as Settings2,
   IconShieldCheck as ShieldCheck,
+  IconWorldShare as ShareIcon,
   IconSparkles as Sparkles,
   IconTrash as Trash2,
 } from "@tabler/icons-react";
@@ -52,6 +53,8 @@ import type {
   ProviderUsageStatus,
   ProviderProtocol,
   ReasoningEffort,
+  ShareOverview,
+  ShareToken,
   TokenTotals,
 } from "./types";
 import {
@@ -537,11 +540,14 @@ export function RequestTable({
   models,
   emptyTitle = "table.empty",
   emptyHint = "table.emptyHint",
+  shareTokenLabels,
 }: {
   requests: AppSnapshot["requests"];
   models: ModelEntry[];
   emptyTitle?: MsgKey;
   emptyHint?: MsgKey;
+  /** 共享令牌串 → 名称；共享请求的徽章用它显示具体令牌名而非笼统「共享」。 */
+  shareTokenLabels?: Record<string, string>;
 }) {
   const { t } = useI18n();
   const [errorRecord, setErrorRecord] = React.useState<RequestRecordView | null>(null);
@@ -597,7 +603,11 @@ export function RequestTable({
                   ) : null}
                   {r.context_bridge?.request_kind ? (
                     <span className={`kind-chip ${kindClass(r.context_bridge.request_kind)}`}>
-                      {t(kindLabelKey(r.context_bridge.request_kind))}
+                      {r.context_bridge.request_kind === "share"
+                        ? (r.context_bridge.share_token &&
+                            shareTokenLabels?.[r.context_bridge.share_token]) ||
+                          t("logs.kindShare")
+                        : t(kindLabelKey(r.context_bridge.request_kind))}
                     </span>
                   ) : null}
                 </span>
@@ -915,6 +925,410 @@ export function Dashboard({ snapshot, config }: PageProps) {
   );
 }
 
+export function SharePage({ config, notify, commit }: PageProps) {
+  const { t } = useI18n();
+  const [overview, setOverview] = React.useState<ShareOverview | null>(null);
+  const [editing, setEditing] = React.useState<ShareToken | "new" | null>(null);
+  const [introDismissed, setIntroDismissed] = React.useState(false);
+  // 介绍卡片：已点「我已了解」(持久化) 或本次会话已点「下次再提醒」时不显示。
+  const showIntro = !config.settings.share_intro_acknowledged && !introDismissed;
+  const shareableModels = config.models.filter((m) => m.enabled && !m.image_generation);
+
+  const reload = React.useCallback(() => {
+    api.shareOverview().then(setOverview).catch(() => {});
+  }, []);
+  React.useEffect(() => {
+    reload();
+    const timer = setInterval(reload, 2000); // 轮询隧道状态 + 额度 + 实时并发数
+    return () => clearInterval(timer);
+  }, [reload]);
+
+  const copy = async (text: string) => {
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      notify("share.copied");
+    } catch {
+      /* clipboard 不可用时静默 */
+    }
+  };
+  const toggle = async (next: boolean) => {
+    try {
+      setOverview(await api.setShareEnabled(next));
+    } catch {
+      reload();
+    }
+  };
+  const remove = async (token: string) => {
+    setOverview(await api.deleteShareToken(token));
+  };
+  // 复制令牌完整信息给朋友：名称 / API / 秘钥 / 协议 / 可用模型(名字 + 下游ID)。
+  const copyTokenInfo = (tk: ShareToken) => {
+    const lines = tk.allowed_model_ids.map((id) => {
+      const downstream = (tk.model_aliases?.[id] ?? "").trim() || id;
+      const name = config.models.find((m) => m.id === id)?.display_name ?? id;
+      return `  - ${name} (${downstream})`;
+    });
+    copy(
+      [
+        `${t("share.tokenName")}: ${tk.label || t("share.untitled")}`,
+        `API: ${overview?.base_url ?? ""}`,
+        `${t("share.secret")}: ${tk.token}`,
+        `${t("share.protocol")}: Responses API`,
+        `${t("share.allowedModels")}:`,
+        ...lines,
+      ].join("\n"),
+    );
+  };
+  // 「我已了解」→ 持久化，永不再提示；「下次再提醒我」→ 仅本次会话隐藏，下次打开仍显示。
+  const acknowledgeIntro = () => {
+    setIntroDismissed(true);
+    commit((d) => {
+      d.settings.share_intro_acknowledged = true;
+    });
+  };
+
+  const state = overview?.status.state ?? "disabled";
+  const stateLabel =
+    state === "connected"
+      ? t("share.connected")
+      : state === "connecting"
+        ? t("share.connecting")
+        : state === "error"
+          ? t("share.errorState")
+          : t("share.offline");
+
+  return (
+    <div className="stack page-enter share-page">
+      {showIntro ? (
+        <section className="card card-pad share-intro">
+          <div className="share-intro-head">
+            <span className="share-intro-icon">
+              <ShareIcon size={17} />
+            </span>
+            <div className="share-intro-title">{t("share.introTitle")}</div>
+          </div>
+          <div className="share-intro-body">{t("share.introBody")}</div>
+          <div className="share-intro-actions">
+            <Button variant="ghost" onClick={() => setIntroDismissed(true)}>
+              {t("share.introRemindLater")}
+            </Button>
+            <Button onClick={acknowledgeIntro}>{t("share.introGotIt")}</Button>
+          </div>
+        </section>
+      ) : null}
+      <section className="card card-pad share-head">
+        <div className="share-toggle-row">
+          <div className="share-head-left">
+            <div className="share-api-line">
+              <span className="share-api-label">Responses API</span>
+              <code className="share-addr-url">{overview?.base_url || "—"}</code>
+              <IconButton
+                onClick={() => copy(overview?.base_url ?? "")}
+                title={t("common.copy")}
+                icon={<Copy size={14} />}
+              />
+            </div>
+          </div>
+          <div className="share-head-right">
+            <span className={`share-status share-status-${state}`}>
+              <span className="share-dot" />
+              <span>{stateLabel}</span>
+            </span>
+            <Switch checked={overview?.enabled ?? false} onChange={toggle} />
+          </div>
+        </div>
+        {state === "error" && overview?.status.message ? (
+          <div className="share-status-error">{overview.status.message}</div>
+        ) : null}
+      </section>
+
+      <section className="card card-pad">
+        <div className="share-tokens-head">
+          <div className="share-section-title">{t("share.tokens")}</div>
+          <Button onClick={() => setEditing("new")} disabled={shareableModels.length === 0}>
+            <Plus size={15} /> {t("share.newToken")}
+          </Button>
+        </div>
+
+        {(overview?.tokens.length ?? 0) === 0 ? (
+          <div className="mc-empty">{t("share.noTokens")}</div>
+        ) : (
+          <div className="share-token-list">
+            {overview!.tokens.map((tk) => {
+              const spend = overview!.token_spend?.[tk.token] ?? 0;
+              const limit = tk.amount_limit_usd;
+              const pct = limit && limit > 0 ? Math.min(100, (spend / limit) * 100) : 0;
+              return (
+                <div className="share-token" key={tk.token}>
+                  <div className="share-token-row">
+                    <div className="share-token-main">
+                      <div className="share-token-label">{tk.label || t("share.untitled")}</div>
+                      <div className="share-token-tags">
+                        <span className="share-tag">
+                          {tk.allowed_model_ids.filter((id) => shareableModels.some((m) => m.id === id)).length}{" "}
+                          {t("share.modelsUnit")}
+                        </span>
+                        <span className="share-tag">
+                          {t("share.concShort")} {overview!.token_active?.[tk.token] ?? 0}/
+                          {tk.concurrency_limit === 0 ? t("share.unlimitedShort") : tk.concurrency_limit}
+                        </span>
+                        <span className="share-tag">
+                          {tk.rpm_limit === 0 ? t("share.rpmOff") : `${tk.rpm_limit} RPM`}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="share-token-ops">
+                      <IconButton
+                        onClick={() => copyTokenInfo(tk)}
+                        title={t("share.copyFriend")}
+                        icon={<Copy size={15} />}
+                      />
+                      <IconButton
+                        onClick={() => setEditing(tk)}
+                        title={t("common.edit")}
+                        icon={<Pencil size={15} />}
+                      />
+                      <IconButton
+                        onClick={() => remove(tk.token)}
+                        title={t("common.delete")}
+                        icon={<Trash2 size={15} />}
+                      />
+                    </div>
+                  </div>
+                  <div className="share-quota">
+                    <div className="share-quota-bar">
+                      <div
+                        className={`share-quota-fill ${pct >= 100 ? "full" : ""}`}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <span className="share-quota-text">
+                      ${spend.toFixed(2)}{" "}
+                      {limit == null ? `· ${t("share.unlimited")}` : `/ $${limit.toFixed(0)}`}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      <ShareTokenModal
+        open={editing != null}
+        editing={editing === "new" ? null : editing}
+        models={shareableModels}
+        onClose={() => setEditing(null)}
+        onSaved={(ov) => {
+          setOverview(ov);
+          setEditing(null);
+        }}
+      />
+    </div>
+  );
+}
+
+/** 生成 sk- 前缀的随机秘钥（32 hex），兼容各类 OpenAI 客户端。 */
+function genShareSecret(): string {
+  let hex = "";
+  for (let i = 0; i < 32; i++) hex += Math.floor(Math.random() * 16).toString(16);
+  return `sk-${hex}`;
+}
+
+function ShareTokenModal({
+  open,
+  editing,
+  models,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  editing: ShareToken | null;
+  models: ModelEntry[];
+  onClose: () => void;
+  onSaved: (ov: ShareOverview) => void;
+}) {
+  const { t } = useI18n();
+  const [label, setLabel] = React.useState("");
+  const [picked, setPicked] = React.useState<string[]>([]);
+  const [unlimited, setUnlimited] = React.useState(false);
+  const [amount, setAmount] = React.useState(1000);
+  const [concurrency, setConcurrency] = React.useState(10);
+  const [rpm, setRpm] = React.useState(0);
+  const [aliases, setAliases] = React.useState<Record<string, string>>({});
+  const [secret, setSecret] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  useSeedOnOpen(open, () => {
+    setLabel(editing?.label ?? "");
+    // 剔除已被停用/删除的模型(不在可共享列表里)→ 等于「自动停用」该授权，保存后即从令牌移除。
+    setPicked((editing?.allowed_model_ids ?? []).filter((id) => models.some((m) => m.id === id)));
+    setUnlimited(editing ? editing.amount_limit_usd == null : false);
+    setAmount(editing?.amount_limit_usd ?? 1000);
+    setConcurrency(editing?.concurrency_limit ?? 10);
+    setRpm(editing?.rpm_limit ?? 0);
+    setAliases(editing?.model_aliases ?? {});
+    setSecret(editing?.token ?? genShareSecret());
+    setBusy(false);
+  });
+
+  const save = async () => {
+    if (picked.length === 0 || !label.trim() || busy) return;
+    setBusy(true);
+    const amountLimit = unlimited ? null : Math.max(0, Number(amount) || 0);
+    const conc = Math.max(0, Math.floor(Number(concurrency) || 0));
+    const rpmVal = Math.max(0, Math.floor(Number(rpm) || 0));
+    // 只收已选模型的非空别名（内部 ID → 下游自定义 ID）。
+    const modelAliases: Record<string, string> = {};
+    for (const id of picked) {
+      const alias = (aliases[id] ?? "").trim();
+      if (alias) modelAliases[id] = alias;
+    }
+    const sec = secret.trim();
+    setError(null);
+    try {
+      const ov = editing
+        ? await api.updateShareToken(editing.token, sec, label.trim(), picked, amountLimit, conc, rpmVal, modelAliases)
+        : await api.createShareToken(sec, label.trim(), picked, amountLimit, conc, rpmVal, modelAliases);
+      onSaved(ov);
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={editing ? t("share.editToken") : t("share.newToken")}
+      icon={<ShareIcon size={18} />}
+      width={560}
+      onEnter={save}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button onClick={save} disabled={picked.length === 0 || !label.trim() || busy}>
+            {t("common.save")}
+          </Button>
+        </>
+      }
+    >
+      <div className="stack-sm share-modal">
+        <Field label={t("share.tokenName")}>
+          <Input
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder={t("share.tokenNamePlaceholder")}
+          />
+        </Field>
+        <Field label={t("share.secret")}>
+          <div className="share-secret-row">
+            <Input
+              value={secret}
+              onChange={(e) => setSecret(e.target.value)}
+              placeholder="sk-..."
+            />
+            <IconButton
+              onClick={() => setSecret(genShareSecret())}
+              title={t("share.regenerate")}
+              icon={<RotateCcw size={15} />}
+            />
+          </div>
+        </Field>
+        <Field label={t("share.allowedModels")}>
+          {models.length === 0 ? (
+            <div className="mc-empty">{t("share.noModels")}</div>
+          ) : (
+            <div className="share-models-grid">
+              {models.map((m) => {
+                const on = picked.includes(m.id);
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    className={`share-model-chip ${on ? "on" : ""}`}
+                    onClick={() =>
+                      setPicked((prev) =>
+                        on ? prev.filter((x) => x !== m.id) : [...prev, m.id],
+                      )
+                    }
+                  >
+                    {m.display_name}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </Field>
+        {picked.length > 0 ? (
+          <Field label={t("share.modelAliases")} hint={t("share.modelAliasHint")}>
+            <div className="share-alias-list">
+              {picked.map((id) => {
+                const m = models.find((mm) => mm.id === id);
+                return (
+                  <div key={id} className="share-alias-row">
+                    <span className="share-alias-name">{m?.display_name ?? id}</span>
+                    <Input
+                      value={aliases[id] ?? ""}
+                      placeholder={id}
+                      onChange={(e) =>
+                        setAliases((prev) => ({ ...prev, [id]: e.target.value }))
+                      }
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </Field>
+        ) : null}
+        <Field label={t("share.amountLimit")}>
+          <div className="share-amount-row">
+            <div className={`share-amount-input ${unlimited ? "off" : ""}`}>
+              <span className="share-amount-prefix">$</span>
+              <Input
+                type="number"
+                min={0}
+                value={unlimited ? "" : amount}
+                disabled={unlimited}
+                placeholder={unlimited ? t("share.unlimited") : ""}
+                onChange={(e) => setAmount(Number(e.target.value))}
+              />
+            </div>
+            <label className="share-unlimited-toggle">
+              <Switch checked={unlimited} onChange={setUnlimited} />
+              <span>{t("share.unlimited")}</span>
+            </label>
+          </div>
+        </Field>
+        <div className="share-limits-row">
+          <Field label={t("share.concurrencyLimit")}>
+            <Input
+              type="number"
+              min={0}
+              value={concurrency}
+              onChange={(e) => setConcurrency(Number(e.target.value))}
+            />
+          </Field>
+          <Field label={t("share.rpmLimit")}>
+            <Input
+              type="number"
+              min={0}
+              value={rpm}
+              onChange={(e) => setRpm(Number(e.target.value))}
+            />
+          </Field>
+        </div>
+        {error ? <div className="inline-warning">{error}</div> : null}
+      </div>
+    </Modal>
+  );
+}
+
 export function HealthPage({ snapshot, config }: PageProps) {
   const { t } = useI18n();
   const visibleProviderIds = visibleUiProviderIds(config, snapshot);
@@ -992,11 +1406,13 @@ const KIND_LABEL_KEYS: Record<string, MsgKey> = {
   main_coding: "logs.kindMain",
   auxiliary: "logs.kindAuxiliary",
   memory_agent: "logs.kindMemory",
+  share: "logs.kindShare",
 };
 const KIND_CLASSES: Record<string, string> = {
   main_coding: "kind-main",
   auxiliary: "kind-aux",
   memory_agent: "kind-memory",
+  share: "kind-share",
 };
 const kindLabelKey = (kind: string | null | undefined): MsgKey =>
   (kind ? KIND_LABEL_KEYS[kind] : undefined) ?? "logs.kindAuxiliary";
@@ -3106,16 +3522,23 @@ export function Logs({ snapshot, refresh, notify, notifyRaw }: PageProps) {
   const [clearing, setClearing] = React.useState(false);
   const [page, setPage] = React.useState(1);
   const [pageSize, setPageSize] = React.useState(50);
+  // 日志过滤："" = 全部；"__local__" = 仅本机；其它 = 某共享令牌串。
+  const [filter, setFilter] = React.useState("");
+  const [shareTokens, setShareTokens] = React.useState<ShareToken[]>([]);
   const [records, setRecords] = React.useState<AppSnapshot["requests"]>(snapshot.requests);
   const [total, setTotal] = React.useState(snapshot.request_log_count);
   const [loading, setLoading] = React.useState(false);
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   const loadPage = React.useCallback(
-    async (nextPage = page, nextPageSize = pageSize, silent = false) => {
+    async (nextPage = page, nextPageSize = pageSize, silent = false, nextFilter = filter) => {
       if (!silent) setLoading(true);
       try {
-        const result = await api.getRequestLogs(nextPage, nextPageSize);
+        const result = await api.getRequestLogs(
+          nextPage,
+          nextPageSize,
+          nextFilter === "" ? null : nextFilter,
+        );
         setRecords(result.records);
         setTotal(result.total);
         setPage(result.page);
@@ -3126,7 +3549,21 @@ export function Logs({ snapshot, refresh, notify, notifyRaw }: PageProps) {
         if (!silent) setLoading(false);
       }
     },
-    [page, pageSize, notifyRaw],
+    [page, pageSize, filter, notifyRaw],
+  );
+
+  // 拉取共享令牌列表，供过滤下拉显示（随日志数变化刷新，新建令牌后即出现）。
+  React.useEffect(() => {
+    api
+      .shareOverview()
+      .then((o) => setShareTokens(o.tokens))
+      .catch(() => {});
+  }, [snapshot.request_log_count]);
+
+  // 令牌串 → 名称，供日志徽章显示具体令牌名。
+  const shareTokenLabels = React.useMemo(
+    () => Object.fromEntries(shareTokens.map((tk) => [tk.token, tk.label])),
+    [shareTokens],
   );
 
   React.useEffect(() => {
@@ -3175,11 +3612,29 @@ export function Logs({ snapshot, refresh, notify, notifyRaw }: PageProps) {
           </div>
           <Button variant="ghost" onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1 || loading}>{t("logs.prev")}</Button>
           <Button variant="ghost" onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages || loading}>{t("logs.next")}</Button>
+          <div className="log-filter-picker">
+            <Dropdown
+              value={filter}
+              options={[
+                { value: "", label: t("logs.filterAll") },
+                { value: "__local__", label: t("logs.filterLocal") },
+                ...shareTokens.map((tk) => ({
+                  value: tk.token,
+                  label: `${t("logs.filterTokenPrefix")} ${tk.label || tk.token.slice(0, 10)}`,
+                })),
+              ]}
+              onChange={(value) => {
+                setFilter(value);
+                setPage(1);
+                loadPage(1, pageSize, false, value);
+              }}
+            />
+          </div>
           <Button variant="ghost" icon={<Trash2 size={16} />} onClick={() => setConfirmClear(true)} disabled={total === 0}>{t("logs.clear")}</Button>
         </div>
       </div>
       <Panel title={t("nav.logs")} sub={t("logs.count", { n: total })} icon={<ListTree size={18} />} color="lav">
-        <RequestTable requests={records} models={snapshot.config.models} emptyTitle="logs.empty" emptyHint="logs.emptyHint" />
+        <RequestTable requests={records} models={snapshot.config.models} emptyTitle="logs.empty" emptyHint="logs.emptyHint" shareTokenLabels={shareTokenLabels} />
       </Panel>
       <ConfirmDialog
         open={confirmClear}
@@ -3480,21 +3935,25 @@ export function CodexWizard({ snapshot, config, commit, refresh, notify, notifyR
     )
       ? config.settings.image_gen_model
       : "";
-  // 辅助/记忆模型只能选 1M 上下文窗口的模型（要装得下大输入）。
+  // 辅助/记忆模型只能选「已启用」且 1M 上下文窗口的模型（要装得下大输入）。
   const oneMillionOptions = [
     { value: "", label: t("setup.routeModelDefault"), sub: "" },
     ...config.models
-      .filter((m) => m.context_window >= 1_000_000)
+      .filter((m) => m.enabled && m.context_window >= 1_000_000)
       .map((m) => ({ value: m.id, label: m.display_name || m.id, sub: m.id })),
   ];
   const auxModel =
     config.settings.aux_model &&
-    config.models.some((m) => m.id === config.settings.aux_model && m.context_window >= 1_000_000)
+    config.models.some(
+      (m) => m.id === config.settings.aux_model && m.enabled && m.context_window >= 1_000_000,
+    )
       ? config.settings.aux_model
       : "";
   const memoryModel =
     config.settings.memory_model &&
-    config.models.some((m) => m.id === config.settings.memory_model && m.context_window >= 1_000_000)
+    config.models.some(
+      (m) => m.id === config.settings.memory_model && m.enabled && m.context_window >= 1_000_000,
+    )
       ? config.settings.memory_model
       : "";
   // 直连模式：只列 OpenAI 协议第三方API / 官方OpenAI账号 / OpenAI官方客户端 三类 provider。

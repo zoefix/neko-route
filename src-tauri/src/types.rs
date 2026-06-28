@@ -150,6 +150,53 @@ pub struct Settings {
     /// 直连模式选定的上游服务商 id；Codex 请求透传到该 provider，不做模型重定向。
     #[serde(default)]
     pub direct_provider_id: Option<String>,
+    /// 共享功能：开启后把本机 neko-route 经 FRP 隧道注册到公网，朋友可经
+    /// https://<share_identity>.openai.arm.moe/v1 + 令牌访问被授权的模型。
+    #[serde(default)]
+    pub share_enabled: bool,
+    /// 16 位小写字母数字身份（公网子域名标签），首次启动生成、持久不变。
+    #[serde(default)]
+    pub share_identity: String,
+    /// 向 FRP 服务端证明身份所有权的密钥，首次启动生成、持久不变。
+    #[serde(default)]
+    pub share_secret: String,
+    /// 分享令牌；每个令牌限定可用的模型 id 列表。
+    #[serde(default)]
+    pub share_tokens: Vec<ShareToken>,
+    /// 用户是否已点「我已了解」共享功能介绍卡片（true = 永不再提示）。
+    #[serde(default)]
+    pub share_intro_acknowledged: bool,
+}
+
+/// 一个分享令牌：朋友拿 `token` 当 api key，只能调用 `allowed_model_ids` 内的模型。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareToken {
+    pub token: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub allowed_model_ids: Vec<String>,
+    /// 金额额度上限（美元）；None = 无限制。默认 $1000。
+    #[serde(default = "default_share_amount_limit")]
+    pub amount_limit_usd: Option<f64>,
+    /// 并发请求上限；0 = 无限制。默认 10。
+    #[serde(default = "default_share_concurrency")]
+    pub concurrency_limit: u32,
+    /// 每分钟请求上限(RPM)；0 = 无限制。默认 0。
+    #[serde(default)]
+    pub rpm_limit: u32,
+    /// 内部模型 ID → 下游可见的自定义模型 ID（别名）。空 = 下游直接看到内部 ID。
+    /// 下游用别名或内部 ID 请求都能识别（见 `share::resolve_shared_model`）。
+    #[serde(default)]
+    pub model_aliases: std::collections::HashMap<String, String>,
+}
+
+fn default_share_amount_limit() -> Option<f64> {
+    Some(1000.0)
+}
+
+fn default_share_concurrency() -> u32 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,9 +286,12 @@ pub struct ContextBridgeDiagnostics {
     #[serde(default)]
     pub compaction_injected: bool,
     // === OpenAI Responses 请求画像（仅 Responses 协议填充，用于日志识别请求用途）===
-    /// 粗分类："main_coding"（主编码对话）| "auxiliary"（内部辅助请求）。
+    /// 粗分类："main_coding"（主编码对话）| "auxiliary"（内部辅助请求）| "share"（共享 API 请求）。
     #[serde(default)]
     pub request_kind: Option<String>,
+    /// 共享请求命中的令牌名称（用于日志按令牌过滤 / 按令牌统计金额）。None = 非共享。
+    #[serde(default)]
+    pub share_token: Option<String>,
     /// instructions 开头摘要。
     #[serde(default)]
     pub instructions_preview: Option<String>,
@@ -505,6 +555,11 @@ pub fn default_config() -> AppConfig {
             aux_model: None,
             memory_model: None,
             direct_provider_id: None,
+            share_enabled: false,
+            share_identity: String::new(),
+            share_secret: String::new(),
+            share_tokens: Vec::new(),
+            share_intro_acknowledged: false,
         },
     }
 }
